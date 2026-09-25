@@ -164,20 +164,17 @@ class AccountStore:
         self.load()
         return True
 
-    def export_month_csv(self, month: str) -> Path | None:
-        """Export one month's records and return the file path when successful."""
+    def export_month_csv(self, month: str, save_path: Path) -> Path:
+        """Export one month's records to the provided save path and return it."""
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT id, record_date, amount, category, note "
                 "FROM accounts WHERE record_date LIKE ? ORDER BY id",
                 (f"{month}-%",),
             ).fetchall()
-        if not rows:
-            return None
 
-        path = self.path.parent / f"account_export_{month}.csv"
-        with path.open("w", newline="", encoding="utf-8-sig") as file:
+        with save_path.open("w", newline="", encoding="utf-8-sig") as file:
             writer = csv.writer(file)
             writer.writerow(CSV_FIELDS)
             writer.writerows(rows)
-        return path
+        return save_path

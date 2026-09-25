@@ -6,17 +6,22 @@ from collections import defaultdict
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 import json
+import os
 import random
 import re
+import subprocess
+import sys
 import tkinter as tk
 import tkinter.font as tkfont
+from pathlib import Path
 from typing import cast
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
 from PIL import Image
 
 from config import (
+    DATA_DIR,
     DEFAULT_SNAIL_MESSAGE,
     SNAIL_IMAGE_CANDIDATES,
     SNAIL_IMAGE_PATH,
@@ -71,31 +76,22 @@ class AccountKeeperApp(ctk.CTk):
         self._animate_snail()
 
     def _prepare_snail_image(self) -> Image.Image:
-        """处理白底、等比缩放，并统一设置为 60% 不透明度。"""
+        """处理白底、等比缩放，并加深蜗牛线条颜色。"""
         image_path = next(
             (path for path in SNAIL_IMAGE_CANDIDATES if path.exists()),
             SNAIL_IMAGE_PATH,
         )
-        image = Image.open(image_path)
+        image = Image.open(image_path).convert("RGBA")
         image.thumbnail((100, 100), Image.Resampling.LANCZOS)
-        if image.mode != "RGBA":
-            image = image.convert("RGBA")
-            for y in range(image.height):
-                for x in range(image.width):
-                    red, green, blue, alpha_value = cast(
-                        tuple[int, int, int, int], image.getpixel((x, y))
-                    )
-                    if red > 230 and green > 230 and blue > 230:
-                        image.putpixel((x, y), (red, green, blue, 0))
-                    elif blue > red + 20 and blue > green + 5:
-                        image.putpixel((x, y), (30, 58, 138, alpha_value))
-
-        image = image.convert("RGBA")
-        alpha_values = bytes(
-            value * 60 // 100 for value in image.getchannel("A").tobytes()
-        )
-        alpha = Image.frombytes("L", image.size, alpha_values)
-        image.putalpha(alpha)
+        for y in range(image.height):
+            for x in range(image.width):
+                red, green, blue, alpha_value = cast(
+                    tuple[int, int, int, int], image.getpixel((x, y))
+                )
+                if red > 230 and green > 230 and blue > 230:
+                    image.putpixel((x, y), (red, green, blue, 0))
+                elif blue > red + 20 and blue > green + 5:
+                    image.putpixel((x, y), (30, 58, 138, alpha_value))
         return image
 
     def _animate_snail(self) -> None:
@@ -346,10 +342,10 @@ class AccountKeeperApp(ctk.CTk):
         }
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self.filter_records)
-        ctk.CTkEntry(
+        # 注意：CustomTkinter 6.0.0 的占位符在绑定 textvariable 时不会激活，
+        # 因此这里不传 textvariable，改为按键时把内容同步到 search_var。
+        self.search_entry = ctk.CTkEntry(
             toolbar,
-            textvariable=self.search_var,
-            placeholder_text="🔍 搜索日期/类别/备注",
             width=200,
             height=34,
             corner_radius=9,
@@ -357,7 +353,13 @@ class AccountKeeperApp(ctk.CTk):
             border_color="#C6D4DF",
             fg_color="#FFFFFF",
             font=font_small,
-        ).pack(side="left", padx=(0, 10))
+            placeholder_text="🔍 搜索日期/类别/备注",
+        )
+        self.search_entry.pack(side="left", padx=(0, 10))
+        self.search_entry.bind(
+            "<KeyRelease>",
+            lambda _event: self.search_var.set(self.search_entry.get()),
+        )
         ctk.CTkButton(
             toolbar,
             text="刷新",
@@ -392,6 +394,24 @@ class AccountKeeperApp(ctk.CTk):
             width=110,
             fg_color="#7B6D8D",
             hover_color="#635775",
+            **button_config,
+        ).pack(side="left", padx=8)
+        ctk.CTkButton(
+            toolbar,
+            text="查看图表",
+            command=self.show_chart,
+            width=108,
+            fg_color="#4A90D9",
+            hover_color="#3679BA",
+            **button_config,
+        ).pack(side="left")
+        ctk.CTkButton(
+            toolbar,
+            text="打开数据目录",
+            command=self.open_data_folder,
+            width=132,
+            fg_color="#607D8B",
+            hover_color="#4F6873",
             **button_config,
         ).pack(side="left", padx=8)
         self.summary_var = tk.StringVar()
@@ -462,6 +482,17 @@ class AccountKeeperApp(ctk.CTk):
     def refresh_records(self) -> None:
         self.filter_records()
 
+    def open_data_folder(self) -> None:
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(DATA_DIR)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(DATA_DIR)])
+            else:
+                subprocess.run(["xdg-open", str(DATA_DIR)])
+        except Exception as error:
+            messagebox.showinfo("数据目录", f"数据目录位于：\n{DATA_DIR}")
+
     def filter_records(self, *_args: str) -> None:
         keyword = self.search_var.get().strip().lower()
         for item in self.tree.get_children():
@@ -501,7 +532,7 @@ class AccountKeeperApp(ctk.CTk):
             Decimal("0"),
         )
         self.summary_var.set(
-            f"共 {len(filtered_records)} 条记录，收入 {income:.2f} 元，支出 {expense:.2f} 元"
+            f"收: {income:.2f} | 支: {expense:.2f}"
         )
 
     def add_record(self) -> None:
@@ -565,17 +596,29 @@ class AccountKeeperApp(ctk.CTk):
         month = self.ask_month("导出账单", "请输入要导出的月份（格式：YYYY-MM）")
         if month is None:
             return
+
+        if not any(record.record_date.startswith(month) for record in self.store.records):
+            messagebox.showinfo("无法导出", "该月没有记录，无法导出")
+            return
+
+        save_path_str = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            initialfile=f"account_export_{month}.csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+        )
+        if not save_path_str:
+            return
+
+        save_path = Path(save_path_str)
         try:
-            export_path = self.store.export_month_csv(month)
+            export_path = self.store.export_month_csv(month, save_path)
         except OSError as error:
             messagebox.showerror("导出失败", f"无法写入导出文件：{error}")
             return
-        if export_path is None:
-            messagebox.showinfo("无法导出", "该月没有记录，无法导出")
-            return
+
         messagebox.showinfo(
             "导出成功",
-            f"导出成功！文件已保存为 {export_path.name}",
+            f"导出成功！文件已保存到：\n{export_path}",
         )
 
     def ask_month(self, title: str, prompt: str) -> str | None:
@@ -840,5 +883,97 @@ class AccountKeeperApp(ctk.CTk):
             f"结余：{balance:.2f} 元"
         )
         messagebox.showinfo("月度统计", f"{summary}\n\n{details}")
+
+    def show_chart(self) -> None:
+        """按月份汇总各分类收入和支出并显示图表。"""
+        month = self.ask_month("查看图表", "请输入要查看的月份（格式：YYYY-MM）")
+        if month is None:
+            return
+
+        category_totals: defaultdict[str, dict[str, Decimal]] = defaultdict(
+            lambda: {"income": Decimal("0"), "expense": Decimal("0")}
+        )
+        for record in self.store.records:
+            if not record.record_date.startswith(month + "-"):
+                continue
+            if record.amount >= 0:
+                category_totals[record.category]["income"] += record.amount
+            else:
+                category_totals[record.category]["expense"] += record.amount
+
+        if not category_totals:
+            messagebox.showinfo("无法生成图表", "该月没有记录，无法生成图表")
+            return
+        self._render_chart_window(month, category_totals)
+
+    def _render_chart_window(
+        self,
+        month: str,
+        category_totals: defaultdict[str, dict[str, Decimal]],
+    ) -> None:
+        """在独立窗口中绘制月份收入与支出分类柱状图。"""
+        import matplotlib
+
+        matplotlib.use("TkAgg")
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+        plt.rcParams["font.sans-serif"] = ["Microsoft YaHei"]
+        plt.rcParams["axes.unicode_minus"] = False
+
+        chart_window = tk.Toplevel(self)
+        chart_window.title(f"{month} 支出统计")
+        width, height = 700, 550
+        screen_width = chart_window.winfo_screenwidth()
+        screen_height = chart_window.winfo_screenheight()
+        position_x = (screen_width - width) // 2
+        position_y = (screen_height - height) // 2
+        chart_window.geometry(f"{width}x{height}+{position_x}+{position_y}")
+
+        keys = list(category_totals.keys())
+        income_values = [
+            float(category_totals[key]["income"])
+            for key in keys
+        ]
+        expense_values = [
+            float(category_totals[key]["expense"])
+            for key in keys
+        ]
+        fig = plt.Figure(figsize=(7, 5))
+        ax = fig.add_subplot(111)
+        positions = list(range(len(keys)))
+        bar_width = 0.38
+        ax.bar(
+            [position - bar_width / 2 for position in positions],
+            income_values,
+            width=bar_width,
+            color="#4CAF50",
+            label="收入",
+        )
+        ax.bar(
+            [position + bar_width / 2 for position in positions],
+            expense_values,
+            width=bar_width,
+            color="#E76F51",
+            label="支出",
+        )
+        ax.set_xticks(positions)
+        ax.set_xticklabels(keys, rotation=30, ha="right")
+        ax.axhline(0, color="#455A64", linewidth=0.8)
+        ax.set_ylabel("金额（元）")
+        ax.set_title(f"{month} 收入与支出统计")
+        ax.legend()
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=chart_window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        def close_chart() -> None:
+            canvas.get_tk_widget().destroy()
+            plt.close(fig)
+            chart_window.destroy()
+
+        chart_window.protocol("WM_DELETE_WINDOW", close_chart)
 
 
