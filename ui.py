@@ -1,258 +1,65 @@
-"""CustomTkinter user interface for AccountKeeper."""
+"""Main AccountKeeper window and application-level business callbacks."""
 
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
-import json
 import os
-import random
-import re
 import subprocess
 import sys
 import tkinter as tk
-import tkinter.font as tkfont
 from pathlib import Path
-from typing import cast
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
-from PIL import Image
 
-from config import (
-    DATA_DIR,
-    DEFAULT_SNAIL_MESSAGE,
-    SNAIL_IMAGE_CANDIDATES,
-    SNAIL_IMAGE_PATH,
-    SNAIL_MESSAGES_PATH,
-)
+import dialogs
+from chart_window import show_chart_window
+from config import DATA_DIR
+from snail import SnailManager
 from store import Account, AccountStore
+from widgets import InputFrame, RecordTableFrame, ToolbarFrame
+
+
 class AccountKeeperApp(ctk.CTk):
     """The desktop interface for viewing and managing expense records."""
 
     def __init__(self, store: AccountStore) -> None:
         super().__init__()
+        # store 由外部注入，方便测试时替换成临时数据库，避免测试污染真实账本。
         self.store = store
         self.title("AccountKeeper 本地记账")
         self.geometry("960x680")
+        # 设置最小尺寸，防止用户把窗口拖得过小导致输入区和表格控件被挤成一团。
         self.minsize(820, 560)
         self.configure(fg_color="#F0F4F8")
-        self.snail_animation_id: str | None = None
-        self.snail_x = 0
-        self.snail_started = False
-        self.snail_paused = False
-        self._bubble_window: tk.Toplevel | None = None
         self._build_widgets()
+        # 先渲染一次数据，保证窗口一出现就能看到历史记录。
         self.refresh_records()
-        self._setup_snail()
-
-    def _setup_snail(self) -> None:
-        """在标题左侧加载 40 像素蜗牛图标，避免遮挡业务控件。"""
-        try:
-            image = self._prepare_snail_image()
-            image.thumbnail((40, 40), Image.Resampling.LANCZOS)
-            self.snail_photo = ctk.CTkImage(
-                light_image=image,
-                dark_image=image,
-                size=image.size,
-            )
-        except (OSError, ValueError) as error:
-            print(f"警告：无法加载蜗牛图片：{error}")
-            self.snail_photo = None
-            return
-
-        self.snail_label = ctk.CTkLabel(
-            self,
-            image=self.snail_photo,
-            text="",
-            cursor="hand2",
-            fg_color="transparent",
-        )
-        self.update_idletasks()
-        self.snail_x = self.winfo_width()
-        self.snail_label.place(x=self.snail_x, y=15, anchor="nw")
-        self.snail_label.bind("<Button-1>", self._snail_clicked)
-        self._animate_snail()
-
-    def _prepare_snail_image(self) -> Image.Image:
-        """处理白底、等比缩放，并加深蜗牛线条颜色。"""
-        image_path = next(
-            (path for path in SNAIL_IMAGE_CANDIDATES if path.exists()),
-            SNAIL_IMAGE_PATH,
-        )
-        image = Image.open(image_path).convert("RGBA")
-        image.thumbnail((100, 100), Image.Resampling.LANCZOS)
-        for y in range(image.height):
-            for x in range(image.width):
-                red, green, blue, alpha_value = cast(
-                    tuple[int, int, int, int], image.getpixel((x, y))
-                )
-                if red > 230 and green > 230 and blue > 230:
-                    image.putpixel((x, y), (red, green, blue, 0))
-                elif blue > red + 20 and blue > green + 5:
-                    image.putpixel((x, y), (30, 58, 138, alpha_value))
-        return image
-
-    def _animate_snail(self) -> None:
-        """让蜗牛从右向左爬行，遇到标题和左边界时传送。"""
-        if self.snail_paused:
-            self.snail_animation_id = self.after(30, self._animate_snail)
-            return
-        if self.winfo_width() <= 1 or not self.winfo_ismapped():
-            self.after(100, self._animate_snail)
-            return
-        if not self.snail_label.winfo_exists():
-            return
-
-        window_width = self.winfo_width()
-        snail_width = self.snail_label.winfo_width()
-        if not self.snail_started:
-            self.snail_x = window_width
-            self.snail_started = True
-        text_left = self.title_block.winfo_rootx() - self.winfo_rootx()
-        text_right = text_left + self.title_block.winfo_width()
-
-        self.snail_x -= 2
-        if self.snail_x <= text_right and self.snail_x + snail_width > text_left:
-            self.snail_x = text_left - snail_width
-        if self.snail_x < 0:
-            self.snail_x = window_width
-
-        self.snail_label.place_configure(x=self.snail_x, y=15)
-        self.snail_animation_id = self.after(30, self._animate_snail)
-
-    def _destroy_active_bubble(self, restore_pause: bool = True) -> None:
-        """销毁当前存在的气泡窗口，并在需要时恢复蜗牛动画。"""
-        if restore_pause:
-            self.snail_paused = False
-        if self._bubble_window is not None:
-            if self._bubble_window.winfo_exists():
-                self._bubble_window.destroy()
-            self._bubble_window = None
-
-    def _show_speech_bubble(self, message: str) -> None:
-        """在蜗牛上方弹出一个纯透明背景的圆角气泡。"""
-        self._destroy_active_bubble(restore_pause=False)
-        if not hasattr(self, "snail_label") or not self.snail_label.winfo_exists():
-            return
-
-        snail_x = self.snail_label.winfo_rootx()
-        snail_y = self.snail_label.winfo_rooty()
-        snail_width = self.snail_label.winfo_width()
-        snail_height = self.snail_label.winfo_height()
-        snail_center_x = snail_x + snail_width / 2
-        snail_center_y = snail_y + snail_height / 2
-
-        bubble = tk.Toplevel(self)
-        bubble.overrideredirect(True)
-        bubble.attributes("-topmost", True)
-        bubble.configure(bg="magenta")
-        bubble.wm_attributes("-transparentcolor", "magenta")
-
-        bubble_font = ("Microsoft YaHei UI", 11)
-        temp_font = tkfont.Font(family="Microsoft YaHei UI", size=11)
-        padding_x = 18
-        padding_y = 12
-        bubble_width = max(120, temp_font.measure(message) + padding_x * 2)
-        bubble_height = max(40, temp_font.metrics("linespace") + padding_y * 2)
-
-        bubble_x = int(snail_center_x - bubble_width / 2)
-        bubble_y = int(snail_center_y - snail_height / 2 - bubble_height - 12)
-        screen_width = self.winfo_screenwidth()
-        margin = 12
-        if bubble_x < margin:
-            bubble_x = margin
-        if bubble_x + bubble_width > screen_width - margin:
-            bubble_x = screen_width - margin - bubble_width
-        if bubble_y < margin:
-            bubble_y = max(margin, int(snail_center_y + snail_height / 2 + 12))
-
-        canvas = tk.Canvas(
-            bubble,
-            width=bubble_width,
-            height=bubble_height + 12,
-            bg="magenta",
-            highlightthickness=0,
-        )
-        canvas.pack()
-
-        bubble.geometry(f"{bubble_width}x{bubble_height + 12}+{bubble_x}+{bubble_y}")
-
-        radius = min(14, bubble_width // 4, bubble_height // 2)
-        rounded_body = [
-            (radius, 0),
-            (bubble_width - radius, 0),
-            (bubble_width, radius),
-            (bubble_width, bubble_height - radius),
-            (bubble_width - radius, bubble_height),
-            (radius, bubble_height),
-            (0, bubble_height - radius),
-            (0, radius),
-        ]
-        canvas.create_polygon(
-            rounded_body,
-            fill="#FFF7D8",
-            outline="#FFF7D8",
-            smooth=True,
-        )
-
-        tail_x = int(snail_center_x - bubble_x)
-        tail_points = [
-            (tail_x - 10, bubble_height - 1),
-            (tail_x + 10, bubble_height - 1),
-            (tail_x, bubble_height + 12),
-        ]
-        canvas.create_polygon(
-            tail_points,
-            fill="#FFF7D8",
-            outline="#FFF7D8",
-            smooth=True,
-        )
-
-        cx = bubble_width / 2
-        cy = bubble_height / 2
-        canvas.create_text(
-            cx,
-            cy,
-            text=message,
-            fill="#3E4A5A",
-            font=bubble_font,
-            justify="center",
-        )
-        bubble.bind("<Button-1>", lambda _event: self._destroy_active_bubble())
-        self._bubble_window = bubble
-        bubble.after(3000, self._destroy_active_bubble)
-
-    def _snail_clicked(self, _event: tk.Event) -> None:
-        """点击蜗牛时随机显示一条 JSON 消息气泡，并暂停蜗牛动画。"""
-        self.snail_paused = True
-        message = DEFAULT_SNAIL_MESSAGE
-        try:
-            with SNAIL_MESSAGES_PATH.open("r", encoding="utf-8") as file:
-                messages = json.load(file)
-            if not isinstance(messages, list) or not messages:
-                raise ValueError("消息列表为空或格式错误")
-            text_messages = [item for item in messages if isinstance(item, str) and item]
-            if not text_messages:
-                raise ValueError("消息列表中没有有效文本")
-            message = random.choice(text_messages)
-        except (OSError, json.JSONDecodeError, ValueError) as error:
-            print(f"警告：无法读取蜗牛消息，使用默认提示：{error}")
-        self._show_speech_bubble(message)
+        # 蜗牛必须等 title_block 建好之后再创建，因为它需要以标题位置作为爬行边界。
+        self.snail_manager = SnailManager(self, self.title_block)
+        self.snail_manager.start()
 
     def _build_widgets(self) -> None:
-        font_regular = ("Microsoft YaHei UI", 12)
+        """组装标题、输入区、工具栏和记录表格。"""
         font_small = ("Microsoft YaHei UI", 11)
         font_title = ("Microsoft YaHei UI", 16, "bold")
 
         self.header = ctk.CTkFrame(
-            self, height=58, fg_color="transparent", corner_radius=0
+            self,
+            height=58,
+            fg_color="transparent",
+            corner_radius=0,
         )
         self.header.pack(fill="x", padx=24, pady=(10, 5))
         self.header.pack_propagate(False)
+        # 标题区用 place 而非 pack 定位：一是保证窗口缩放时标题始终水平居中，
+        # 二是给蜗牛动画提供一个固定、可查询的矩形范围（蜗牛从标题两侧穿过）。
         self.title_block = ctk.CTkFrame(
-            self, fg_color="transparent", corner_radius=0
+            self,
+            fg_color="transparent",
+            corner_radius=0,
         )
         self.title_block.place(relx=0.5, rely=0.05, anchor="center")
         ctk.CTkLabel(
@@ -268,222 +75,44 @@ class AccountKeeperApp(ctk.CTk):
             text_color="#607D8B",
         ).pack(anchor="center")
 
-        input_frame = ctk.CTkFrame(
+        self.input_frame = InputFrame(self, self.add_record)
+        self.input_frame.pack(fill="x", padx=24, pady=(0, 8))
+        # 把这些控件引用提升到主窗口，方便各回调直接读取/清空；控件本身仍归 InputFrame 所有。
+        self.date_var = self.input_frame.date_var
+        self.amount_var = self.input_frame.amount_var
+        self.amount_entry = self.input_frame.amount_entry
+        self.category_var = self.input_frame.category_var
+        self.note_var = self.input_frame.note_var
+
+        # 工具栏只负责界面，把具体业务动作（筛选/删除/统计/导出/图表）回调给主窗口实现。
+        self.toolbar = ToolbarFrame(
             self,
-            corner_radius=14,
-            fg_color="#FFFFFF",
-            border_width=1,
-            border_color="#D8E1EA",
+            filter_callback=self.filter_records,
+            refresh_callback=self.refresh_records,
+            delete_callback=self.delete_record,
+            stats_callback=self.show_stats,
+            export_callback=self.export_csv,
+            # 图表依赖 matplotlib，用 lambda 延迟到实际点击时才导入，加快启动速度。
+            chart_callback=lambda: show_chart_window(self),
+            open_folder_callback=self.open_data_folder,
         )
-        input_frame.pack(fill="x", padx=24, pady=(0, 8))
-        ctk.CTkLabel(
-            input_frame,
-            text="添加记录",
-            font=("Microsoft YaHei UI", 13, "bold"),
-            text_color="#243447",
-        ).grid(row=0, column=0, columnspan=8, padx=16, pady=(12, 4), sticky="w")
+        self.toolbar.pack(fill="x", padx=24, pady=(0, 10))
+        self.search_var = self.toolbar.search_var
+        self.search_entry = self.toolbar.search_entry
+        self.summary_var = self.toolbar.summary_var
 
-        self.date_var = tk.StringVar(value=date.today().isoformat())
-        self.amount_var = tk.StringVar()
-        self.category_var = tk.StringVar()
-        self.note_var = tk.StringVar()
-        fields = (
-            ("日期", self.date_var, 13),
-            ("金额", self.amount_var, 12),
-            ("类别", self.category_var, 14),
-            ("备注", self.note_var, 28),
-        )
-        for column, (label, variable, width) in enumerate(fields):
-            ctk.CTkLabel(
-                input_frame,
-                text=label,
-                font=font_small,
-                text_color="#455A64",
-            ).grid(
-                row=1, column=column * 2, padx=(16, 6), pady=(4, 14), sticky="w"
-            )
-            ctk.CTkEntry(
-                input_frame,
-                textvariable=variable,
-                width=width * 8,
-                height=36,
-                font=font_regular,
-                corner_radius=9,
-                border_width=1,
-                border_color="#C6D4DF",
-                fg_color="#F8FAFC",
-            ).grid(
-                row=1,
-                column=column * 2 + 1,
-                padx=(0, 10),
-                pady=(4, 14),
-                sticky="ew",
-            )
-        ctk.CTkButton(
-            input_frame,
-            text="添加记录",
-            command=self.add_record,
-            width=108,
-            height=36,
-            corner_radius=10,
-            fg_color="#2F80ED",
-            hover_color="#256AC4",
-            font=font_small,
-        ).grid(row=1, column=8, padx=(4, 16), pady=(4, 14), sticky="e")
-        for column in (1, 3, 5, 7):
-            input_frame.columnconfigure(column, weight=1)
-
-        toolbar = ctk.CTkFrame(self, fg_color="transparent")
-        toolbar.pack(fill="x", padx=24, pady=(0, 10))
-        button_config = {
-            "height": 34,
-            "corner_radius": 9,
-            "font": font_small,
-        }
-        self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", self.filter_records)
-        # 注意：CustomTkinter 6.0.0 的占位符在绑定 textvariable 时不会激活，
-        # 因此这里不传 textvariable，改为按键时把内容同步到 search_var。
-        self.search_entry = ctk.CTkEntry(
-            toolbar,
-            width=200,
-            height=34,
-            corner_radius=9,
-            border_width=1,
-            border_color="#C6D4DF",
-            fg_color="#FFFFFF",
-            font=font_small,
-            placeholder_text="🔍 搜索日期/类别/备注",
-        )
-        self.search_entry.pack(side="left", padx=(0, 10))
-        self.search_entry.bind(
-            "<KeyRelease>",
-            lambda _event: self.search_var.set(self.search_entry.get()),
-        )
-        ctk.CTkButton(
-            toolbar,
-            text="刷新",
-            command=self.refresh_records,
-            width=78,
-            fg_color="#607D8B",
-            hover_color="#4F6873",
-            **button_config,
-        ).pack(side="left")
-        ctk.CTkButton(
-            toolbar,
-            text="删除选中记录",
-            command=self.delete_record,
-            width=132,
-            fg_color="#E76F51",
-            hover_color="#C9573D",
-            **button_config,
-        ).pack(side="left", padx=8)
-        ctk.CTkButton(
-            toolbar,
-            text="月度统计",
-            command=self.show_stats,
-            width=108,
-            fg_color="#5B8E7D",
-            hover_color="#477564",
-            **button_config,
-        ).pack(side="left")
-        ctk.CTkButton(
-            toolbar,
-            text="导出为CSV",
-            command=self.export_csv,
-            width=110,
-            fg_color="#7B6D8D",
-            hover_color="#635775",
-            **button_config,
-        ).pack(side="left", padx=8)
-        ctk.CTkButton(
-            toolbar,
-            text="查看图表",
-            command=self.show_chart,
-            width=108,
-            fg_color="#4A90D9",
-            hover_color="#3679BA",
-            **button_config,
-        ).pack(side="left")
-        ctk.CTkButton(
-            toolbar,
-            text="打开数据目录",
-            command=self.open_data_folder,
-            width=132,
-            fg_color="#607D8B",
-            hover_color="#4F6873",
-            **button_config,
-        ).pack(side="left", padx=8)
-        self.summary_var = tk.StringVar()
-        ctk.CTkLabel(
-            toolbar,
-            textvariable=self.summary_var,
-            font=font_small,
-            text_color="#546E7A",
-        ).pack(side="right")
-
-        table_frame = ctk.CTkFrame(
-            self,
-            corner_radius=14,
-            fg_color="#FFFFFF",
-            border_width=1,
-            border_color="#D8E1EA",
-        )
-        table_frame.pack(fill="both", expand=True, padx=24, pady=(0, 0))
-        table_inner = ctk.CTkFrame(table_frame, fg_color="transparent")
-        table_inner.pack(fill="both", expand=True, padx=10, pady=10)
-        columns = ("id", "date", "amount", "category", "note")
-        style = ttk.Style(self)
-        style.configure(
-            "Account.Treeview",
-            background="#FFFFFF",
-            fieldbackground="#FFFFFF",
-            foreground="#263238",
-            rowheight=34,
-            font=font_small,
-            borderwidth=0,
-        )
-        style.configure(
-            "Account.Treeview.Heading",
-            background="#E8F0F6",
-            foreground="#37474F",
-            font=("Microsoft YaHei UI", 11, "bold"),
-            relief="flat",
-        )
-        style.map("Account.Treeview", background=[("selected", "#D7E9FC")])
-        self.tree = ttk.Treeview(
-            table_inner,
-            columns=columns,
-            show="headings",
-            style="Account.Treeview",
-        )
-        headings = (
-            ("id", "ID", 70),
-            ("date", "日期", 120),
-            ("amount", "金额", 120),
-            ("category", "类别", 140),
-            ("note", "备注", 300),
-        )
-        for column, title, width in headings:
-            self.tree.heading(column, text=title)
-            self.tree.column(
-                column,
-                width=width,
-                anchor="center" if column != "note" else "w",
-            )
-        scrollbar = ttk.Scrollbar(table_inner, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.tree.bind("<Double-1>", self.edit_record)
-        table_inner.rowconfigure(0, weight=1)
-        table_inner.columnconfigure(0, weight=1)
+        # 表格是唯一始终占据剩余空间的区域，用 expand=True 保证窗口拉大时表格跟着变大。
+        self.table_frame = RecordTableFrame(self, self.edit_record)
+        self.table_frame.pack(fill="both", expand=True, padx=24, pady=(0, 0))
+        self.tree = self.table_frame.tree
 
     def refresh_records(self) -> None:
+        # 刷新按钮与新增/删除/编辑后的刷新都收敛到这一处，避免多份重复的渲染逻辑。
         self.filter_records()
 
     def open_data_folder(self) -> None:
         try:
+            # 三个平台调用系统文件管理器的方式各不相同，这里按平台分派。
             if sys.platform.startswith("win"):
                 os.startfile(DATA_DIR)
             elif sys.platform == "darwin":
@@ -491,18 +120,26 @@ class AccountKeeperApp(ctk.CTk):
             else:
                 subprocess.run(["xdg-open", str(DATA_DIR)])
         except Exception as error:
+            # 打不开资源管理器也不能让程序崩溃，退而求其次把路径打印给用户。
             messagebox.showinfo("数据目录", f"数据目录位于：\n{DATA_DIR}")
 
     def filter_records(self, *_args: str) -> None:
-        keyword = self.search_var.get().strip().lower()
+        # 用 *_args 吸收事件对象/回调参数，使同一函数既能当事件回调也能被直接调用。
+        # 直接读输入框内容而不是 search_var：粘贴（尤其右键粘贴）只改控件内容、不产生按键事件，
+        # 依赖变量会读到过期值，表现为"粘进去的文字筛不出结果"。
+        keyword = self.search_entry.get().strip().lower()
+        # Treeview 不支持增量更新，只能先清空再按当前条件重新插入。
         for item in self.tree.get_children():
             self.tree.delete(item)
+        # 单独收集"通过筛选"的记录，用它们（而不是全量数据）计算汇总，保证汇总与列表一致。
         filtered_records = []
+        # 按日期倒序 + ID 倒序排列，让最新记录总是出现在最上面。
         for record in sorted(
             self.store.records,
             key=lambda item: (item.record_date, item.record_id),
             reverse=True,
         ):
+            # 统一转小写做不区分大小写的模糊匹配，日期/类别/备注任一命中即可。
             searchable_text = (
                 record.record_date.lower(),
                 record.category.lower(),
@@ -511,6 +148,7 @@ class AccountKeeperApp(ctk.CTk):
             if keyword and not any(keyword in text for text in searchable_text):
                 continue
             filtered_records.append(record)
+            # iid 直接用 record_id，这样双击/删除时能由选中项反推出数据库主键。
             self.tree.insert(
                 "",
                 "end",
@@ -523,45 +161,101 @@ class AccountKeeperApp(ctk.CTk):
                     record.note,
                 ),
             )
+        # 约定：正数金额为收入、负数金额为支出，因此支出侧取相反数再求和得到正数展示值。
+        # 比较前必须先判 is_finite()：Decimal("NaN") 参与 > / < 比较会抛 InvalidOperation，
+        # 一旦库里存在历史脏数据（旧版本校验缺失时写入的 "NaN"），界面会在启动时就崩溃。
+        # 这类记录仍然照常显示在表格里，方便用户定位后删除或改正，只是不计入收支合计。
         income = sum(
-            (record.amount for record in filtered_records if record.amount > 0),
+            (
+                record.amount
+                for record in filtered_records
+                if record.amount.is_finite() and record.amount > 0
+            ),
             Decimal("0"),
         )
         expense = sum(
-            (-record.amount for record in filtered_records if record.amount < 0),
+            (
+                -record.amount
+                for record in filtered_records
+                if record.amount.is_finite() and record.amount < 0
+            ),
             Decimal("0"),
         )
+        # 汇总随筛选结果实时变化，用户搜索某个类别时即可看到该类别的收支小计；
+        # 末尾附带条数，让用户一眼确认当前列表里有多少条记录（筛选后即为命中条数）。
         self.summary_var.set(
-            f"收: {income:.2f} | 支: {expense:.2f}"
+            f"收: {income:.2f} | 支: {expense:.2f} | 记录数: {len(filtered_records)}"
         )
 
     def add_record(self) -> None:
         try:
-            record_date = datetime.strptime(self.date_var.get().strip(), "%Y-%m-%d").date()
-            amount = Decimal(self.amount_var.get().strip())
+            # 日期必须严格符合 YYYY-MM-DD，strptime 失败会直接跳到 except 分支。
+            record_date = datetime.strptime(
+                self.date_var.get().strip(), "%Y-%m-%d"
+            ).date()
+            # 直接读控件内容：金额框用的是 placeholder_text 而不是 textvariable，
+            # 且粘贴不会触发按键事件，读 StringVar 会漏掉粘贴（含右键粘贴）进来的数字。
+            raw_amount = self.amount_entry.get().strip()
+            # 空字符串不是合法的 Decimal，这里主动抛 ValueError 走统一的错误提示分支。
+            if not raw_amount:
+                raise ValueError
+            # 先取绝对值拿到"金额大小"，正负号完全交给下面的类型开关决定。
+            amount = abs(Decimal(raw_amount))
+            # Decimal("nan") / Decimal("Infinity") 都能正常解析、也能正常入库（存成 "NaN"），
+            # 但之后任何"金额 > 0"这类大小比较都会抛 InvalidOperation，直接把界面渲染炸掉
+            # （这就是账本里那条 NaN 记录导致程序一启动就崩溃的原因）。
+            # 因此在入口处用 is_finite() 显式拦掉，保证入库的金额一定可比较、可汇总。
+            if not amount.is_finite():
+                raise ValueError
         except (ValueError, InvalidOperation):
             messagebox.showerror("输入错误", "日期格式应为 YYYY-MM-DD，金额必须是数字。")
             return
+
+        # 根据支出/收入切换按钮，自动为金额加上正负号。
+        # 之所以把符号转换放在这里而不是控件里，是为了让 UI 层只关心"用户意图"，
+        # 数据层始终按统一的"正数=收入、负数=支出"约定存储。
+        amount_type = self.input_frame.amount_type_var.get()
+        if amount_type == "支出":
+            amount = -amount
+
         category = self.category_var.get().strip()
+        # 0 元记录在统计中没有意义，类别为空则无法分类，两者都视为非法输入。
         if amount == 0 or not category:
             messagebox.showerror(
-                "输入错误", "金额不能为 0；正数表示收入，负数表示支出，类别不能为空。"
+                "输入错误",
+                "金额不能为 0；正数表示收入，负数表示支出，类别不能为空。",
             )
             return
-        self.store.add(record_date.isoformat(), amount, category, self.note_var.get())
+        # store.add 内部还会再校验一次金额（数据层最后防线）。正常流程下这里不会触发，
+        # 但万一上层校验被改动绕过，也只会弹出提示而不会让程序崩溃。
+        try:
+            self.store.add(
+                record_date.isoformat(), amount, category, self.note_var.get()
+            )
+        except ValueError:
+            messagebox.showerror("输入错误", "日期格式应为 YYYY-MM-DD，金额必须是数字。")
+            return
+        # 清空金额/类别/备注，但保留日期，方便用户连续录入同一天的流水。
         self.amount_var.set("")
+        # 金额框使用的是 placeholder_text 而非 textvariable，控件内容必须单独清空，
+        # 否则下一次提交会把上一次的金额重复带进去（上面的 StringVar 只是顺手重置）。
+        self.amount_entry.delete(0, "end")
         self.category_var.set("")
         self.note_var.set("")
         self.refresh_records()
 
     def delete_record(self) -> None:
         selected = self.tree.selection()
+        # 没有任何选中行时给出提示而不是静默忽略，避免用户以为按钮失效。
         if not selected:
             messagebox.showinfo("删除记录", "请先选择一条记录。")
             return
+        # iid 就是 record_id（见 filter_records），因此可直接转成主键。
         record_id = int(selected[0])
-        if not messagebox.askyesno("确认删除", "确定要删除这条记录吗？"):
+        # 删除属于不可逆操作，必须先弹自定义确认框。
+        if not dialogs.confirm_delete(self):
             return
+        # 数据库里已不存在该行（例如被其它窗口删掉），提示用户而不是假装成功。
         if not self.store.delete(record_id):
             messagebox.showinfo("删除记录", "找不到该记录")
             return
@@ -569,6 +263,7 @@ class AccountKeeperApp(ctk.CTk):
 
     def edit_record(self, event: tk.Event) -> None:
         """双击记录行时打开编辑窗口。"""
+        # identify_row 会把双击的像素坐标映射为行 ID；点在空白处时返回空串。
         item_id = self.tree.identify_row(event.y)
         if not item_id:
             return
@@ -576,6 +271,7 @@ class AccountKeeperApp(ctk.CTk):
             record_id = int(item_id)
         except ValueError:
             return
+        # 从内存缓存里找到对应的完整记录，用于给编辑框预填当前值。
         record = next(
             (item for item in self.store.records if item.record_id == record_id),
             None,
@@ -583,29 +279,39 @@ class AccountKeeperApp(ctk.CTk):
         if record is None:
             return
 
-        edited_values = self.ask_edit_record(record)
+        # 用户取消编辑时返回 None，此时保持原样不做任何改动。
+        edited_values = dialogs.ask_edit_record(self, record)
         if edited_values is None:
             return
         record_date, amount, category, note = edited_values
+        # 主键不参与修改，编辑只更新内容字段（需求 3.5.1）。
         if not self.store.update(record_id, record_date, amount, category, note):
             messagebox.showerror("编辑失败", "找不到该记录或记录更新失败。")
             return
         self.refresh_records()
 
     def export_csv(self) -> None:
-        month = self.ask_month("导出账单", "请输入要导出的月份（格式：YYYY-MM）")
+        # 先让用户输入要导出的月份，取消则直接返回。
+        month = dialogs.ask_month(
+            self,
+            "导出账单",
+            "请输入要导出的月份（格式：YYYY-MM）",
+        )
         if month is None:
             return
 
+        # 该月一条记录都没有时不必生成空文件，直接告知用户更友好。
         if not any(record.record_date.startswith(month) for record in self.store.records):
             messagebox.showinfo("无法导出", "该月没有记录，无法导出")
             return
 
+        # 保存对话框里预填文件名，用户在"另存为"时就能看清导出的是哪个月份。
         save_path_str = filedialog.asksaveasfilename(
             defaultextension=".csv",
             initialfile=f"account_export_{month}.csv",
             filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
         )
+        # 用户点了取消，返回空串。
         if not save_path_str:
             return
 
@@ -613,6 +319,7 @@ class AccountKeeperApp(ctk.CTk):
         try:
             export_path = self.store.export_month_csv(month, save_path)
         except OSError as error:
+            # 磁盘写满、文件被占用、没有写入权限等都属于 OSError，提示后返回即可。
             messagebox.showerror("导出失败", f"无法写入导出文件：{error}")
             return
 
@@ -621,251 +328,47 @@ class AccountKeeperApp(ctk.CTk):
             f"导出成功！文件已保存到：\n{export_path}",
         )
 
-    def ask_month(self, title: str, prompt: str) -> str | None:
-        """显示自定义月份输入框，并返回通过校验的月份。"""
-        dialog = ctk.CTkToplevel(self)
-        dialog.title(title)
-        dialog.geometry("420x240")
-        dialog.resizable(False, False)
-        dialog.transient(self)
-        dialog.configure(fg_color="#F0F4F8")
-
-        dialog_font = ("Microsoft YaHei UI", 11)
-        title_font = ("Microsoft YaHei UI", 13, "bold")
-        result: list[str | None] = [None]
-
-        content = ctk.CTkFrame(dialog, fg_color="transparent")
-        content.pack(fill="both", expand=True)
-        ctk.CTkLabel(
-            content,
-            text=title,
-            font=title_font,
-            text_color="#243447",
-        ).pack(anchor="w", padx=24, pady=(20, 0))
-        ctk.CTkLabel(
-            content,
-            text=prompt,
-            font=dialog_font,
-            text_color="#455A64",
-        ).pack(anchor="w", padx=24, pady=(12, 8))
-
-        month_var = tk.StringVar()
-        entry = ctk.CTkEntry(
-            content,
-            textvariable=month_var,
-            font=dialog_font,
-            height=38,
-            corner_radius=9,
-            border_width=1,
-            border_color="#C6D4DF",
-            fg_color="#FFFFFF",
-        )
-        entry.pack(fill="x", padx=24)
-        error_var = tk.StringVar()
-        ctk.CTkLabel(
-            content,
-            textvariable=error_var,
-            text_color="#C62828",
-            font=("Microsoft YaHei UI", 10),
-        ).pack(
-            anchor="w", padx=24, pady=(5, 0)
-        )
-
-        buttons = ctk.CTkFrame(content, fg_color="transparent")
-        buttons.pack(anchor="e", padx=24, pady=(14, 0))
-
-        def cancel() -> None:
-            dialog.destroy()
-
-        def confirm() -> None:
-            month = month_var.get().strip()
-            try:
-                valid_format = re.fullmatch(r"\d{4}-\d{2}", month) is not None
-                if not valid_format:
-                    raise ValueError
-                datetime.strptime(month, "%Y-%m")
-            except ValueError:
-                error_var.set("格式错误，请输入有效的 YYYY-MM 月份。")
-                entry.focus_set()
-                return
-            result[0] = month
-            dialog.destroy()
-
-        ctk.CTkButton(
-            buttons,
-            text="取消",
-            command=cancel,
-            width=88,
-            height=34,
-            corner_radius=9,
-            fg_color="#90A4AE",
-            hover_color="#78909C",
-            font=dialog_font,
-        ).pack(side="right")
-        ctk.CTkButton(
-            buttons,
-            text="确定",
-            command=confirm,
-            width=88,
-            height=34,
-            corner_radius=9,
-            fg_color="#2F80ED",
-            hover_color="#256AC4",
-            font=dialog_font,
-        ).pack(side="right", padx=(0, 8)
-        )
-        dialog.protocol("WM_DELETE_WINDOW", cancel)
-        dialog.bind("<Return>", lambda _event: confirm())
-        dialog.bind("<Escape>", lambda _event: cancel())
-        entry.focus_set()
-        dialog.grab_set()
-        self.wait_window(dialog)
-        return result[0]
-
-    def ask_edit_record(
-        self, record: Account
-    ) -> tuple[str, Decimal, str, str] | None:
-        """显示预填记录编辑框，并返回通过校验的字段。"""
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("编辑记录")
-        dialog.geometry("460x360")
-        dialog.resizable(False, False)
-        dialog.transient(self)
-        dialog.configure(fg_color="#F0F4F8")
-
-        dialog_font = ("Microsoft YaHei UI", 11)
-        title_font = ("Microsoft YaHei UI", 13, "bold")
-        result: list[tuple[str, Decimal, str, str] | None] = [None]
-        date_var = tk.StringVar(value=record.record_date)
-        amount_var = tk.StringVar(value=f"{record.amount:.2f}")
-        category_var = tk.StringVar(value=record.category)
-        note_var = tk.StringVar(value=record.note)
-
-        content = ctk.CTkFrame(dialog, fg_color="transparent")
-        content.pack(fill="both", expand=True, padx=24, pady=20)
-        ctk.CTkLabel(
-            content,
-            text="编辑记录",
-            font=title_font,
-            text_color="#243447",
-        ).pack(anchor="w")
-
-        fields = (
-            ("日期", date_var),
-            ("金额", amount_var),
-            ("类别", category_var),
-            ("备注", note_var),
-        )
-        entries: list[ctk.CTkEntry] = []
-        for label, variable in fields:
-            ctk.CTkLabel(
-                content,
-                text=label,
-                font=dialog_font,
-                text_color="#455A64",
-            ).pack(anchor="w", pady=(10, 3))
-            entry = ctk.CTkEntry(
-                content,
-                textvariable=variable,
-                font=dialog_font,
-                height=34,
-                corner_radius=9,
-                border_width=1,
-                border_color="#C6D4DF",
-                fg_color="#FFFFFF",
-            )
-            entry.pack(fill="x")
-            entries.append(entry)
-
-        error_var = tk.StringVar()
-        ctk.CTkLabel(
-            content,
-            textvariable=error_var,
-            text_color="#C62828",
-            font=("Microsoft YaHei UI", 10),
-        ).pack(anchor="w", pady=(5, 0))
-
-        buttons = ctk.CTkFrame(content, fg_color="transparent")
-        buttons.pack(anchor="e", pady=(10, 0))
-
-        def cancel() -> None:
-            dialog.destroy()
-
-        def confirm() -> None:
-            try:
-                parsed_date = datetime.strptime(
-                    date_var.get().strip(), "%Y-%m-%d"
-                ).date()
-                parsed_amount = Decimal(amount_var.get().strip())
-            except (ValueError, InvalidOperation):
-                error_var.set("日期格式应为 YYYY-MM-DD，金额必须是数字。")
-                return
-            parsed_category = category_var.get().strip()
-            if parsed_amount == 0 or not parsed_category:
-                error_var.set(
-                    "金额不能为 0；正数表示收入，负数表示支出，类别不能为空。"
-                )
-                return
-            result[0] = (
-                parsed_date.isoformat(),
-                parsed_amount,
-                parsed_category,
-                note_var.get().strip(),
-            )
-            dialog.destroy()
-
-        ctk.CTkButton(
-            buttons,
-            text="取消",
-            command=cancel,
-            width=88,
-            height=34,
-            corner_radius=9,
-            fg_color="#90A4AE",
-            hover_color="#78909C",
-            font=dialog_font,
-        ).pack(side="right")
-        ctk.CTkButton(
-            buttons,
-            text="确定",
-            command=confirm,
-            width=88,
-            height=34,
-            corner_radius=9,
-            fg_color="#2F80ED",
-            hover_color="#256AC4",
-            font=dialog_font,
-        ).pack(side="right", padx=(0, 8))
-        dialog.protocol("WM_DELETE_WINDOW", cancel)
-        dialog.bind("<Return>", lambda _event: confirm())
-        dialog.bind("<Escape>", lambda _event: cancel())
-        entries[0].focus_set()
-        dialog.grab_set()
-        self.wait_window(dialog)
-        return result[0]
-
     def show_stats(self) -> None:
-        month = self.ask_month("选择统计月份", "请输入要统计的月份（格式：YYYY-MM）")
+        month = dialogs.ask_month(
+            self,
+            "选择统计月份",
+            "请输入要统计的月份（格式：YYYY-MM）",
+        )
         if month is None:
             return
+        # 只保留该月份的记录；要求存储的日期带前导零，所以前缀匹配是安全的（需求 3.4）。
         month_records = [
             record
             for record in self.store.records
             if record.record_date.startswith(month + "-")
         ]
         total_income = sum(
-            (record.amount for record in month_records if record.amount > 0),
+            (
+                record.amount
+                for record in month_records
+                if record.amount.is_finite() and record.amount > 0
+            ),
             Decimal("0"),
         )
         total_expense = sum(
-            (-record.amount for record in month_records if record.amount < 0),
+            (
+                -record.amount
+                for record in month_records
+                if record.amount.is_finite() and record.amount < 0
+            ),
             Decimal("0"),
         )
+        # 结余 = 收入 - 支出；支出转成正数后相减，避免出现"负数减负数"的歧义。
         balance = total_income - total_expense
-        category_totals: defaultdict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        # 只统计支出分类，因为收入不分摊分类、用途是"花了多少钱在什么类别上"。
+        category_totals: defaultdict[str, Decimal] = defaultdict(
+            lambda: Decimal("0")
+        )
         for record in month_records:
-            if record.amount < 0:
+            # 同样跳过非有限金额：它既无法比较大小，参与减法还会把整个分类合计污染成 NaN。
+            if record.amount.is_finite() and record.amount < 0:
                 category_totals[record.category] -= record.amount
+        # 分三种情况给出结论，避免展示一个"只有标题没有内容"的空明细。
         if not month_records:
             details = "该月份没有记账记录"
         elif total_expense == 0:
@@ -884,96 +387,13 @@ class AccountKeeperApp(ctk.CTk):
         )
         messagebox.showinfo("月度统计", f"{summary}\n\n{details}")
 
-    def show_chart(self) -> None:
-        """按月份汇总各分类收入和支出并显示图表。"""
-        month = self.ask_month("查看图表", "请输入要查看的月份（格式：YYYY-MM）")
-        if month is None:
-            return
+    def ask_month(self, title: str, prompt: str) -> str | None:
+        """保留旧接口，实际对话框由 dialogs 模块负责。"""
+        return dialogs.ask_month(self, title, prompt)
 
-        category_totals: defaultdict[str, dict[str, Decimal]] = defaultdict(
-            lambda: {"income": Decimal("0"), "expense": Decimal("0")}
-        )
-        for record in self.store.records:
-            if not record.record_date.startswith(month + "-"):
-                continue
-            if record.amount >= 0:
-                category_totals[record.category]["income"] += record.amount
-            else:
-                category_totals[record.category]["expense"] += record.amount
-
-        if not category_totals:
-            messagebox.showinfo("无法生成图表", "该月没有记录，无法生成图表")
-            return
-        self._render_chart_window(month, category_totals)
-
-    def _render_chart_window(
+    def ask_edit_record(
         self,
-        month: str,
-        category_totals: defaultdict[str, dict[str, Decimal]],
-    ) -> None:
-        """在独立窗口中绘制月份收入与支出分类柱状图。"""
-        import matplotlib
-
-        matplotlib.use("TkAgg")
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
-        plt.rcParams["font.sans-serif"] = ["Microsoft YaHei"]
-        plt.rcParams["axes.unicode_minus"] = False
-
-        chart_window = tk.Toplevel(self)
-        chart_window.title(f"{month} 支出统计")
-        width, height = 700, 550
-        screen_width = chart_window.winfo_screenwidth()
-        screen_height = chart_window.winfo_screenheight()
-        position_x = (screen_width - width) // 2
-        position_y = (screen_height - height) // 2
-        chart_window.geometry(f"{width}x{height}+{position_x}+{position_y}")
-
-        keys = list(category_totals.keys())
-        income_values = [
-            float(category_totals[key]["income"])
-            for key in keys
-        ]
-        expense_values = [
-            float(category_totals[key]["expense"])
-            for key in keys
-        ]
-        fig = plt.Figure(figsize=(7, 5))
-        ax = fig.add_subplot(111)
-        positions = list(range(len(keys)))
-        bar_width = 0.38
-        ax.bar(
-            [position - bar_width / 2 for position in positions],
-            income_values,
-            width=bar_width,
-            color="#4CAF50",
-            label="收入",
-        )
-        ax.bar(
-            [position + bar_width / 2 for position in positions],
-            expense_values,
-            width=bar_width,
-            color="#E76F51",
-            label="支出",
-        )
-        ax.set_xticks(positions)
-        ax.set_xticklabels(keys, rotation=30, ha="right")
-        ax.axhline(0, color="#455A64", linewidth=0.8)
-        ax.set_ylabel("金额（元）")
-        ax.set_title(f"{month} 收入与支出统计")
-        ax.legend()
-        fig.tight_layout()
-
-        canvas = FigureCanvasTkAgg(fig, master=chart_window)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
-
-        def close_chart() -> None:
-            canvas.get_tk_widget().destroy()
-            plt.close(fig)
-            chart_window.destroy()
-
-        chart_window.protocol("WM_DELETE_WINDOW", close_chart)
-
-
+        record: Account,
+    ) -> tuple[str, Decimal, str, str] | None:
+        """保留旧接口，实际对话框由 dialogs 模块负责。"""
+        return dialogs.ask_edit_record(self, record)

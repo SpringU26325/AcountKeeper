@@ -25,7 +25,7 @@ account_export_*.csv
 temp.py
 *.tmp
 *.log
-bugs.txt
+issues.txt
 
 # ---------- IDE 配置 ----------
 .vscode/
