@@ -119,34 +119,117 @@
 ---
 
 ## Step 1.5 返工说明（2026-09-26）
+- 原实现按「可自定义 db_path + csv_dir」设计。
+- 后根据实际开发成本，取消 db_path 自定义，仅保留 csv_dir。
+- settings.py 已收敛，返回值改为三元组 (csv_dir, is_fallback, is_first_run)，区分首次运行与异常回退。
+- #12.1 正式完成。
 
-背景：本节记录 #12.1 的返工过程，作为「实现与需求不同步 → 主动收敛」的留痕。
+---
 
-1. **原实现（Step 1）按「可自定义 db_path + csv_dir」设计**：
-   `config.py` 新增了 `DEFAULT_DB_PATH` 作为回退常量；`settings.py` 的 `load_settings()`
-   同时读取并校验 `db_path`（要求必须指向具体文件）与 `csv_dir` 两个字段，
-   `save_settings(db_path, csv_dir)` 两个参数，`get_effective_paths()` 返回 `(db_path, csv_dir)`。
+## Step 2 完成说明（2026-09-26）
 
-2. **需求变更：取消 db_path 自定义，仅保留 csv_dir**：
-   后续评估发现让用户自定义数据库路径的实际收益有限（需额外承担「切换路径后旧数据不迁移、
-   用户误以为数据丢失」的沟通成本，且数据库本身已固定在用户数据目录、满足需求 3.1 的防丢失要求），
-   因此决定数据库路径固定为 `DATA_DIR / "account.db"`、不提供任何配置入口，
-   用户可配置项收窄为「CSV 导出目录」一项。`requirements.md` 的 §2、§3.1、§3.11 已同步重写。
+对应待办 #12.2「启动流程读取 csv_dir 配置并处理回退提示」。
 
-3. **settings.py 收敛结果**：
-   - `config.py`：删除 `DEFAULT_DB_PATH`，`DB_PATH` 注释明确「固定路径、不可自定义」。
-   - `settings.py`：只读写 `csv_dir`；`load_settings()` 的返回值扩展为三元组
-     `(csv_dir, is_fallback, is_first_run)`，把「首次运行」与「异常回退」两个语义分开——
-     文件不存在时返回 `is_first_run=True`（正常情况，UI 不弹窗），
-     文件存在但解析失败 / 字段缺失 / 路径非法 / 目录不可用时返回 `is_fallback=True`（UI 弹窗提示）。
-   - `save_settings(csv_dir: Path) -> bool`：写入前做 expanduser/resolve/mkdir 校验，
-     失败返回 False 而不抛异常，由 UI 层决定弹窗措辞。
-   - `get_effective_csv_dir() -> tuple[Path, bool, bool]`：额外补一层「文件系统真实可用性」校验
-     （U 盘拔出、网络盘断开、无权限等），这类情况同样回退默认目录并置 `is_fallback=True`。
+1. **account_keeper.py 接入配置读取**：
+   `main()` 在创建 store 之前调用 `settings.get_effective_csv_dir()`，拿到
+   `(csv_dir, is_fallback, is_first_run)`。该函数内部已兜住全部异常并保证目录真实可用，
+   因此调用点不需要再包 try/except。
 
-4. **结论：#12.1 正式完成**，已用 `tempfile` 隔离环境实测 7 种输入场景
-   （不存在 / 解析失败 / 根节点非对象 / 字段缺失 / 类型非法 / 正常读取 / 路径不可用），
-   返回值均符合上述语义，且未触碰真实 `settings.json`。
+2. **迁移路径跟随 csv_dir**：
+   创建 store 时使用 `AccountStore(legacy_csv_path=csv_dir / "account.csv")`，
+   显式**不传 `path`**——数据库路径按需求 3.11 固定为 `config.DB_PATH`，不接受配置覆盖。
 
-5. **剩余待办**：#12.2（启动流程读取配置）、#12.3（设置界面对话框）、#12.4（export_csv 使用 csv_dir）
-   仍按原计划分步实施，本次未修改任何其他 `.py` 文件。
+3. **启动回退提示**：
+   弹窗时机放在主窗口创建之后、`app.mainloop()` 之前（先有窗口再提示，观感是「程序已启动，顺便提醒」）。
+   判断条件为 `is_fallback and not is_first_run`，使用 `messagebox.showwarning`，
+   文案「之前设置的 CSV 导出目录不可用，已回退到默认目录。」；
+   `is_first_run=True`（首次运行、从未配置过）属正常情况，静默处理、不弹窗。
+
+4. **AccountKeeperApp 构造函数新增可选参数**：
+   `__init__(self, store, csv_dir: Path = DEFAULT_CSV_DIR, settings_path: Path = SETTINGS_PATH)`，
+   两者均带默认值（取自 `config` 常量），保存为 `self.csv_dir` / `self.settings_path`。
+   用可选参数而非必填：既保证启动流程能注入配置，也不破坏「单独构造窗口」等现有调用方式，
+   且默认值直接引用常量，避免在 UI 层再写一份回退逻辑。
+
+5. **结论：#12.2 正式完成**，已用 `tempfile` 隔离环境验证三种启动场景
+   （首次运行 → 不弹窗；配置损坏 → 弹窗；正常配置 → 不弹窗且迁移路径跟随 csv_dir），
+   并确认 `AccountStore` 在临时库上构造正常、`DB_PATH` 未被覆盖。
+   本次未修改 `store.py`、`settings.py`、`config.py`、`widgets.py`、`dialogs.py`、`snail.py`、`chart_window.py`。
+
+6. **剩余待办**：#12.3（设置界面对话框）、#12.4（export_csv 使用 csv_dir）按计划分步实施。
+
+---
+
+## 方案变更说明：csv_dir → last_export_dir（2026-09-26）
+
+> 本节是 v0.1.2 的最新结论；上文 Step 1.5 与 Step 2 两节描述的 csv_dir 方案**已被本节取代**，仅作历史记录保留。
+
+### 为什么改（原方案太重）
+旧方案要求用户「自定义 CSV 导出目录」，为此需要一整套机制：设置界面、`is_fallback` / `is_first_run` 两个信号、
+启动弹窗提示「你配置的目录不能用了」。以实际使用场景衡量，性价比不成立：
+
+- 用户真正的痛点只是「每次导出都要重新点选一遍目录」，而不是「我要长期固定一个导出目录」；
+- 为一个便利功能引入了「配置错了要弹窗」这种让普通用户困惑的概念（用户并不理解 csv_dir 是什么）；
+- 设置界面 + 回退弹窗 + 双布尔返回值 + 只有一项的表单，实现与维护成本远高于收益。
+
+### 新方案（轻量）
+`settings.json` 只存一个字段 `last_export_dir`：**记住用户上次导出时实际选的目录**。
+
+- 没有设置界面，没有「存储设置」按钮，没有 `CTkToplevel` 对话框；
+- 启动只读一次，读不到或当前不可用就静默用 `DATA_DIR`，**不弹窗**；
+- 导出时用它作 `initialdir`；导出成功后把用户实际所选的目录写回配置。
+
+### 本次改了什么
+1. `settings.py`
+   - `get_effective_csv_dir()` → `get_last_export_dir()`，返回值由 `(Path, is_fallback, is_first_run)` 收敛为 `(Path, has_saved_dir)`；
+   - `save_settings(csv_dir)` → `save_settings(last_export_dir)`，JSON 字段名改为 `last_export_dir`（由模块常量 `SETTINGS_KEY` 统一，避免读写两处各写一遍字符串）；
+   - 目录判定拆成语义清晰的两个辅助函数：`_is_usable()`（只读探测，回答「上次那个目录现在还认不认得」，**刻意不创建目录**）与 `_prepare_directory()`（写配置前 mkdir 并确认可写）；
+   - 删除 `_parse_csv_dir` / `_ensure_usable` 及 `is_fallback` / `is_first_run` 的全部说明与分支。
+2. `account_keeper.py`（**最小改动，已与开发者确认**）
+   - import 与调用改为 `get_last_export_dir()`，解包由三元组改为二元组；
+   - 删除启动回退弹窗（`if is_fallback and not is_first_run:` 整段）——新方案没有需要告知用户的「回退」；
+   - `AccountKeeperApp(...)` 调用改用 `last_export_dir=`；因设置界面已取消，`settings_path=` 失去唯一消费者，一并移除（连带删掉已无用的 `from config import SETTINGS_PATH`）。
+3. `ui.py`
+   - `AccountKeeperApp.__init__` 的 `csv_dir` / `settings_path` 两个参数收敛为 `last_export_dir: Path = DEFAULT_CSV_DIR`；新增 `import settings`；
+   - `export_csv` 增加 `initialdir=str(self.last_export_dir)`（**即原先的 #15**），并在导出成功后调用 `settings.save_settings()` 写回实际所选目录、同步内存值；写回失败只打控制台警告，不影响已完成的导出。
+4. `widgets.py` / `dialogs.py`：**本次未改动**。核对后确认 Step 3 的「存储设置」按钮、`settings_callback`、`ask_storage_settings()`、`open_settings()` 实际都还没写进代码，因此「撤回」动作为空。
+5. 文档同步
+   - `requirements.md`：§2（存储/配置）、§3.1（account.csv 说明）、§3.6（initialdir 与写回）、§3.11（整节重写为「记住上次导出路径」）；
+   - `issues.txt`：#12 / #12.3 / #12.4 移入新增的「搁置」区；新增 `[已修复] #12'`；#15 与 #12.2 一并并入 #12'；头部编号变更说明同步。
+
+### 影响与遗留
+- 数据库路径不受影响，仍固定 `config.DB_PATH`（`DATA_DIR / "account.db"`）。
+- 旧 CSV 迁移路径仍沿用 `last_export_dir / "account.csv"`（保持 Step 2 的既有形状）。**语义上略有别扭**：「上次导出目录」与「历史 account.csv 所在目录」本无关系，保留只为避免扩大改动面；若要改回 `config.CSV_PATH`（即 `DATA_DIR / "account.csv"`），只需改 `account_keeper.py` 一行。
+- `config.py` 不在本次允许修改的清单内，其 `DEFAULT_CSV_DIR` 常量名与注释维持原样（语义仍成立：它是「记录缺失/失效时」的回退目标；常量名沿用是为了不扩大改动面）。
+- 工具栏「打开数据目录」文案仍未改为「打开默认数据目录」（需求 3.11 约束项），属独立小尾巴，未纳入本次改动。
+- 本次全部改动仍遵守 `PROJECT_RULES.md`：未使用终端命令操作文件、未在聊天框输出完整文件、关键逻辑均带中文注释解释「为什么」。
+
+---
+
+## 收尾说明：删除 legacy CSV 迁移逻辑（2026-09-26）
+
+### 为什么删
+- 项目暂无真实用户从旧版本升级，`_migrate_legacy_csv` 属于「为不存在的场景写的代码」：每次启动都要判一次文件存在性、读一次表头、再决定是否导入。它带来的阅读成本与出错面（表头校验、逐行校验、任一行非法就整体放弃）远大于实际收益，是纯粹的负债。
+- 它还与 `last_export_dir` 形成了语义上别扭的绑定（见上一节遗留说明）：把「上次导出目录」当成「历史 `account.csv` 所在目录」去找数据，本就是凑合出来的形状；删除后这层概念纠缠随之消失。
+
+### 本次改了什么
+1. `store.py`
+   - 删除 `_migrate_legacy_csv()` 整个方法，以及 `__init__` 中对它的调用；
+   - `AccountStore.__init__` 简化为 `(self, path: Path = DB_PATH)`，不再接收 `legacy_csv_path`，也不再保存 `self.legacy_csv_path`；
+   - 删除只服务于迁移的 `from datetime import datetime`（`strptime` 是它在此文件的唯一用途）；
+   - **保留** `import csv` 与 `CSV_FIELDS`：`export_month_csv` 仍要用它们写表头，已在注释里注明用途；
+   - **保留** `path` 参数：数据库位置已固定为 `config.DB_PATH`，该参数现仅作为测试注入临时库的接口。
+2. `config.py`
+   - 删除常量 `CSV_PATH`（删除迁移后已无任何引用）；
+   - `DEFAULT_CSV_DIR` 改名为 `DEFAULT_EXPORT_DIR`，注释改为「无 last_export_dir 时使用的回退目录」；
+   - 顺手修掉 `DB_PATH` 上方仍写着「可配置项收窄为仅 csv_dir」的过时注释。
+3. `settings.py`：同步引用新常量名 `DEFAULT_EXPORT_DIR`（代码与文档串一并更新）。
+4. `ui.py`：**仅两处**随之改名（import 行与 `last_export_dir` 的默认值）——该常量在 UI 层被用作默认回退目录，不改会直接 `ImportError`；除此之外 `ui.py` 未动一行（已单独向开发者确认）。
+5. `account_keeper.py`：创建 store 时改为 `AccountStore()`，不再传 `legacy_csv_path`。
+6. `requirements.md`：删除 §3.1 的 `account.csv` 存放描述；删除 §3.11「数据迁移说明」整节；删除 §3.11 约束里基于旧方案的「打开数据目录」文案条目；§3.11 只保留 `last_export_dir` 的读取、回退、导出时使用、导出成功后写回；常量名同步为 `DEFAULT_EXPORT_DIR`。
+7. `issues.txt`：#40 记入已修复历史，顶部「编号变更」区追加一行。
+8. 验证：`get_errors` 对 `config.py` / `settings.py` / `store.py` / `account_keeper.py` / `ui.py` 全部无错误；`store.py` 内 `csv` / `CSV_FIELDS` / `InvalidOperation` 均已确认仍有其它用途后保留。
+
+### 与上文的冲突说明
+- 本文档上文出现的 `DEFAULT_CSV_DIR`、`CSV_PATH`、`legacy_csv_path`，以及「旧 CSV 迁移路径沿用 `last_export_dir`」等描述，**自本节起不再适用**；保留原文仅为追溯当时决策，不做回改。
+- 其中「`config.py` 不在允许修改清单内，其 `DEFAULT_CSV_DIR` 常量名与注释维持原样」一条已被本节第 2 点取代。

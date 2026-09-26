@@ -15,8 +15,9 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 import dialogs
+import settings
 from chart_window import show_chart_window
-from config import DATA_DIR
+from config import DATA_DIR, DEFAULT_EXPORT_DIR
 from snail import SnailManager
 from store import Account, AccountStore
 from widgets import InputFrame, RecordTableFrame, ToolbarFrame
@@ -25,10 +26,18 @@ from widgets import InputFrame, RecordTableFrame, ToolbarFrame
 class AccountKeeperApp(ctk.CTk):
     """The desktop interface for viewing and managing expense records."""
 
-    def __init__(self, store: AccountStore) -> None:
+    def __init__(
+        self,
+        store: AccountStore,
+        last_export_dir: Path = DEFAULT_EXPORT_DIR,
+    ) -> None:
         super().__init__()
         # store 由外部注入，方便测试时替换成临时数据库，避免测试污染真实账本。
         self.store = store
+        # last_export_dir 由启动流程注入，带默认值保证单独构造窗口时仍可用：
+        # 默认值取 config 常量，避免本层再写一份「用哪个目录」的判断（配置读取只归 settings 模块管）。
+        # 它只是「另存为」对话框的起始目录；导出成功后会被更新为用户实际所选的目录。
+        self.last_export_dir = last_export_dir
         self.title("AccountKeeper 本地记账")
         self.geometry("960x680")
         # 设置最小尺寸，防止用户把窗口拖得过小导致输入区和表格控件被挤成一团。
@@ -119,7 +128,7 @@ class AccountKeeperApp(ctk.CTk):
                 subprocess.run(["open", str(DATA_DIR)])
             else:
                 subprocess.run(["xdg-open", str(DATA_DIR)])
-        except Exception as error:
+        except Exception:
             # 打不开资源管理器也不能让程序崩溃，退而求其次把路径打印给用户。
             messagebox.showinfo("数据目录", f"数据目录位于：\n{DATA_DIR}")
 
@@ -309,6 +318,9 @@ class AccountKeeperApp(ctk.CTk):
         save_path_str = filedialog.asksaveasfilename(
             defaultextension=".csv",
             initialfile=f"account_export_{month}.csv",
+            # 需求 3.11：用「上次导出目录」作起始目录。它由 settings 层保证一定可用，
+            # 没有记录或记录已失效时返回值本身就是默认目录，所以这里不需要再判空。
+            initialdir=str(self.last_export_dir),
             filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
         )
         # 用户点了取消，返回空串。
@@ -322,6 +334,13 @@ class AccountKeeperApp(ctk.CTk):
             # 磁盘写满、文件被占用、没有写入权限等都属于 OSError，提示后返回即可。
             messagebox.showerror("导出失败", f"无法写入导出文件：{error}")
             return
+
+        # 需求 3.11：记住用户这次实际选的目录，供下次导出直接复用。
+        # 只有写回成功才更新内存值，避免「界面用新目录、磁盘上还是旧记录」的不一致。
+        # 写回失败不弹窗：导出本身已经成功，不该因为「记不住目录」这种小事报错。
+        chosen_dir = save_path.expanduser().resolve().parent
+        if settings.save_settings(chosen_dir):
+            self.last_export_dir = chosen_dir
 
         messagebox.showinfo(
             "导出成功",

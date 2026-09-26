@@ -17,6 +17,7 @@ except ImportError:
 
 
 # CSV 表头字段顺序，必须与数据库查询列的顺序保持一致，否则导出后列会错位。
+# 旧 CSV 迁移逻辑已在 #40 中删除，该常量现仅被 store.export_month_csv 用于写表头。
 CSV_FIELDS = ("id", "date", "amount", "category", "note")
 # 源码所在目录，用于开发环境下定位 image、snail_messages.json 等资源文件。
 BASE_DIR = Path(__file__).resolve().parent
@@ -25,10 +26,20 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(user_data_dir("AccountKeeper", "SpringU26325"))
 # 启动时就把目录建好，避免后续写数据库时因目录不存在而报错。
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-# 默认的 SQLite 数据库文件路径（后续可由用户设置自定义）。
+# 固定的 SQLite 数据库文件路径。
+# 需求 3.11 现已取消全部路径自定义入口（导出目录也只剩「记住上次路径」），数据库位置更不提供配置项，
+# 所以这里是唯一权威路径，任何模块都不应再接受外部传入的数据库路径。
 DB_PATH = DATA_DIR / "account.db"
-# 旧版本使用的 CSV 存储路径，现在仅用于历史数据的一次性迁移。
-CSV_PATH = DATA_DIR / "account.csv"
+
+# 用户自定义配置文件（需求 3.11）的路径。
+# 之所以放在用户数据目录、而不是源码目录：打包成 exe 后源码目录是只读的临时解压目录，
+# 往那里写配置会失败；和数据文件放一起也便于用户整体备份/迁移。
+SETTINGS_PATH = DATA_DIR / "settings.json"
+# 无 last_export_dir 时使用的回退目录。
+# 取数据库所在目录，符合「数据集中在一处、方便备份和迁移」的预期；
+# settings.json 缺失、损坏、路径非法，或记住的目录已被删除/不可写时，一律回退到它。
+DEFAULT_EXPORT_DIR = DATA_DIR
+
 # 资源根目录：PyInstaller 打包后资源会被解压到 sys._MEIPASS，
 # 用 getattr 做兼容，未打包时回退到源码目录，保证两种运行方式都能找到图片。
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR))

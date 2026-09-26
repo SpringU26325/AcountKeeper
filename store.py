@@ -3,13 +3,12 @@
 import csv
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import sqlite3
 from typing import Iterator
 
-from config import CSV_FIELDS, CSV_PATH, DB_PATH
+from config import CSV_FIELDS, DB_PATH
 
 
 @dataclass
@@ -27,15 +26,15 @@ class Account:
 class AccountStore:
     """Persist account records in a local SQLite database."""
 
-    def __init__(self, path: Path = DB_PATH, legacy_csv_path: Path = CSV_PATH) -> None:
-        # 路径做成参数是为了给「用户自定义数据库位置」留接口，默认仍走 config 里的用户数据目录。
+    def __init__(self, path: Path = DB_PATH) -> None:
+        # 数据库位置固定为 config.DB_PATH，不再接受配置覆盖；
+        # 保留 path 参数仅是给测试留接口，便于注入临时库而不污染真实账本。
         self.path = path
-        self.legacy_csv_path = legacy_csv_path
         # 内存缓存：UI 的筛选与汇总都读它，避免用户每敲一个字就查一次数据库。
         self.records: list[Account] = []
-        # 先建表、再迁移旧 CSV、最后把数据读进内存，这个顺序不能颠倒。
+        # 先建表、再把数据读进内存，这个顺序不能颠倒。
+        # 旧 CSV 迁移逻辑已在 #40 中整体删除（项目还没有真实用户从旧版本升级，迁移属于纯负债）。
         self._initialize_database()
-        self._migrate_legacy_csv()
         self.load()
 
     @contextmanager
@@ -69,57 +68,6 @@ class AccountStore:
                     note TEXT NOT NULL
                 )
                 """
-            )
-
-    def _migrate_legacy_csv(self) -> None:
-        """Migrate the previous CSV once when the new database is empty."""
-        # 旧 CSV 不存在说明是新用户，直接跳过，不需要迁移。
-        if not self.legacy_csv_path.exists():
-            return
-        with self._connect() as connection:
-            # 只在数据库完全为空时迁移，避免每次启动都把旧数据重复导入一遍。
-            has_records = connection.execute("SELECT 1 FROM accounts LIMIT 1").fetchone()
-            if has_records:
-                return
-            try:
-                with self.legacy_csv_path.open("r", newline="", encoding="utf-8") as file:
-                    reader = csv.DictReader(file)
-                    # 表头对不上说明不是本程序生成的 CSV，宁可放弃迁移也不能导入垃圾数据。
-                    if reader.fieldnames != list(CSV_FIELDS):
-                        return
-                    migrated = []
-                    for row in reader:
-                        record_id = int(row["id"])
-                        record_date = datetime.strptime(row["date"], "%Y-%m-%d").date()
-                        amount = Decimal(row["amount"])
-                        # 任意一行数据非法就整体取消迁移，保证数据要么全部正确、要么完全不动。
-                        # 额外要求金额有限：NaN / Infinity 能解析成功，
-                        # 却会让后续所有金额大小比较或汇总计算出错。
-                        if (
-                            record_id < 1
-                            or not amount.is_finite()
-                            or amount == 0
-                            or not row["category"].strip()
-                        ):
-                            return
-                        # 统一格式化为两位小数字符串，与正常写入数据库时的格式保持一致。
-                        migrated.append(
-                            (
-                                record_id,
-                                record_date.isoformat(),
-                                f"{amount:.2f}",
-                                row["category"].strip(),
-                                row["note"].strip(),
-                            )
-                        )
-            except (OSError, csv.Error, ValueError, InvalidOperation, TypeError):
-                # 迁移只是锦上添花，读文件出错时静默跳过，绝不能因此让程序启动失败。
-                return
-            # 显式写入 id，是为了保留历史记录原有的主键，避免迁移后 ID 发生变化。
-            connection.executemany(
-                "INSERT INTO accounts (id, record_date, amount, category, note) "
-                "VALUES (?, ?, ?, ?, ?)",
-                migrated,
             )
 
     def load(self) -> None:

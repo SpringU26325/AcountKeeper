@@ -28,6 +28,7 @@ temp.py
 issues.txt
 *.spec
 PROJECT_RULES.md
+build.bat
 
 # ---------- IDE 配置 ----------
 .vscode/
