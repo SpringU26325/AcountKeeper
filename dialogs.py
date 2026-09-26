@@ -10,6 +10,7 @@ import tkinter as tk
 
 import customtkinter as ctk
 
+from calendar_picker import ask_date
 from store import Account
 
 
@@ -179,6 +180,14 @@ def ask_edit_record(
         ("类别", category_var),
         ("备注", note_var),
     )
+
+    def _pick_date() -> None:
+        """打开日历选择器，把选中的日期回填到日期输入框（需求 3.12）。"""
+        picked = ask_date(dialog, date_var.get().strip())
+        # 返回 None 表示用户取消/按 ESC，此时保持输入框原值不变。
+        if picked:
+            date_var.set(picked)
+
     # 按顺序收集输入框，用于最后把焦点落到第一个字段上。
     entries: list[ctk.CTkEntry] = []
     for label, variable in fields:
@@ -188,6 +197,42 @@ def ask_edit_record(
             font=dialog_font,
             text_color="#455A64",
         ).pack(anchor="w", pady=(10, 3))
+
+        # 日期行采用「输入框 + ▼」组合：两者放进同一个横向容器，
+        # 这样 ▼ 始终贴在输入框右侧，且行高与其它字段完全一致（分开 pack 会多占一行）。
+        if label == "日期":
+            date_row = ctk.CTkFrame(content, fg_color="transparent")
+            date_row.pack(fill="x")
+            entry = ctk.CTkEntry(
+                date_row,
+                textvariable=variable,
+                font=dialog_font,
+                height=34,
+                corner_radius=9,
+                border_width=1,
+                border_color="#C6D4DF",
+                fg_color="#FFFFFF",
+            )
+            # 与 InputFrame 一致：按钮文字用「▼」（YaHei UI 自带字形），
+            # 不用 emoji 📅（该字体无此字形会渲染成空白方块）。
+            # 按钮先 pack 且 side="right" 钉在右端，宽度 36；
+            # 输入框再 pack 且 expand=True 占满剩余空间，高度 34 与按钮齐平。
+            ctk.CTkButton(
+                date_row,
+                text="▼",
+                command=_pick_date,
+                width=36,
+                height=34,
+                corner_radius=9,
+                fg_color="#E3EAF2",
+                hover_color="#D2DEE9",
+                text_color="#243447",
+                font=("Microsoft YaHei UI", 11),
+            ).pack(side="right", padx=(6, 0))
+            entry.pack(side="left", fill="x", expand=True)
+            entries.append(entry)
+            continue
+
         # 这里的输入框不需要 placeholder_text，因此可以放心使用 textvariable 双向绑定。
         entry = ctk.CTkEntry(
             content,

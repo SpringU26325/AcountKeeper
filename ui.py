@@ -108,7 +108,6 @@ class AccountKeeperApp(ctk.CTk):
         self.toolbar.pack(fill="x", padx=24, pady=(0, 10))
         self.search_var = self.toolbar.search_var
         self.search_entry = self.toolbar.search_entry
-        self.summary_var = self.toolbar.summary_var
 
         # 表格是唯一始终占据剩余空间的区域，用 expand=True 保证窗口拉大时表格跟着变大。
         self.table_frame = RecordTableFrame(self, self.edit_record)
@@ -140,8 +139,6 @@ class AccountKeeperApp(ctk.CTk):
         # Treeview 不支持增量更新，只能先清空再按当前条件重新插入。
         for item in self.tree.get_children():
             self.tree.delete(item)
-        # 单独收集"通过筛选"的记录，用它们（而不是全量数据）计算汇总，保证汇总与列表一致。
-        filtered_records = []
         # 按日期倒序 + ID 倒序排列，让最新记录总是出现在最上面。
         for record in sorted(
             self.store.records,
@@ -156,7 +153,6 @@ class AccountKeeperApp(ctk.CTk):
             )
             if keyword and not any(keyword in text for text in searchable_text):
                 continue
-            filtered_records.append(record)
             # iid 直接用 record_id，这样双击/删除时能由选中项反推出数据库主键。
             self.tree.insert(
                 "",
@@ -170,31 +166,6 @@ class AccountKeeperApp(ctk.CTk):
                     record.note,
                 ),
             )
-        # 约定：正数金额为收入、负数金额为支出，因此支出侧取相反数再求和得到正数展示值。
-        # 比较前必须先判 is_finite()：Decimal("NaN") 参与 > / < 比较会抛 InvalidOperation，
-        # 一旦库里存在历史脏数据（旧版本校验缺失时写入的 "NaN"），界面会在启动时就崩溃。
-        # 这类记录仍然照常显示在表格里，方便用户定位后删除或改正，只是不计入收支合计。
-        income = sum(
-            (
-                record.amount
-                for record in filtered_records
-                if record.amount.is_finite() and record.amount > 0
-            ),
-            Decimal("0"),
-        )
-        expense = sum(
-            (
-                -record.amount
-                for record in filtered_records
-                if record.amount.is_finite() and record.amount < 0
-            ),
-            Decimal("0"),
-        )
-        # 汇总随筛选结果实时变化，用户搜索某个类别时即可看到该类别的收支小计；
-        # 末尾附带条数，让用户一眼确认当前列表里有多少条记录（筛选后即为命中条数）。
-        self.summary_var.set(
-            f"收: {income:.2f} | 支: {expense:.2f} | 记录数: {len(filtered_records)}"
-        )
 
     def add_record(self) -> None:
         try:

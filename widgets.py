@@ -9,6 +9,8 @@ from tkinter import ttk
 
 import customtkinter as ctk
 
+from calendar_picker import ask_date
+
 
 class InputFrame(ctk.CTkFrame):
     """Input controls for adding a record."""
@@ -31,127 +33,256 @@ class InputFrame(ctk.CTkFrame):
         self.category_var = tk.StringVar()
         self.note_var = tk.StringVar()
 
+        # 标题固定贴在卡片左上角：它是卡片标题，不属于两行字段，不参与列对齐。
         ctk.CTkLabel(
             self,
             text="添加记录",
             font=("Microsoft YaHei UI", 13, "bold"),
             text_color="#243447",
-        ).grid(row=0, column=0, columnspan=8, padx=16, pady=(12, 4), sticky="w")
+        ).grid(row=0, column=0, padx=16, pady=(12, 8), sticky="w")
 
-        # 保持原有列结构：日期 / 金额 / 类别 / 备注。
-        field_specs = (
-            ("日期", self.date_var, 13),
-            ("金额", self.amount_var, 12),
-            ("类别", self.category_var, 14),
-            ("备注", self.note_var, 28),
-        )
-
-        # 先把标签和普通输入框按原来的列布局绘制。
-        for column, (label, variable, width) in enumerate(field_specs):
-            ctk.CTkLabel(
-                self,
-                text=label,
-                font=font_small,
-                text_color="#455A64",
-            ).grid(
-                row=1,
-                column=column * 2,
-                padx=(16, 6),
-                pady=(4, 14),
-                sticky="w",
-            )
-
-            if label != "金额":
-                entry = ctk.CTkEntry(
-                    self,
-                    width=width * 8,
-                    height=36,
-                    font=font_regular,
-                    corner_radius=9,
-                    border_width=1,
-                    border_color="#C6D4DF",
-                    fg_color="#F8FAFC",
-                    textvariable=variable,
-                )
-                entry.grid(
-                    row=1,
-                    column=column * 2 + 1,
-                    padx=(0, 10),
-                    pady=(4, 14),
-                    sticky="ew",
-                )
-                continue
-
-            # 金额区域使用一个透明的内部容器，确保切换按钮和输入框在同一行水平排列。
-            # 若把两个控件各自 grid 到不同列，行高会被撑开，导致整行控件全部错位。
-            amount_frame = ctk.CTkFrame(
-                self,
-                fg_color="transparent",
-                corner_radius=0,
-            )
-            amount_frame.grid(
-                row=1,
-                column=column * 2 + 1,
-                padx=(0, 10),
-                pady=(4, 14),
-                sticky="ew",
-            )
-            # 这里不设置「列权重」：容器内部用 pack 水平排列子控件，列的伸缩权重不会生效，
-            # 留着只会让人误以为宽度分配由 grid 控制，所以直接省略。
-
-            # 支出/收入切换按钮（需求 3.2）：只决定金额的正负号，不直接改写输入框里的数字。
-            self.amount_type_button = ctk.CTkSegmentedButton(
-                amount_frame,
-                values=["支出", "收入"],
-                variable=self.amount_type_var,
-                width=92,
-                height=32,
-                corner_radius=8,
-                font=("Microsoft YaHei UI", 10),
-                selected_color="#2F80ED",
-                selected_hover_color="#256AC4",
-                # 浅色主题下必须显式指定未选中态的底色与文字色，否则「收入」二字会看不见。
-                unselected_color="#C6D4DF",
-                unselected_hover_color="#B7C7D4",
-                text_color="#455A64",
-            )
-            self.amount_type_button.pack(side="left", padx=(0, 8), pady=0)
-
-            # 金额输入框刻意不用 textvariable，而是用 placeholder_text 显示占位提示；
-            # 代价是取用户输入时必须读控件本身（amount_entry.get()），不能读 StringVar。
-            # 也正因为如此，这里不绑定 <KeyRelease> 去回写 StringVar：粘贴（尤其右键粘贴）
-            # 只发送 <<Paste>> 之类的虚拟事件、不产生按键事件，靠按键回写必然漏掉粘贴内容。
-            self.amount_entry = ctk.CTkEntry(
-                amount_frame,
-                width=120,
-                height=36,
-                font=font_regular,
-                corner_radius=9,
-                border_width=1,
-                border_color="#C6D4DF",
-                fg_color="#F8FAFC",
-                placeholder_text=" 请输入金额 ",
-            )
-            self.amount_entry.pack(side="left", fill="y", expand=True)
-
-        ctk.CTkButton(
+        # ---------- 按比例自适应的两行布局（需求 3.2） ----------
+        # 【四条设计意图】
+        #   1. 输入框按比例自适应：日期框、类别框、金额框、备注框都不再写死 width，
+        #      而是靠 grid 的列权重（weight）分配宽度。窗口拉宽时一起变宽、拉窄时
+        #      一起变窄，任何宽度下都填满可用空间，卡片右侧不会留下大片空白。
+        #   2. 只有图标型控件固定宽度：▼ 按钮 36px、支出/收入切换 100px、添加按钮
+        #      110px。它们要么是图标、要么是短文字，跟着伸缩只会变形或拉得很空洞。
+        #   3. 两行共用同一套列网格：日期与类别占同一列、金额与备注占同一列，
+        #      所以两行的标签和输入框天然上下对齐，不用再手工凑像素宽度。
+        #   4. 备注框与金额区共用第 3 列并填满整列，两者右边缘因此严格对齐
+        #      （备注框起点更靠左，所以会比金额输入框宽出约一个切换按钮的宽度）。
+        #      这里刻意不把第 3 列写成 35：权重是整列共享的，写 35 会把金额框
+        #      一起拉到 35%，反而偏离「金额约占 25%」的目标。
+        # 【为什么中间要有一层 master_frame】两行共用的列必须落在同一个容器里才可能
+        #   对齐；master_frame 用 sticky="ew" 撑满 InputFrame，成为两行共享的列网格。
+        # 【权重分配】第 1 列 : 第 3 列 = 15 : 25，对应「日期约占 15%、金额约占 25%」。
+        #   注意权重分配的是「固定部分（两个标签列、三个图标按钮）之外剩余的空间」，
+        #   所以窗口越宽，各输入框的实际占比会比 15/25 略有放大；但两者的比例关系
+        #   始终保持不变，这正是「按比例自适应」的预期行为。
+        # 【窄窗口下的安全性】窗口最小尺寸是 820x560（见 ui.py），卡片内部至少 772px，
+        #   而本布局各控件的自然宽度合计约 636px，始终留有余量，所以任何被允许的
+        #   窗口宽度下字段都完整可见、不会重叠，也不会被压缩到看不全。
+        # 【列结构】两行共用同一套列：
+        #   第 0 列 = 标签（日期 / 类别）—— 权重 0，宽度只由文字决定
+        #   第 1 列 = 日期框组（日期框 + ▼）/ 类别框 —— weight=15，按比例伸缩
+        #   第 2 列 = 标签（金额 / 备注）—— 权重 0，宽度只由文字决定
+        #   第 3 列 = 金额区（切换按钮 + 金额框）/ 备注框 —— weight=25，按比例伸缩
+        #   第 4 列 = 添加记录按钮（固定 110px，只有第二行有）
+        # 两行之间留 10px 垂直间距：上行下边距 5px + 下行上边距 5px。
+        master_frame = ctk.CTkFrame(
             self,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        master_frame.grid(row=1, column=0, padx=0, pady=(0, 14), sticky="ew")
+        # 只给两个「输入列」权重：它们会吃掉全部剩余宽度，所以卡片右侧不会留白。
+        # 两个标签列和按钮列的权重保持 0，宽度只由内容决定，两行才能始终左对齐。
+        master_frame.columnconfigure(1, weight=15)
+        master_frame.columnconfigure(3, weight=25)
+        # master 撑满卡片宽度，两行的对齐完全由它内部的列决定。
+        self.columnconfigure(0, weight=1)
+
+        # ---------- 第一行左侧：日期（输入框 + ▼ 日历按钮） ----------
+        ctk.CTkLabel(
+            master_frame,
+            text="日期",
+            font=font_small,
+            text_color="#455A64",
+        ).grid(row=0, column=0, padx=(16, 6), pady=(0, 5), sticky="w")
+
+        # 输入框与 ▼ 按钮放进透明容器水平排布；若各自 grid 到不同列，
+        # 会把整行高度撑高并让标签错位。
+        date_frame = ctk.CTkFrame(
+            master_frame,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        # sticky="ew"：日期框组随第 1 列的权重一起伸缩，两端贴住列边缘，
+        # 于是它和第二行的类别框左、右边缘同时对齐。
+        # 右侧不留 padx：与金额区的间距统一由「金额」标签的左侧 padx 控制，
+        # 避免两处同时加空隙后实际间距翻倍。
+        date_frame.grid(row=0, column=1, padx=(0, 0), pady=(0, 5), sticky="ew")
+        # 日期框可以放心使用 textvariable：它没有 placeholder_text，不存在占位符失效问题。
+        # 这里不写 width：宽度交给列权重决定，窗口拉宽时日期框跟着变宽。
+        # （▼ 按钮仍固定 36px，见下方。）
+        self.date_entry = ctk.CTkEntry(
+            date_frame,
+            height=36,
+            font=font_regular,
+            corner_radius=9,
+            border_width=1,
+            border_color="#C6D4DF",
+            fg_color="#F8FAFC",
+            textvariable=self.date_var,
+        )
+        # 按钮文字用「▼」而不是 emoji 📅：Windows 下 CTkButton 的默认字体
+        # （YaHei UI）不含 emoji 字形，📅 会退化成空白方块；▼（U+25BC）属于
+        # 几何图形区，YaHei UI 自带该字形，兼容性远好于 emoji。
+        # 先 pack 按钮并 side="right"：让它钉在容器右端不被挤压；
+        # 再 pack 输入框并 expand=True 占满剩余宽度，两者高度都是 36 保持齐平。
+        ctk.CTkButton(
+            date_frame,
+            text="▼",
+            command=self._pick_date,
+            width=36,
+            height=36,
+            corner_radius=9,
+            fg_color="#E3EAF2",
+            hover_color="#D2DEE9",
+            text_color="#243447",
+            font=("Microsoft YaHei UI", 11),
+        ).pack(side="right", padx=(6, 0))
+        # expand=True + fill="both"：输入框吃掉容器里 ▼ 按钮之外的全部宽度，
+        # 窗口变宽时新增的宽度全部落在日期框上（▼ 按钮宽度始终保持 36px）。
+        self.date_entry.pack(side="left", fill="both", expand=True)
+
+        # ---------- 第一行右侧：金额（支出/收入切换按钮 + 输入框） ----------
+        ctk.CTkLabel(
+            master_frame,
+            text="金额",
+            font=font_small,
+            text_color="#455A64",
+        # 左侧 padx=12 + 标签宽 22 + 右侧 padx=6，恰好让日期组合与金额组合
+        # 之间留出约 40px 水平间距（总计 12+22+6=40），避免两个组合粘在一起。
+        ).grid(row=0, column=2, padx=(12, 6), pady=(0, 5), sticky="w")
+
+        # 金额区域使用一个透明的内部容器，确保切换按钮和输入框在同一行水平排列。
+        # 若把两个控件各自 grid 到不同列，行高会被撑开，导致整行控件全部错位。
+        amount_frame = ctk.CTkFrame(
+            master_frame,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        # sticky="ew" + 右 padx=0：金额区随第 3 列的权重一起伸缩。
+        # 容器内的切换按钮固定 100px，多出来的宽度全部给金额输入框（内部 expand=True），
+        # 于是金额框与备注框的右边缘落在同一条竖线上。
+        # 右 padx 保持 0：若在这里加一段间距，备注框右边缘就会比金额框更靠右。
+        amount_frame.grid(row=0, column=3, padx=(0, 0), pady=(0, 5), sticky="ew")
+        # 这里不设置「列权重」：容器内部用 pack 水平排列子控件，列的伸缩权重不会生效，
+        # 留着只会让人误以为宽度分配由 grid 控制，所以直接省略。
+
+        # 支出/收入切换按钮（需求 3.2）：只决定金额的正负号，不直接改写输入框里的数字。
+        # width=100 必须配合 dynamic_resizing=False 才会生效：
+        # CTkSegmentedButton 内部的每个分段按钮都是以 width=0 创建的，
+        # 默认（dynamic_resizing=True）会让外层容器自动收缩到「文字宽度」，
+        # 无论把 width 写成多少，实测都恒为 74px 左右；
+        # 关掉自动收缩后，width=100 才会被完整尊重，与日期框、金额框形成整齐的一组。
+        self.amount_type_button = ctk.CTkSegmentedButton(
+            amount_frame,
+            values=["支出", "收入"],
+            variable=self.amount_type_var,
+            width=100,
+            height=32,
+            dynamic_resizing=False,
+            corner_radius=8,
+            font=("Microsoft YaHei UI", 10),
+            selected_color="#2F80ED",
+            selected_hover_color="#256AC4",
+            # 浅色主题下必须显式指定未选中态的底色与文字色，否则「收入」二字会看不见。
+            unselected_color="#C6D4DF",
+            unselected_hover_color="#B7C7D4",
+            text_color="#455A64",
+        )
+        self.amount_type_button.pack(side="left", padx=(0, 8), pady=0)
+
+        # 金额输入框刻意不用 textvariable，而是用 placeholder_text 显示占位提示；
+        # 代价是取用户输入时必须读控件本身（amount_entry.get()），不能读 StringVar。
+        # 也正因为如此，这里不绑定 <KeyRelease> 去回写 StringVar：粘贴（尤其右键粘贴）
+        # 只发送 <<Paste>> 之类的虚拟事件、不产生按键事件，靠按键回写必然漏掉粘贴内容。
+        self.amount_entry = ctk.CTkEntry(
+            amount_frame,
+            height=36,
+            font=font_regular,
+            corner_radius=9,
+            border_width=1,
+            border_color="#C6D4DF",
+            fg_color="#F8FAFC",
+            placeholder_text=" 请输入金额 ",
+        )
+        # expand=True + fill="both"：金额框吃掉容器里切换按钮之外的全部宽度，
+        # 无论窗口多宽都完整填满，不会在按钮右侧留下一段空隙。
+        self.amount_entry.pack(side="left", fill="both", expand=True)
+
+        # ---------- 第二行：类别 | 备注 | 添加记录按钮 ----------
+        ctk.CTkLabel(
+            master_frame,
+            text="类别",
+            font=font_small,
+            text_color="#455A64",
+        ).grid(row=1, column=0, padx=(16, 6), pady=(5, 0), sticky="w")
+
+        category_entry = ctk.CTkEntry(
+            master_frame,
+            height=36,
+            font=font_regular,
+            corner_radius=9,
+            border_width=1,
+            border_color="#C6D4DF",
+            fg_color="#F8FAFC",
+            textvariable=self.category_var,
+        )
+        # sticky="ew" + 右 padx=0：类别框与第一行的日期框组共用第 1 列并填满整列，
+        # 两行在同一列里两端对齐，所以「类别框」与「日期框组」左右边缘都对齐。
+        # 不写 width：宽度跟着第 1 列的权重走。
+        category_entry.grid(row=1, column=1, padx=(0, 0), pady=(5, 0), sticky="ew")
+
+        ctk.CTkLabel(
+            master_frame,
+            text="备注",
+            font=font_small,
+            text_color="#455A64",
+        ).grid(row=1, column=2, padx=(12, 6), pady=(5, 0), sticky="w")
+
+        # 备注框与第一行的金额区共用第 3 列，并用 sticky="ew" 填满整列：
+        # 两者右边缘因此严格对齐；而金额区左侧还要放下一个固定 100px 的切换按钮，
+        # 所以备注框会比金额输入框宽出约一个按钮的宽度（起点更靠左、终点相同）。
+        # 不写 width：宽度完全由列权重决定，窗口拉宽时备注框同步变宽。
+        note_entry = ctk.CTkEntry(
+            master_frame,
+            height=36,
+            font=font_regular,
+            corner_radius=9,
+            border_width=1,
+            border_color="#C6D4DF",
+            fg_color="#F8FAFC",
+            textvariable=self.note_var,
+        )
+        # 右侧不留 padx：那 12px 间距统一由按钮自己的 padx=(12, 0) 提供；
+        # 若这里也加一段，间距会翻倍，备注框右边缘也会与金额框错开。
+        note_entry.grid(row=1, column=3, padx=(0, 0), pady=(5, 0), sticky="ew")
+
+        # 按钮占第 4 列（备注框右边一列），sticky="w" 让它紧贴备注框右侧不漂移；
+        # 左 padx=12 就是需求里那 12px 间距，右 padx=16 是卡片内边距。
+        # 这个右内边距不能省：两个输入列带权重、会吃掉全部剩余宽度，按钮列因此
+        # 正好顶到卡片右边缘，不留 16px 的话按钮会贴死在卡片边框上。
+        # 它只是一圈内边距，不是以前那种「一块空的留白列」，窗口拉宽时宽度不变。
+        # 按钮是「固定宽度」控件：所在列权重为 0、宽度写死 110px，不跟着伸缩。
+        # 回调保持原样。
+        ctk.CTkButton(
+            master_frame,
             text="添加记录",
             command=add_callback,
-            width=108,
+            width=110,
             height=36,
             corner_radius=10,
             fg_color="#2F80ED",
             hover_color="#256AC4",
             font=font_small,
-        ).grid(row=1, column=8, padx=(4, 16), pady=(4, 14), sticky="e")
-        # 只给输入框所在的奇数列分配伸缩权重，标签列保持固定宽度不被拉伸。
-        for column in (1, 3, 5, 7):
-            self.columnconfigure(column, weight=1)
+        ).grid(row=1, column=4, padx=(12, 16), pady=(5, 0), sticky="w")
+
+    def _pick_date(self) -> None:
+        """打开日历选择器，把选中的日期回填到日期输入框（需求 3.12）。"""
+        # 用 winfo_toplevel() 而不是 self：弹窗必须挂在主窗口上，
+        # 否则 transient 会认错父窗口，导致弹窗跑到主窗口下面或被最小化时一起消失。
+        picked = ask_date(self.winfo_toplevel(), self.date_var.get().strip())
+        # 返回 None 表示用户取消/按 ESC，此时保持输入框原值不变。
+        if picked:
+            self.date_var.set(picked)
 
 
 class ToolbarFrame(ctk.CTkFrame):
-    """Search, action buttons, and summary controls."""
+    """Search box and the responsive action-button bar."""
 
     def __init__(
         self,
@@ -167,7 +298,12 @@ class ToolbarFrame(ctk.CTkFrame):
         super().__init__(master, fg_color="transparent")
         font_small = ("Microsoft YaHei UI", 11)
         # 所有工具按钮共用同一套尺寸参数，保证视觉高度完全一致。
+        # 这里的 width 是「最小宽度」而不是固定宽度：外层 grid 的列权重会在窗口变宽时
+        # 把按钮一起拉宽（见下方 sticky="ew"）。取 110 是因为最长文字「删除选中记录」
+        # 实际只需约 81px（文字 68.8 + 两侧内边距 12），110 留有余量又不至于夸张；
+        # 关键在于六个按钮取同一个值，六列的「最小宽度」才相同，grid 才能把它们算成等宽。
         button_config = {
+            "width": 110,
             "height": 34,
             "corner_radius": 9,
             "font": font_small,
@@ -189,7 +325,18 @@ class ToolbarFrame(ctk.CTkFrame):
             font=font_small,
             placeholder_text="🔍 搜索日期/类别/备注",
         )
-        self.search_entry.pack(side="left", padx=(0, 10))
+        # 用 grid 而不是 pack(side="left")：pack 是「从左往右按各自固定宽度依次占位」，
+        # 它不会在窗口变窄时让步，最右边的按钮会被挤出可视区域。
+        # grid 用「列权重」表达意图：第 0 列（搜索框）权重 0、宽度固定 200px 不参与伸缩；
+        # 第 1~6 列（六个按钮）权重都是 1 且同属一个 uniform 组
+        #   → 剩下多少宽度就由六列严格均分：窗口拉宽按钮变宽，拉窄按钮变窄。
+        # uniform 是一道额外保险：它强制同组列宽相等，即使将来某个按钮因文字变长
+        # 而抬高自己的最小宽度，六列也仍会取同一个宽度，不会出现参差不齐。
+        self.columnconfigure(0, weight=0)
+        for column_index in range(1, 7):
+            self.columnconfigure(column_index, weight=1, uniform="toolbar_button")
+        # 搜索框 sticky="w"：它所在列没有权重，宽度就固定 200px，不会被拉伸。
+        self.search_entry.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="w")
         # 实时筛选的触发源必须挂在输入框上：没有 textvariable 就没有变量可监听，
         # 逐字符过滤只能由输入事件驱动。
         # 键盘输入用 <KeyRelease>；粘贴/剪切/清空走的是 <<Paste>>/<<Cut>>/<<Clear>> 虚拟事件
@@ -204,68 +351,62 @@ class ToolbarFrame(ctk.CTkFrame):
                 add="+",
             )
         # 工具按钮按「轻-重」顺序从左到右排列，删除这类破坏性操作用红色以示警示。
+        # 六个按钮共用同一套 grid 参数：sticky="ew" 让按钮撑满所在列（列有多宽按钮就多宽）；
+        # 右内边距 8px 就是需求里「按钮之间的 8px 间距」。
+        # 最后一个按钮也留这 8px：六列的「最小宽度」必须完全一致，少了这 8px 的
+        # 那个列会比其他列宽出 8px，整体就不再等宽（这 8px 落在工具栏最右侧，
+        # 与卡片左内边距作用相同，视觉上看不出来）。
+        button_grid = {"row": 0, "padx": (0, 8), "pady": 0, "sticky": "ew"}
         ctk.CTkButton(
             self,
             text="刷新",
             command=refresh_callback,
-            width=78,
             fg_color="#607D8B",
             hover_color="#4F6873",
             **button_config,
-        ).pack(side="left")
+        ).grid(column=1, **button_grid)
         ctk.CTkButton(
             self,
             text="删除选中记录",
             command=delete_callback,
-            width=132,
             fg_color="#E76F51",
             hover_color="#C9573D",
             **button_config,
-        ).pack(side="left", padx=8)
+        ).grid(column=2, **button_grid)
         ctk.CTkButton(
             self,
             text="月度统计",
             command=stats_callback,
-            width=108,
             fg_color="#5B8E7D",
             hover_color="#477564",
             **button_config,
-        ).pack(side="left")
+        ).grid(column=3, **button_grid)
         ctk.CTkButton(
             self,
             text="导出为CSV",
             command=export_callback,
-            width=110,
             fg_color="#7B6D8D",
             hover_color="#635775",
             **button_config,
-        ).pack(side="left", padx=8)
+        ).grid(column=4, **button_grid)
         ctk.CTkButton(
             self,
             text="查看图表",
             command=chart_callback,
-            width=108,
             fg_color="#4A90D9",
             hover_color="#3679BA",
             **button_config,
-        ).pack(side="left")
+        ).grid(column=5, **button_grid)
+        # 按钮文字始终在按钮内居中（CTkButton 内部就是居中放置文本标签），
+        # 所以按钮变宽变窄都不会让文字跑偏，也不会截断。
         ctk.CTkButton(
             self,
             text="打开数据目录",
             command=open_folder_callback,
-            width=132,
             fg_color="#607D8B",
             hover_color="#4F6873",
             **button_config,
-        ).pack(side="left", padx=8)
-        self.summary_var = tk.StringVar()
-        # 右侧的收/支汇总标签用 pack(side="right") 固定靠右，不随左侧按钮增减而移动。
-        ctk.CTkLabel(
-            self,
-            textvariable=self.summary_var,
-            font=font_small,
-            text_color="#546E7A",
-        ).pack(side="right")
+        ).grid(column=6, **button_grid)
 
 
 class RecordTableFrame(ctk.CTkFrame):
