@@ -22,6 +22,10 @@ from config import (
 # 气泡宽度上限占主窗口宽度的比例：留出余量，避免气泡贴着窗口边缘或超出可视区域。
 BUBBLE_WIDTH_RATIO = 0.8
 
+# 右键彩蛋的固定文案：刻意不放进 snail_messages.json，
+# 否则左键随机抽文案时也会抽到这句，彩蛋就不再是"彩蛋"了。
+SNAIL_EASTER_EGG_MESSAGE = "诶~我躲（恭喜你找到了作者的彩蛋）"
+
 
 def _wrap_message_by_width(
     font: tkfont.Font,
@@ -72,6 +76,11 @@ class SnailManager:
         self.snail_started = False
         # 弹出气泡或用户点击时置为 True，让蜗牛原地等待，不遮挡正在阅读的气泡。
         self.snail_paused = False
+        # 窗口是否持有焦点：失焦期间即便气泡自动关闭，也不该让蜗牛"恢复"爬行。
+        self._window_focused = True
+        # 窗口是否已经真正显示过：未显示的 Toplevel 会谎报 Tk 默认的 200x200，
+        # 直接拿它当入口坐标，蜗牛就会从窗口偏左处冒出来（见 _on_window_shown）。
+        self._window_shown = False
         # 当前活动气泡的 Canvas 与自动关闭定时器，任一时刻最多只有一个气泡。
         self._bubble_canvas: tk.Canvas | None = None
         self._bubble_after_id: str | None = None
@@ -105,12 +114,51 @@ class SnailManager:
         self.master.update_idletasks()
         window_width = self.master.winfo_width()
         # 只有窗口已布局且已显示时才摆放蜗牛，否则坐标不可靠。
+        # 这条分支覆盖"窗口早已显示、之后才创建蜗牛"的场景；正常启动时窗口还没显示，走下面的 <Map>。
         if window_width > 1 and self.master.winfo_ismapped():
-            # 起点放在窗口最右侧，让蜗牛"从屏幕外爬进来"。
-            self.snail_x = window_width
-            self.snail_label.place(x=self.snail_x, y=15, anchor="nw")
+            self._window_shown = True
+            self._enter_from_right(window_width)
+        # 正常启动时窗口尚未显示，而此时的 winfo_width() 不是 1 而是 Tk 默认的 200，
+        # 拿它当入口坐标会让蜗牛从窗口偏左处冒出来，所以入口摆放必须推迟到窗口真正显示的 <Map> 事件。
+        self.master.bind("<Map>", self._on_window_shown)
         self.snail_label.bind("<Button-1>", self._snail_clicked)
+        # 右键彩蛋：随机传送到行进路线上并冒出一句固定文案（<Button-3> 即 Windows 下的右键）。
+        self.snail_label.bind("<Button-3>", self._snail_right_clicked)
+        # 用户真正切走窗口（例如 Alt+Tab）时暂停动画，切回来自动恢复；
+        # 用焦点事件而不是键盘事件判断，才不会把 Alt 这类系统按键误当成"离开窗口"。
+        self.master.bind("<FocusOut>", self._on_focus_out)
+        self.master.bind("<FocusIn>", self._on_focus_in)
         self._animate_snail()
+
+    def _on_focus_out(self, _event: tk.Event) -> None:
+        """窗口失去焦点时暂停动画，避免在后台空转重绘。"""
+        self._window_focused = False
+        self.snail_paused = True
+
+    def _on_focus_in(self, _event: tk.Event) -> None:
+        """窗口重新获得焦点时恢复动画；气泡仍在显示则保持暂停，避免蜗牛与气泡错位。"""
+        self._window_focused = True
+        # 气泡打开期间 snail_paused 同样为 True，这里不能无条件清零，
+        # 否则「点开气泡 → 切走窗口 → 切回来」会让蜗牛在气泡还挂着时重新爬动。
+        if self._bubble_canvas is None:
+            self.snail_paused = False
+
+    def _on_window_shown(self, _event: tk.Event) -> None:
+        """窗口真正显示后补一次入口摆放：只有这时 winfo_width() 才是真实宽度。"""
+        self._window_shown = True
+        # 已经入场过就不再摆：从最小化恢复同样会触发 <Map>，那时应保持蜗牛当前位置。
+        if not self.snail_started:
+            self._enter_from_right(self.master.winfo_width())
+
+    def _enter_from_right(self, window_width: int) -> None:
+        """把蜗牛放到窗口最右侧，让它"从屏幕外爬进来"。"""
+        if window_width <= 1:
+            # 几何信息还没生效，留给下一帧动画重试。
+            return
+        self.snail_x = window_width
+        self.snail_started = True
+        if self.snail_label is not None and self.snail_label.winfo_exists():
+            self.snail_label.place(x=self.snail_x, y=15, anchor="nw")
 
     def _prepare_snail_image(self) -> Image.Image:
         """处理白底、等比缩放，并加深蜗牛线条颜色。"""
@@ -143,8 +191,12 @@ class SnailManager:
         if self.snail_paused:
             self.snail_animation_id = self.master.after(30, self._animate_snail)
             return
-        # 窗口尚未完成布局或已最小化时，几何尺寸不可信，先慢速等待。
-        if self.master.winfo_width() <= 1 or not self.master.winfo_ismapped():
+        # 窗口尚未真正显示时 winfo_width() 会谎报 Tk 默认的 200（不是 1），
+        # 据此摆放会让蜗牛从窗口偏左处冒出来，所以必须先等 <Map> 事件把 _window_shown 置位。
+        # 这里刻意不再判断 winfo_ismapped()：按下 Alt 键会让 Tk 短暂认为窗口未映射，
+        # 而动画定时器一旦据此提前 return，蜗牛就会永远停在原地（表现为卡死），
+        # 所以改用"只在启动阶段判一次"的 _window_shown，它与 Alt 无关。
+        if not self._window_shown or self.master.winfo_width() <= 1:
             self.snail_animation_id = self.master.after(100, self._animate_snail)
             return
         # 控件已被销毁（例如窗口关闭）时彻底停止循环，避免对已销毁对象调用方法报错。
@@ -155,13 +207,8 @@ class SnailManager:
         snail_width = self.snail_label.winfo_width()
         if not self.snail_started:
             # 首帧只负责摆好初始位置，不移动，避免出现"从左上角突然跳到右边"的闪烁。
-            self.snail_x = window_width
-            self.snail_started = True
-            self.snail_label.place(
-                x=self.snail_x,
-                y=15,
-                anchor="nw",
-            )
+            # 兜底：正常启动时 <Map> 事件已经摆好，这里只在事件没赶上（例如绑定前窗口就已显示）时生效。
+            self._enter_from_right(window_width)
             self.snail_animation_id = self.master.after(30, self._animate_snail)
             return
         # 用屏幕绝对坐标相减换算成主窗口内的相对坐标，
@@ -196,8 +243,9 @@ class SnailManager:
             except tk.TclError:
                 pass
             self._bubble_canvas = None
-        if restore_pause:
+        if restore_pause and self._window_focused:
             # 气泡关闭后让蜗牛继续爬行；连点蜗牛时传 False 可保持暂停，避免动画闪跳。
+            # 窗口已失焦时也不恢复：否则用户切走后气泡到点自动关闭，蜗牛又会在后台爬。
             self.snail_paused = False
 
     def _show_speech_bubble(self, message: str) -> None:
@@ -351,3 +399,59 @@ class SnailManager:
             # 文案只是趣味功能，读取出错只打印警告并退回默认文案，绝不打断用户记账。
             print(f"警告：无法读取蜗牛消息，使用默认提示：{error}")
         self._show_speech_bubble(message)
+
+    def _snail_right_clicked(self, _event: tk.Event) -> None:
+        """彩蛋：右键蜗牛时随机传送到行进路线上，并弹出固定文案的气泡。"""
+        # 与左键一致，先暂停：否则蜗牛会在气泡展示期间继续爬走，气泡看起来像脱了钩。
+        self.snail_paused = True
+        self._teleport_snail()
+        self._show_speech_bubble(SNAIL_EASTER_EGG_MESSAGE)
+
+    def _snail_route_segments(self) -> list[tuple[int, int]]:
+        """给出行进路线上可停留的横向区间（已挖掉与标题文字重叠的那一段）。"""
+        window_width = self.master.winfo_width()
+        # 拿不到控件宽度时按 40 估算（与实际图片尺寸一致），避免算出负数区间。
+        snail_width = (
+            self.snail_label.winfo_width()
+            if self.snail_label is not None and self.snail_label.winfo_exists()
+            else 40
+        )
+        # 与 _animate_snail 用同一套相对坐标：屏幕坐标相减换算到主窗口内。
+        text_left = self.title_block.winfo_rootx() - self.master.winfo_rootx()
+        text_right = text_left + self.title_block.winfo_width()
+        # 右端要留出一个蜗牛身位，保证传送后整只蜗牛都在窗口内可见。
+        right_limit = max(0, window_width - snail_width)
+        segments: list[tuple[int, int]] = []
+        # 标题左侧的一段：只有窗口足够宽、放得下整只蜗牛时才存在。
+        left_limit = min(text_left - snail_width, right_limit)
+        if left_limit >= 0:
+            segments.append((0, left_limit))
+        # 标题右侧到窗口右缘的一段。
+        if text_right <= right_limit:
+            segments.append((text_right, right_limit))
+        # 窗口太窄时两段都放不下，退化成整条路线，至少保证传送可用。
+        if not segments:
+            segments.append((0, right_limit))
+        return segments
+
+    def _teleport_snail(self) -> None:
+        """把蜗牛随机挪到行进路线上的某个位置（右键彩蛋用）。"""
+        if self.snail_label is None or not self.snail_label.winfo_exists():
+            return
+        # 窗口还没完成布局时几何尺寸不可信，放弃这次传送，蜗牛维持原位。
+        if self.master.winfo_width() <= 1:
+            return
+        segments = self._snail_route_segments()
+        # 按区间长度加权抽取：长区间被选中的概率更高，落点在整条路线上更均匀。
+        start, end = random.choices(
+            segments,
+            weights=[end - start + 1 for start, end in segments],
+        )[0]
+        self.snail_x = random.randint(start, end)
+        # 标记为已入场：否则 _animate_snail 的首帧会按"从右侧爬进来"重置坐标，传送就白做了。
+        self.snail_started = True
+        # 只改 x，y 与动画保持一致固定在窗口顶部。
+        self.snail_label.place_configure(x=self.snail_x, y=15)
+        # 强制刷新一次几何信息：place_configure 不会立刻更新 winfo_x()，
+        # 不刷新的话紧接着创建的气泡仍会按蜗牛传送前的位置去定位。
+        self.master.update_idletasks()

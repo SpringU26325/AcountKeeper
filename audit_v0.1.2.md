@@ -233,3 +233,46 @@
 ### 与上文的冲突说明
 - 本文档上文出现的 `DEFAULT_CSV_DIR`、`CSV_PATH`、`legacy_csv_path`，以及「旧 CSV 迁移路径沿用 `last_export_dir`」等描述，**自本节起不再适用**；保留原文仅为追溯当时决策，不做回改。
 - 其中「`config.py` 不在允许修改清单内，其 `DEFAULT_CSV_DIR` 常量名与注释维持原样」一条已被本节第 2 点取代。
+
+---
+
+## 蜗牛焦点暂停、启动入口与右键彩蛋说明（2026-09-26）
+
+### #30 复现结论（推翻上文「未能复现」的判断）
+- 真实成因：`_animate_snail()` 把 `self.master.winfo_ismapped()` 当作「窗口是否可用」的判据。按下 Alt（或 Alt+Tab 切走）时 Tk 会短暂认为主窗口未映射，动画定时器据此提前 `return`，蜗牛就停在原地不再动，表现为「按 Alt 后蜗牛卡死」。
+- 修复：`_animate_snail()` 删除 `winfo_ismapped()` 判断，只用 `if self.master.winfo_width() <= 1:` 作为「窗口尚未完成布局」的重试条件。
+  - 注意：这个判据单独用是不够的 —— 未显示的窗口 `winfo_width()` 返回的是 Tk 默认的 **200** 而不是 1，于是首帧就把它当真实宽度，蜗牛改从窗口偏左处入场。后续已用 `_window_shown`（由 `<Map>` 事件置位）替换，详见下一节。
+- 暂停/恢复改由窗口焦点事件驱动：`<FocusOut>` 暂停、`<FocusIn>` 恢复。用焦点事件而不是键盘事件判断，才不会把 Alt 这类系统按键误当成「离开窗口」。
+- 收口补丁：`<FocusIn>` 不再无条件恢复动画，只有 `_bubble_canvas is None`（没有活动气泡）时才恢复；`_destroy_active_bubble()` 也只在窗口持有焦点（`_window_focused`）时才恢复。否则「点开气泡 → 切走 → 切回」或「切走后气泡到点自动关闭」都会让蜗牛在气泡还挂着 / 窗口在后台时继续爬行。
+
+### 启动入口位置回归修复（由 #30 的修复引入）
+- 现象：软件启动时蜗牛不是从窗口最右侧出发，而是从窗口偏左的某个固定位置冒出来。
+- 真实成因：`SnailManager.start()` 是在主窗口 `geometry()` 之后、但窗口还没真正显示时被调用的，此时 `winfo_width()` 返回 Tk 默认的 **200**（不是 1），`winfo_ismapped()` 为 0。删掉 `winfo_ismapped()` 判断后，`winfo_width() <= 1` 这个唯一的「等窗口就绪」判据在启动阶段失效：首帧动画就在 width=200 下把入口定在 `x=200` 并置 `snail_started = True`；等 `<Map>` 到达、真实宽度变成 1200 时，因为已经 `snail_started` 而不再回到最右侧，蜗牛就从 x=200 一路向左爬。
+- 修复：新增「只在启动阶段判一次」的 `_window_shown` 状态（由 `<Map>` 事件置位），与 Alt 无关，因此不会让 #30 的卡死回归。
+  - `start()`：移除内联的右侧摆放，改为绑定 `self.master.bind("<Map>", self._on_window_shown)`；保留「窗口早已显示、之后才创建蜗牛」的分支（该分支同时置 `_window_shown = True`）。
+  - 新增 `_on_window_shown()`：`<Map>` 到达时置 `_window_shown = True`，且仅在尚未入场时按真实宽度摆到最右侧。从最小化恢复同样会触发 `<Map>`，靠 `snail_started` 防止重摆。
+  - 新增 `_enter_from_right(window_width)`：把「摆到最右侧」抽成一个方法，宽度 ≤ 1 时直接返回，留给下一帧重试。
+  - `_animate_snail()`：重试判据改为 `if not self._window_shown or self.master.winfo_width() <= 1:`，首帧分支改用 `_enter_from_right()`。
+- 验证（真实启动序列，内联脚本未落盘）：首帧 `winfo_width=200`、`ismapped=0` → 正确跳过不摆放；`<Map>` 后 `winfo_width=1200` → `snail_x` 从 1200 开始逐帧 −2px 左移，`snail_label.winfo_x()` 与 `snail_x` 一致。彩蛋 #41 回归 4/4 通过（传送落点在路线区间内、气泡期间静止、关闭后恢复爬行、左键随机文案不受影响、爬出左边界后重新从最右侧入场）。
+
+### #41 右键彩蛋
+- 行为：在蜗牛上右键（`<Button-3>`），蜗牛随机传送到行进路线上的某一点，并弹出气泡「彩蛋：诶~我躲」；气泡 3 秒后自动关闭或点击立即关闭，之后蜗牛从新位置继续爬行。
+- 「行进路线」的定义与动画保持一致：可停留的横向区间 = 窗口宽度内减去一个蜗牛身位，并挖掉与标题控件重叠的那一段（左侧一段 + 标题右侧到窗口右缘一段，按区间长度加权随机取点）。这样传送后蜗牛既不会压住标题，也不会露出窗口外。
+- 文案常量 `SNAIL_EASTER_EGG_MESSAGE` 放在 `snail.py` 而不是 `snail_messages.json`：后者是左键随机抽取的扁平列表，把这句塞进去会按比例出现在普通左键点击里，彩蛋就不再是彩蛋了。
+- 一个必须注意的 Tk 细节：`place_configure()` 不会立刻更新 `winfo_x()`（实测需一次 idle 周期），而气泡是按 `snail_label.winfo_x()` 定位的。因此 `_teleport_snail()` 末尾显式调用 `self.master.update_idletasks()`，否则气泡会挂在蜗牛传送前的位置。
+- 另一处细节：传送后把 `snail_started` 置为 `True`，否则 `_animate_snail()` 的首帧会按「从右侧爬进来」重置坐标，把传送结果冲掉。
+
+### 本次改了什么
+1. `snail.py`（唯一改动的代码文件）
+   - 模块级新增常量 `SNAIL_EASTER_EGG_MESSAGE`；
+   - `_animate_snail()`：删除 `winfo_ismapped()` 判断；
+   - `start()`：新增 `<FocusOut>` / `<FocusIn>` / `<Button-3>` 三个绑定；
+   - 新增 `_on_focus_out()` / `_on_focus_in()` / `_snail_right_clicked()` / `_snail_route_segments()` / `_teleport_snail()`；
+   - 启动入口回归修复：新增 `_window_shown` 状态与 `_on_window_shown()` / `_enter_from_right()`，`start()` 改绑 `<Map>`，`_animate_snail()` 重试判据改为 `not self._window_shown or winfo_width() <= 1`；
+   - `_destroy_active_bubble()`：恢复条件加上 `self._window_focused`。
+2. `issues.txt`：#41 移出 P3 并记入已修复历史；顶部「编号变更」区那行改为「现已实现（右键传送）」；另追加 #30 回归修复记录（已修复历史新增一条 + 顶部编号变更区补一行说明）。
+3. 未改动 `snail_messages.json`（原因见上），也未触碰 `ui.py` / `config.py` / `settings.py` / `store.py` / `dialogs.py` / `widgets.py` / `chart_window.py` / `account_keeper.py`。
+4. 验证：`ast.parse` 语法检查通过；用真实 Tk 实例跑过冒烟测试（内联脚本，未落盘）——路线区间计算正确（示例 `[(0, 102), (475, 1077)]`）、连续传送后 `winfo_x()` 与 `snail_x` 一致、右键后气泡生成且居中于蜗牛新位置、气泡关闭后动画恢复、左键随机文案不受影响、传送后动画从新位置继续左移（未被首帧重置）。
+
+### 与上文的冲突说明
+- 本文档「附：精简清单中新增的两项」中 #30 一条的「本次审计未能在代码中复现该行为」结论已被本节推翻；保留原文仅为追溯当时判断。
