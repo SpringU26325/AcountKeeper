@@ -130,10 +130,23 @@ class AccountStore:
                 "FROM accounts ORDER BY id"
             ).fetchall()
         # 数据库里金额是字符串，这里重新构造 Decimal，保证后续汇总计算不损失精度。
-        self.records = [
-            Account(record_id, record_date, Decimal(amount), category, note)
-            for record_id, record_date, amount, category, note in rows
-        ]
+        # 但要逐行捕获异常：历史库或手工改过的库里可能出现 "abc" 这类无法解析的金额，
+        # Decimal() 会抛出 InvalidOperation，而 load() 是在 __init__ 里调用的，
+        # 一旦抛出就会让整个程序在启动阶段闪退（用户只看到「双击没反应」）。
+        records: list[Account] = []
+        for record_id, record_date, amount, category, note in rows:
+            try:
+                parsed_amount = Decimal(amount)
+            except (InvalidOperation, TypeError, ValueError) as error:
+                # 只跳过这一行：数据库里的原始记录保持原样，绝不顺手改写或删除用户数据。
+                print(
+                    f"警告：记录 ID {record_id} 的金额无法解析（{amount!r}），已跳过该行：{error}"
+                )
+                continue
+            records.append(
+                Account(record_id, record_date, parsed_amount, category, note)
+            )
+        self.records = records
 
     def next_id(self) -> int:
         # 取当前最大 ID 加一；空表时 default=0 返回 1，避免 max() 在空序列上报错。

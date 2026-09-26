@@ -1,16 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_all
 
-datas = [('image', 'image')]
-datas += collect_data_files('customtkinter')
+datas = [('image', 'image'), ('snail_messages.json', '.')]
+binaries = []
+hiddenimports = []
+tmp_ret = collect_all('customtkinter')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('matplotlib')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
     ['account_keeper.py'],
     pathex=[],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
-    hiddenimports=[],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -26,7 +31,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='AccountKeeper',
+    name='AccountKeeper_v0.1.1-alpha',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
