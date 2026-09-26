@@ -115,3 +115,38 @@
 [ ] #30 - 按 Alt 时蜗牛暂停 (涉及文件: snail.py)
     详情：原 issues.txt 第 11 条。本次审计未能在代码中复现该行为，
     snail.py 只对点击事件（_snail_clicked）做了处理，未发现 Alt 相关绑定。需用户补充复现步骤后再确认。
+
+---
+
+## Step 1.5 返工说明（2026-09-26）
+
+背景：本节记录 #12.1 的返工过程，作为「实现与需求不同步 → 主动收敛」的留痕。
+
+1. **原实现（Step 1）按「可自定义 db_path + csv_dir」设计**：
+   `config.py` 新增了 `DEFAULT_DB_PATH` 作为回退常量；`settings.py` 的 `load_settings()`
+   同时读取并校验 `db_path`（要求必须指向具体文件）与 `csv_dir` 两个字段，
+   `save_settings(db_path, csv_dir)` 两个参数，`get_effective_paths()` 返回 `(db_path, csv_dir)`。
+
+2. **需求变更：取消 db_path 自定义，仅保留 csv_dir**：
+   后续评估发现让用户自定义数据库路径的实际收益有限（需额外承担「切换路径后旧数据不迁移、
+   用户误以为数据丢失」的沟通成本，且数据库本身已固定在用户数据目录、满足需求 3.1 的防丢失要求），
+   因此决定数据库路径固定为 `DATA_DIR / "account.db"`、不提供任何配置入口，
+   用户可配置项收窄为「CSV 导出目录」一项。`requirements.md` 的 §2、§3.1、§3.11 已同步重写。
+
+3. **settings.py 收敛结果**：
+   - `config.py`：删除 `DEFAULT_DB_PATH`，`DB_PATH` 注释明确「固定路径、不可自定义」。
+   - `settings.py`：只读写 `csv_dir`；`load_settings()` 的返回值扩展为三元组
+     `(csv_dir, is_fallback, is_first_run)`，把「首次运行」与「异常回退」两个语义分开——
+     文件不存在时返回 `is_first_run=True`（正常情况，UI 不弹窗），
+     文件存在但解析失败 / 字段缺失 / 路径非法 / 目录不可用时返回 `is_fallback=True`（UI 弹窗提示）。
+   - `save_settings(csv_dir: Path) -> bool`：写入前做 expanduser/resolve/mkdir 校验，
+     失败返回 False 而不抛异常，由 UI 层决定弹窗措辞。
+   - `get_effective_csv_dir() -> tuple[Path, bool, bool]`：额外补一层「文件系统真实可用性」校验
+     （U 盘拔出、网络盘断开、无权限等），这类情况同样回退默认目录并置 `is_fallback=True`。
+
+4. **结论：#12.1 正式完成**，已用 `tempfile` 隔离环境实测 7 种输入场景
+   （不存在 / 解析失败 / 根节点非对象 / 字段缺失 / 类型非法 / 正常读取 / 路径不可用），
+   返回值均符合上述语义，且未触碰真实 `settings.json`。
+
+5. **剩余待办**：#12.2（启动流程读取配置）、#12.3（设置界面对话框）、#12.4（export_csv 使用 csv_dir）
+   仍按原计划分步实施，本次未修改任何其他 `.py` 文件。
