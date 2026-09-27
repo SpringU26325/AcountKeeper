@@ -278,36 +278,14 @@ def ask_edit_record(
                 fg_color="#FFFFFF",
             )
 
-            # 参数必须用「默认参数」把 entry / variable 当场绑死，不能直接引用外层名字：
-            # 这两个名字在同一个 for 循环里会被后一轮（备注字段）重新赋值，
-            # 闭包晚绑定拿到的就是备注框——实测类别列表会锚到备注框上，
-            # 位置整体下移 92px、宽度多出 52px，而且选中项会被写进备注。
-            def _pick_category(
-                target: ctk.CTkEntry = entry,
-                var: ctk.StringVar = variable,
-            ) -> None:
-                """打开类别选择器，把选中的类别回填到输入框（需求 3.13）。"""
-                # 锚点用输入框而不是 category_row：弹窗宽度与输入框等宽、左边缘与输入框对齐。
-                # 候选用打开弹窗时按 record.amount 正负号算好的那一套（见上方 category_values），
-                # 不随用户在金额框里改符号而变化，避免候选列表跟着输字符跳动。
-                picked = ask_category(dialog, target, category_values, var.get())
-                # 返回 None 表示用户取消/按 ESC，此时保持输入框原值不变。
-                if picked:
-                    var.set(picked)
-                # 类别列表自己是另一个 grab 窗口：它关闭时 Tk 会把 grab 一并释放掉，
-                # 而「上一个 grab」并不会自动恢复，不补这一行编辑弹窗就丢了模态
-                # （列表关掉后还能点到主窗口）。这里把它抢回来。
-                # winfo_exists() 判断是必须的：列表开着时用户仍能点编辑弹窗的右上角关闭，
-                # 那种情况下这里的 dialog 已经被销毁，直接 grab_set() 会抛 TclError。
-                if dialog.winfo_exists():
-                    dialog.grab_set()
-
-            # 与日期行同一套写法：按钮先 pack 且 side="right" 钉在右端（36x34），
-            # 输入框再 pack 且 expand=True 占满剩余宽度，两者高度齐平。
-            ctk.CTkButton(
+            # ▼ 按钮改在闭包之前建：闭包要拿到它的引用（见下面 toggle=），
+            # 而 command 得等闭包定义好才能接上，于是先建控件、后 configure。
+            # 留引用是给 category_picker 用的：它的「点弹窗外面就关」监视器必须把
+            # 本按钮排除掉，否则按下时先关掉列表、紧接着 command 又把它打开，
+            # 表现出来就是「点 ▼ 关不上」。
+            category_button = ctk.CTkButton(
                 category_row,
                 text="▼",
-                command=_pick_category,
                 width=36,
                 height=34,
                 corner_radius=9,
@@ -315,7 +293,38 @@ def ask_edit_record(
                 hover_color="#D2DEE9",
                 text_color="#243447",
                 font=("Microsoft YaHei UI", 11),
-            ).pack(side="right", padx=(6, 0))
+            )
+
+            # 参数必须用「默认参数」把 entry / variable 当场绑死，不能直接引用外层名字：
+            # 这两个名字在同一个 for 循环里会被后一轮（备注字段）重新赋值，
+            # 闭包晚绑定拿到的就是备注框——实测类别列表会锚到备注框上，
+            # 位置整体下移 92px、宽度多出 52px，而且选中项会被写进备注。
+            def _pick_category(
+                target: ctk.CTkEntry = entry,
+                var: ctk.StringVar = variable,
+                toggle: ctk.CTkButton = category_button,
+            ) -> None:
+                """打开类别选择器，把选中的类别回填到输入框（需求 3.13）。"""
+                # 锚点用输入框而不是 category_row：弹窗宽度与输入框等宽、左边缘与输入框对齐。
+                # 候选用打开弹窗时按 record.amount 正负号算好的那一套（见上方 category_values），
+                # 不随用户在金额框里改符号而变化，避免候选列表跟着输字符跳动。
+                # toggle 传给弹窗：再点一次这个 ▼ 表示关闭列表（返回 None），输入框原值不动。
+                picked = ask_category(
+                    dialog, target, category_values, var.get(),
+                    toggle_button=toggle,
+                )
+                # 返回 None 表示用户取消/按 ESC/再点一次 ▼，此时保持输入框原值不变。
+                if picked:
+                    var.set(picked)
+                # 这里不用再补 grab_set：编辑弹窗原来握着的 grab 是 category_picker
+                # 主动借走、关闭时原样还回来的（见 category_picker._cleanup）。
+                # 自己再抢一次纯属重复，还会掩盖借还逻辑真实是否成对的问题。
+
+            category_button.configure(command=_pick_category)
+
+            # 与日期行同一套写法：按钮先 pack 且 side="right" 钉在右端（36x34），
+            # 输入框再 pack 且 expand=True 占满剩余宽度，两者高度齐平。
+            category_button.pack(side="right", padx=(6, 0))
             entry.pack(side="left", fill="x", expand=True)
             entries.append(entry)
             continue

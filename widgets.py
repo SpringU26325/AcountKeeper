@@ -321,7 +321,10 @@ class InputFrame(ctk.CTkFrame):
         # 所以两行的 ▼ 看起来是同一个控件。
         # 先 pack 按钮（side="right"）再 pack 输入框（expand=True），写法与日期字段一致，
         # 保证「输入框右边缘」和「▼ 按钮右边缘」两行都落在同一条竖线上。
-        ctk.CTkButton(
+        # 这里特意留一个引用（日期那个 ▼ 是匿名的）：category_picker 的
+        # 「点弹窗外面就关」监视器必须把本按钮排除掉，否则鼠标按下时先关掉列表、
+        # 紧接着 command 又把列表重新打开，表现出来就是「点 ▼ 关不上」。
+        self.category_button = ctk.CTkButton(
             category_frame,
             text="▼",
             command=self._pick_category,
@@ -332,7 +335,8 @@ class InputFrame(ctk.CTkFrame):
             hover_color="#D2DEE9",
             text_color="#243447",
             font=("Microsoft YaHei UI", 11),
-        ).pack(side="right", padx=(6, 0))
+        )
+        self.category_button.pack(side="right", padx=(6, 0))
         self.category_entry.pack(side="left", fill="both", expand=True)
 
         ctk.CTkLabel(
@@ -376,13 +380,16 @@ class InputFrame(ctk.CTkFrame):
         # 这样切换支出/收入后弹出的列表自动就是对应的那一套（需求 3.13），
         # 保存新记录后刷新历史也不需要再回头去改任何控件的 values。
         # 以 category_entry 为 anchor：弹窗宽度与它等宽、左边缘与它对齐。
+        # toggle_button 传自己这个 ▼：弹窗开着时再点它一次表示关闭列表
+        # （ask_category 返回 None），而不是被「点外面」逻辑抢先关掉。
         picked = ask_category(
             self.winfo_toplevel(),
             self.category_entry,
             self._categories_for(self.amount_type_var.get()),
             self.category_var.get(),
+            toggle_button=self.category_button,
         )
-        # 返回 None 表示用户取消/按 ESC，此时保持输入框原值不变。
+        # 返回 None 表示用户取消/按 ESC/再点一次 ▼，此时保持输入框原值不变。
         if picked:
             self.category_var.set(picked)
 

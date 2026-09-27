@@ -18,12 +18,20 @@
 本模块改用 CTkToplevel 自己画一列类别项：位置、宽度、配色全部由我们控制，
 既不经过 Tk 原生菜单，也就不需要去改 CustomTkinter 的下拉实现。
 布局与提交流程对齐 calendar_picker.py，保证两个弹窗看起来是一家人。
+
+交互上本弹窗刻意**不** grab_set，这一点与 calendar_picker 相反，原因是需求要求
+「再点一次同一个 ▼ 就把列表关掉」和「点弹窗外的别处也关掉」：只要 grab 住，
+弹窗外的一切鼠标事件都会被 Tk 直接丢掉，第二次点 ▼ 根本进不来，toggle 永远做不到。
+放弃 grab 的代价是弹窗不再模态——关掉它的那一次外部点击会同时作用到被点的控件上
+（点「添加」就真的会添一条记录）。这一点无法两全，只能选 toggle。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
+from typing import Callable
 
 import customtkinter as ctk
 
@@ -50,6 +58,29 @@ _GAP_ABOVE = 6  # 弹窗与输入框之间的竖向缝隙
 _MIN_WIDTH = 180  # 输入框窄到离谱时的兜底宽度（逻辑像素）
 _SCREEN_MARGIN = 8  # 贴边保护，避免弹窗压在屏幕边缘上
 _POLL_INTERVAL_MS = 50  # 复查锚点位置的轮询间隔（Windows 下窗口移动是异步的）
+
+
+@dataclass
+class _ActivePicker:
+    """当前打开的类别弹窗（同一时刻只允许一个，见下方 _active_picker）。"""
+
+    dialog: ctk.CTkToplevel
+    anchor: tk.Misc  # 锚点输入框：用来判断用户是不是又点了同一个 ▼
+    toggle: tk.Misc | None  # 调用方的 ▼ 按钮：点它算 toggle，不算「点了外面」
+    close: Callable[[], None]  # 关闭函数，由 ask_category 内部的闭包提供
+
+
+_active_picker: _ActivePicker | None = None
+
+# 全局 <Button-1> 监视器是否已安装。这里刻意「只装一次、之后永不摘」：
+# CustomTkinter 自己在每个 CTk / CTkToplevel 上都会绑一个全局 <Button-1>
+# （ctk_tk.py:86、ctk_toplevel.py:82，用来让 CTkEntry/CTkTextbox 在点别处时失焦），
+# 也就是说 "all" 绑定标签上的 <Button-1> 是别人也在用的公共资源——
+# 一旦 unbind_all("<Button-1>")，CTk 那套「点空白处失焦」会跟着一起失效；
+# 而 tk.Misc.unbind 只能按 funcid 精确摘 self._w 上的绑定，摘不到 "all" 标签，
+# 想「用完就摘」其实无路可走。所以只剩常驻一个空转回调这一种写法：
+# 没有弹窗时它第一句就 return，开销可以忽略，换来的是绝不去动别人的全局绑定。
+_click_monitor_installed = False
 
 
 def _apply_logo_icon(window: tk.Misc) -> None:
@@ -87,11 +118,85 @@ def _window_scaling(widget: tk.Misc) -> float:
     return scaling if scaling > 0 else 1.0
 
 
+def _is_inside(widget: tk.Misc, ancestor: tk.Misc) -> bool:
+    """widget 是不是 ancestor 自己或它的后代（沿 master 链往上找）。"""
+    # 不能直接比对对象：CTk 是复合控件，Tk 事件里的 event.widget 往往是
+    # 内部那块画布 / 内层 tkinter.Entry，而不是 Python 层那个 CTkButton。
+    node: tk.Misc | None = widget
+    while node is not None:
+        if node is ancestor:
+            return True
+        node = getattr(node, "master", None)
+    return False
+
+
+def _register_picker(item: _ActivePicker) -> None:
+    """登记「当前打开的类别弹窗」。"""
+    global _active_picker
+    _active_picker = item
+
+
+def _clear_picker(dialog: tk.Misc) -> None:
+    """撤销登记；只有登记的还是自己时才清，避免误清掉后开的新弹窗。"""
+    global _active_picker
+    if _active_picker is not None and _active_picker.dialog is dialog:
+        _active_picker = None
+
+
+def _on_any_click(event: tk.Event) -> None:
+    """全局 <Button-1> 监视：点到弹窗外的地方就把弹窗关掉。
+
+    弹窗放弃了 grab_set（见模块 docstring），点弹窗外的行为不再被 Tk 拦下，得自己判断。
+    判定口径：
+      - 点击落在弹窗自己身上 → 不关（否则列表里一项都点不中）；
+      - 点击落在调用方那个 ▼ 按钮上 → 不关。这个白名单是必须的：鼠标点击会拆成
+        <Button-1> 与 <ButtonRelease-1> 两次事件，如果按下时就把列表关掉，
+        紧接着按钮的 command 回调又把列表重新打开，表现出来就是「点了 ▼ 闪一下没关上」；
+      - 其余情况一律关掉。
+    注意事件只会送到本应用内部（点桌面或别的程序 Tk 根本收不到），
+    所以「切出去看个数再切回来」不会把列表弄丢。
+    """
+    active = _active_picker
+    if active is None:
+        # 常态：没有弹窗。这一句就是常驻回调的全部日常开销。
+        return
+    widget = event.widget
+    if not isinstance(widget, tk.Misc):
+        return
+    try:
+        if not active.dialog.winfo_exists():
+            return
+        inside_dialog = widget.winfo_toplevel() is active.dialog
+    except tk.TclError:
+        return
+    if inside_dialog:
+        return
+    if active.toggle is not None and _is_inside(widget, active.toggle):
+        return
+    active.close()
+
+
+def _ensure_click_monitor(widget: tk.Misc) -> None:
+    """安装全局 <Button-1> 监视器（进程内只装一次，之后一直留着）。"""
+    global _click_monitor_installed
+    if _click_monitor_installed:
+        return
+    try:
+        # 必须 add="+"：CTk 已经在这个标签上挂了它自己的 set_focus 回调，
+        # 不加 "+" 会把那一条覆盖掉，CTkEntry/CTkTextbox 点别处失焦就废了。
+        tk.Misc.bind_all(widget, "<Button-1>", _on_any_click, add="+")
+    except tk.TclError:
+        # 装不上只影响「点外面关闭」这一个便利功能，弹窗本身照常可用。
+        return
+    _click_monitor_installed = True
+
+
 def ask_category(
     parent: tk.Misc,
     anchor: tk.Misc,
     values: list[str],
     current: str = "",
+    toggle_button: tk.Misc | None = None,
 ) -> str | None:
     """在 anchor 控件正下方弹出类别列表。
 
@@ -101,10 +206,43 @@ def ask_category(
             上边缘贴在它下边缘再往下 _GAP_ABOVE 像素。
         values: 候选类别（预置 + 历史，调用方已去重）。
         current: 输入框里的当前内容，用于在列表里高亮当前项。
+        toggle_button: 调用方那个 ▼ 按钮。点它属于「再点一次关闭」而不是「点外面」，
+            所以全局点击监视器要把它排除掉；不传只是少这一个白名单，功能不受影响。
 
     Returns:
-        选中的类别；用户点「取消」、按 ESC 或点右上角关闭时返回 None。
+        选中的类别；用户点「取消」、按 ESC、点右上角关闭、再点一次同一个 ▼，
+        或者点弹窗外的别处时返回 None。
     """
+    # 【toggle / 防叠加】先处理「已经有一个类别弹窗开着」的情况，必须早于建窗：
+    # 弹窗的 wait_window 是嵌套事件循环，上一次调用还停在那一行没返回，
+    # 但它的窗口是活的，只能由这新一次调用负责关掉。
+    #   - 同一个锚点（用户又点了一次同一个 ▼）：关掉旧的，直接返回 None。
+    #     调用方拿到 None 就不会去 set 输入框，所以内容一个字符都不会变。
+    #   - 别的锚点（主窗口开着时又点了编辑弹窗的 ▼）：关掉旧的再开新的，防连点叠加。
+    existing = _active_picker
+    if existing is not None:
+        same_anchor = existing.anchor is anchor
+        existing.close()
+        if same_anchor:
+            return None
+
+    # 【grab 借还】本弹窗不 grab_set，但调用方自己可能正握着 grab——编辑记录弹窗就是，
+    # 它会挡住本弹窗的点击。所以这里把它的 grab 临时借走，_cleanup 里原样还回去。
+    # 只认「parent 自己握着 grab」这一种：Tk 的本地 grab 会把发给同应用其他窗口的
+    # 鼠标事件全部改投给 grab 窗口，所以别处握着 grab 时本函数压根不会被调用到。
+    previous_grab: tk.Misc | None = None
+    try:
+        current_grab = parent.grab_current()
+        holds_grab = current_grab is not None and current_grab.winfo_toplevel() is parent
+    except tk.TclError:
+        holds_grab = False
+    if holds_grab:
+        previous_grab = current_grab
+        try:
+            current_grab.grab_release()
+        except tk.TclError:
+            previous_grab = None
+
     dialog = ctk.CTkToplevel(parent)
     dialog.title("选择类别")
     dialog.resizable(False, False)
@@ -190,11 +328,33 @@ def ask_category(
                     tk.Misc.unbind(widget, sequence, funcid)
             except tk.TclError:
                 pass
+        # 撤销「当前弹窗」登记：不清的话下一次 ask_category 会对一个已销毁的弹窗
+        # 调 close()，toggle 判断也跟着错乱。
+        _clear_picker(dialog)
+        # 把开头借走的 grab 还回调用方（编辑记录弹窗的模态性不能因为开了个类别列表
+        # 就永久丢掉）。调用方可能已被连带销毁，所以要先判断窗口还在不在。
+        if previous_grab is not None:
+            try:
+                if previous_grab.winfo_exists():
+                    previous_grab.grab_set()
+            except tk.TclError:
+                pass
+        # 焦点还给锚点：弹窗一销毁焦点就落到一个不存在的窗口上，键盘操作会短暂失灵。
+        try:
+            if anchor.winfo_exists():
+                anchor.focus_set()
+        except tk.TclError:
+            pass
 
     def _close_dialog() -> None:
         """统一的关闭出口：先收尾再销毁，保证不存在「销毁了但没摘回调」的窗口期。"""
         _cleanup()
-        dialog.destroy()
+        try:
+            dialog.destroy()
+        except tk.TclError:
+            # 弹窗已经先一步被连带销毁（父窗口被关掉、或 toggle 时旧弹窗正在关闭中）：
+            # 这里只是重复销毁一次，忽略即可。
+            pass
 
     def _choose(value: str) -> None:
         """选中某一项：记下结果并关闭弹窗，让 wait_window 返回。"""
@@ -370,8 +530,49 @@ def ask_category(
     # 这个绑定只挂在弹窗自己身上，弹窗一销毁就随 Tk 一起回收，不用登记进 bound。
     dialog.bind("<Destroy>", _on_destroy, add="+")
 
-    # grab_set 把键盘事件收进弹窗，ESC 才能稳定生效（与 calendar_picker 一致）。
-    dialog.grab_set()
+    def _on_map(event: tk.Event) -> None:
+        """弹窗真正显示出来时把焦点抢过来，ESC 才可能生效。
+
+        以前靠 grab_set 收键盘，现在没有 grab 了，键盘事件只会送给「拥有焦点的窗口」，
+        而点完 ▼ 焦点其实留在主窗口（CTk 那个全局 <Button-1> 回调会把焦点交给刚被点中的
+        画布），不主动抢一次的话按 ESC 会毫无反应。
+        只认 event.widget is dialog：<Map> 是沿绑定标签传播的，弹窗里每个子控件映射时都会
+        回调到这里，那些要滤掉。真正的窗口映射有两次：初次显示，以及 CTkToplevel 在
+        Windows 上那次 withdraw() → after(5) → deiconify()（ctk_toplevel.py:280）。
+        所以这里不能加「只抢一次」的开关，否则会被第一次那个还没 withdraw 的假显示骗过去。
+        """
+        if event.widget is not dialog:
+            return
+        try:
+            if not dialog.winfo_exists():
+                return
+            focused = dialog.focus_get()
+            if focused is not None and _is_inside(focused, dialog):
+                return  # 焦点已经在弹窗里（例如用户刚点了某一项），不抢
+            dialog.focus_force()
+        except (tk.TclError, KeyError):
+            pass
+
+    dialog.bind("<Map>", _on_map, add="+")
+
+    # 「点弹窗外面就关」的全局监视器：装一次，之后一直留着（原因见
+    # _click_monitor_installed 处的注释）。
+    _ensure_click_monitor(dialog)
+
+    # 登记为「当前打开的类别弹窗」：下一次 ask_category 靠它判断是 toggle 关闭
+    # 还是「换一个锚点重开」，见函数开头那一段。
+    _register_picker(
+        _ActivePicker(
+            dialog=dialog,
+            anchor=anchor,
+            toggle=toggle_button,
+            close=_close_dialog,
+        )
+    )
+
+    # 这里刻意不 grab_set（与 calendar_picker 相反）：一旦 grab，弹窗外的一切点击都被
+    # Tk 拒绝，「再点一次同一个 ▼ 关闭」和「点外面关闭」这两条需求就永远实现不了。
+    # 调用方原本握着的 grab 已在函数开头借走，_cleanup 里会原样还回去。
     parent.wait_window(dialog)
     # 再兜一次：不管弹窗走的是哪条关闭路径，函数返回前保证回调和定时器都已摘掉。
     _cleanup()
