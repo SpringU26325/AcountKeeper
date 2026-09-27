@@ -24,6 +24,15 @@
 弹窗外的一切鼠标事件都会被 Tk 直接丢掉，第二次点 ▼ 根本进不来，toggle 永远做不到。
 放弃 grab 的代价是弹窗不再模态——关掉它的那一次外部点击会同时作用到被点的控件上
 （点「添加」就真的会添一条记录）。这一点无法两全，只能选 toggle。
+
+弹窗底部是一条操作区（footer，见下方 _FOOTER_* 常量与「底部操作区」那一段）：
+第一行是「新类别输入框 + 「+ 保存」按钮」，第二行是一行提示语；列表里每一项右侧
+各有一个「×」按钮，点它就把该类别从候选里**真删掉**（category_prefs.delete_user）。
+这些动作全部交给 category_prefs 落盘，本模块只负责「改完之后把列表重画一遍」
+（_render_list）。
+
+footer 里那个输入框是**弹窗自己的**，不绑主窗口的 category_var：存什么完全以它
+里面的文字为准，主窗口输入框只在「点选了某一项」时通过返回值回流一次。
 """
 
 from __future__ import annotations
@@ -34,6 +43,11 @@ import tkinter as tk
 from typing import Callable
 
 import customtkinter as ctk
+
+# 候选与增删都交给 category_prefs（user 列表就是唯一真源，那份规则只有一份实现）。
+# 这里只导入函数、不导入 EXPENSE/INCOME：方向由调用方按关键字传进来，
+# 本模块不替调用方决定「没传时算哪一个方向」——猜错方向会静默写错一份列表。
+from category_prefs import build_candidates, delete_user, save_user
 
 # 与 calendar_picker.py / dialogs.py 的弹窗保持同一套浅色主题配色。
 _BG_COLOR = "#F0F4F8"
@@ -48,15 +62,51 @@ _SCROLLBAR_HOVER_COLOR = "#90A4AE"
 _ITEM_HEIGHT = 32
 _MAX_VISIBLE_ITEMS = 7
 
+# ---------- 底部操作区（footer） ----------
+# 结构：第一行 = 新类别输入框 + 「+ 保存」按钮；第二行 = 一行提示语。
+# 高度拆成常量是为了让「弹窗总高度」能一条式子算出来：
+#   50 = 28（输入框/按钮行）+ 4（行距）+ 18（一行提示语）
+_FOOTER_GAP = 6  # 列表与 footer 之间的竖向缝隙
+_BUTTON_ROW_HEIGHT = 28
+# 提示语那一行的高度。**必须**在建 hint_label 时原样传给它：CTkLabel 的 height 默认
+# 是 28（与字号无关），不传就等于「预算 18、实花 28」，footer 会凭空多要 10px，
+# 那 10px 只能从别处扣，扣到的就是这条提示语自己。
+_HINT_ROW_HEIGHT = 18
+_FOOTER_HEIGHT = _BUTTON_ROW_HEIGHT + 4 + _HINT_ROW_HEIGHT
+
+# 提示语只留一句，说明「footer 这个输入框怎么用」。必须点明「要在这里输入」：
+# 弹窗自带输入框之后，在主窗口那个框里打字并不会进候选，沿用旧文案
+# 「可直接输入新类别名」会让人以为自己打的字已经被收下了。
+# 「×」不再另做图例：它是各 App 里删掉一项的通用符号，不需要解释；而弹窗最窄时
+# （锚点 180px）一行里也塞不下第二句。
+_HINT_LINE_1 = "输入新类别后点 + 保存"
+_HINT_COLOR = "#90A4AE"
+_ERROR_COLOR = "#D64545"  # 写盘失败时把提示语染成警示色
+
+# 动作按钮的文字。× (U+00D7) 是 Microsoft YaHei UI **自带**字形，不依赖字体回退，
+# 各 App 里「删除/移除这一项」都用它（关标签页、删块）。
+# 刻意不用 ✕(U+2715)：它在 YaHei UI 里没有字形，靠系统字体回退才显示得出来，
+# 跨环境一致性不如上面这个原生字符。
+_ACTION_REMOVE_TEXT = "×"
+_SAVE_TEXT = "+ 保存"
+
+_SAVE_BUTTON_WIDTH = 64
+_ACTION_BUTTON_WIDTH = 28
+
 # 调用方那个 ▼ 按钮的文字：弹窗开着时翻成 ▲，关掉时翻回 ▼。
-# ▲/▼ 是 U+25B2 / U+25BC，Microsoft YaHei UI 自带字形（当初日期/类别按钮选 ▼
-# 而不是 emoji 📅，就是这个原因），翻转不会出现缺字方块。
+# ▲/▼ 是 U+25B2 / U+25BC，是 Microsoft YaHei UI **自带**字形（不靠字体回退），
+# 所以翻转既不会缺字、也不受系统字体环境差异影响。
 # 「关态」刻意与调用方创建按钮时写的初始文字保持一致——本模块拿到的是别人建好的
 # 控件，只能保证「关掉之后回到 ▼」；一旦有人改了 widgets.py / dialogs.py 里建按钮处
 # 的文字，这两处必须同步改，否则会出现「关掉了但图标没回原样」的错觉。
 _TOGGLE_TEXT_CLOSED = "▼"
 _TOGGLE_TEXT_OPEN = "▲"
 
+# 列表区的圆角半径。它同时会**撑高**列表区：CTkScrollableFrame 真正被 pack 进父容器
+# 的是它内部那层 _parent_frame，而该层在上下各留了一个圆角半径的间距，所以列表区
+# 向父容器申请的高度是「视口高 + 2 × 本值」。下面两条弹窗高度公式都必须带上这个
+# 增量，否则总高会比内容实际需要的矮 16px，缺的那截由 pack 转嫁给列表区自己，
+# 表现成「最后一行露一半、要滚动才看得全」。
 _LIST_CORNER_RADIUS = 8
 _PAD = 10  # 弹窗四周内边距
 _GAP_ABOVE = 6  # 弹窗与输入框之间的竖向缝隙
@@ -218,9 +268,10 @@ def _ensure_click_monitor(widget: tk.Misc) -> None:
 def ask_category(
     parent: tk.Misc,
     anchor: tk.Misc,
-    values: list[str],
     current: str = "",
     toggle_button: tk.Misc | None = None,
+    *,
+    direction: str,
 ) -> str | None:
     """在 anchor 控件正下方弹出类别列表。
 
@@ -228,12 +279,14 @@ def ask_category(
         parent: 父窗口，弹窗以 transient 方式挂在它上面（主窗口或编辑记录弹窗）。
         anchor: 锚点控件（类别输入框）：弹窗左边缘与它左边缘对齐、宽度与它相同、
             上边缘贴在它下边缘再往下 _GAP_ABOVE 像素。
-        values: 候选类别（预置 + 历史，调用方已去重）。
-        current: 输入框里的当前内容，用于在列表里高亮当前项。
+        current: 输入框里的当前内容，用于在列表里高亮当前项，并预填 footer 的输入框。
         toggle_button: 调用方那个 ▼ 按钮。点它属于「再点一次关闭」而不是「点外面」，
             所以全局点击监视器要把它排除掉。弹窗显示期间它的文字会被翻成 ▲，
             关闭时无论走哪条路径都由 _cleanup 翻回 ▼。不传只是少这一个白名单
             和图标切换，功能不受影响。
+        direction: 收支方向（category_prefs.EXPENSE / INCOME）。用关键字强制传入，
+            不给默认值：存取哪一份 categories.json 必须由调用方说出来，取错方向
+            会静默写到另一份列表上去，而那种错很难在界面上看出来。
 
     Returns:
         选中的类别；用户按 ESC、点右上角关闭、再点一次同一个 ▼，
@@ -282,6 +335,14 @@ def ask_category(
     result: list[str | None] = [None]
     current_text = (current or "").strip()
 
+    def _candidates() -> list[str]:
+        """现算候选（就是该方向的 user 列表）。
+
+        每次调用都重新读文件、不缓存：弹窗自己就能保存和删除，改完必须立刻
+        反映到列表上，拿一份打开时的快照就永远是旧的。
+        """
+        return build_candidates(direction)
+
     # 【宽度】与输入框严格等宽，视觉上像从输入框里「掉下来」的一条列表。
     # winfo_width() 是物理像素，交回给 geometry() 前必须先换算成逻辑像素。
     anchor_width = anchor.winfo_width()
@@ -290,14 +351,19 @@ def ask_category(
     else:
         width = _MIN_WIDTH
 
-    # 【高度】最多露出 _MAX_VISIBLE_ITEMS 项，其余靠滚动条看：候选 = 预置 + 历史，
-    # 数量只增不减，不限高的话弹窗迟早会长到屏幕外面去。
-    # 弹窗里现在只剩列表这一块（底部「取消」按钮已删掉：关闭已有 toggle / 点外面 /
-    # ESC / 点选项 / 右上角 × 五条路，再摆一个「取消」纯属重复），
-    # 所以高度 = 上下内边距 + 列表视口高度。
-    visible_items = max(min(len(values), _MAX_VISIBLE_ITEMS), 1)
+    # 【高度】最多露出 _MAX_VISIBLE_ITEMS 项，其余靠滚动条看：候选数量由用户自己
+    # 维护，不限高的话弹窗迟早会长到屏幕外面去。
+    # 高度 = 上内边距 + 列表视口 + 列表与 footer 的缝隙 + footer + 下内边距。
+    # 底部那个「取消」按钮已经删掉（关闭已有 toggle / 点外面 / ESC / 点选项 /
+    # 右上角 × 五条路，再摆一个「取消」纯属重复），现在占用那块位置的是
+    # 「+ 保存」这个**非关闭**类操作，它不重复，所以 footer 又回来了。
+    visible_items = max(min(len(_candidates()), _MAX_VISIBLE_ITEMS), 1)
     list_height = visible_items * _ITEM_HEIGHT
-    height = _PAD + list_height + _PAD
+    # 末尾的 + 2 * _LIST_CORNER_RADIUS 不能漏：列表区控件申请的是「视口高 + 两个圆角」
+    # （原因见 _LIST_CORNER_RADIUS 处的说明），弹窗总高按视口高算就会矮 16px。
+    height = (
+        _PAD + list_height + _FOOTER_GAP + _FOOTER_HEIGHT + 2 * _LIST_CORNER_RADIUS + _PAD
+    )
 
     dialog.geometry(f"{width}x{height}")
 
@@ -401,14 +467,14 @@ def ask_category(
     def _cancel() -> None:
         """取消：result 保持 None，关闭弹窗。
 
-        现在只剩 ESC 和右上角 × 两个入口（底部「取消」按钮已删），保留它是因为
-        「不改动输入框内容地关掉弹窗」这条路必须还在。
+        现在只剩 ESC 和右上角 × 两个入口（底部 footer 里没有「取消」按钮），
+        保留它是因为「不改动输入框内容地关掉弹窗」这条路必须还在。
         """
         _close_dialog()
 
     # ---------- 列表区 ----------
     # 用 CTkScrollableFrame 而不是普通 CTkFrame：它的 height 是「视口」高度，
-    # 内容超出后自动出现滚动条（候选里既有预置 10 项，又有用户历史）。
+    # 内容超出后自动出现滚动条（候选里既有预置 10 项，又有用户保存的项）。
     list_frame = ctk.CTkScrollableFrame(
         dialog,
         width=0,
@@ -418,35 +484,251 @@ def ask_category(
         scrollbar_button_color=_SCROLLBAR_COLOR,
         scrollbar_button_hover_color=_SCROLLBAR_HOVER_COLOR,
     )
-    list_frame.pack(fill="both", expand=True, padx=_PAD, pady=_PAD)
+    # 这里只建控件、**先不 pack**：pack 顺序决定「空间不够时压谁」，而 footer 必须
+    # 先落地才有保障，所以 list_frame 的 pack 挪到了下面「底部操作区」footer 之后。
 
-    if values:
-        for value in values:
-            # 当前输入框里已经有的那个类别高亮成主色，用户一眼能看出「现在用的是哪个」。
-            is_current = value == current_text
-            ctk.CTkButton(
+    # ---------- 弹窗内的动作 ----------
+    # 这几个函数只改 category_prefs、然后重画列表，**都不关弹窗**：
+    # 保存完通常紧接着就要点刚出现的那一项，删完可能想接着删下一个，
+    # 关掉再让用户点一次 ▼ 是完全多余的往返。
+    #
+    # 定义顺序说明：下面「底部操作区」里建按钮时要用命令参数引用它们，
+    # 所以函数必须先于控件出现（闭包里的 list_frame/hint_label 等反而是调用时才
+    # 取值，控件建在函数后面没有关系）。
+    def _set_hint(text: str, error: bool = False) -> None:
+        """改 footer 提示语。error=True 时换成警示色，用来报告写盘失败。"""
+        hint_label.configure(text=text, text_color=_ERROR_COLOR if error else _HINT_COLOR)
+
+    def _save_current() -> None:
+        """把 footer 输入框里的类别名存进 user 列表。
+
+        值只从 save_entry 里取，**不再回头看主窗口的输入框**：那一个是「这条记录用
+        什么类别」，这一个才是「要把哪个写法存进候选」。把两件事并到一个框里，用户
+        就会以为在主窗口打了字等于已经存进候选了——这正是需求要改掉的那点绕。
+
+        成功时一声不吭：列表里当场多出一项就是最直接的反馈，再弹一句「保存成功」
+        反而要多点一次才能继续。失败必须说清楚——静默失败会让用户以为已经存好了，
+        下次点 ▼ 才发现类别不见了，那时已经无从追查。
+        """
+        # save_entry 建在这几个函数的下面，这里是「调用时才取值」，所以顺序没问题。
+        name = save_entry.get().strip()
+        if not name:
+            _set_hint("先在上面的输入框里写下类别名，再点 + 保存", error=True)
+            return
+        if save_user(direction, name):
+            # 存下之后清空输入框，拿「框空了」当一次「已经收下了」的反馈：
+            # 类别原本就在列表里时 save_user 同样不报错、列表看不出任何变化，
+            # 不清空的话用户分不清刚才那一下到底生效没有，只会忍不住再点一次。
+            save_entry.delete(0, "end")
+            _render_list()
+        else:
+            # 失败时保留框里的内容：用户多半想照着这个名字重试，或者去手工检查文件，
+            # 清空等于逼他重新打一遍。
+            _set_hint(f"保存失败：{name} 没能写入类别文件", error=True)
+
+    def _delete_category(name: str) -> None:
+        """把某一项从候选里真删掉（列表里当场消失，下次不会再出现）。
+
+        没有二次确认：弹窗里不能用 messagebox（它是另一个顶层窗口，会被「点弹窗外
+        就关闭」的监视器当成外部点击，反而先把列表关掉），而需求要的就是「删掉就是
+        真的没了」这条直白语义；想找回来只能重新用「+ 保存」输入同名类别。
+        """
+        if delete_user(direction, name):
+            _render_list()
+        else:
+            _set_hint(f"删除失败：{name} 没能写入类别文件", error=True)
+
+    def _resize_dialog(row_count: int) -> None:
+        """按行数改弹窗高度，宽度保持不变。
+
+        宽度交给 _reanchor（它按锚点实时算、而且用物理像素），这里若再按创建时
+        那个旧宽度调一次 geometry()，会把宽度拽回旧值、紧接着又被 _reanchor 拉回来，
+        屏幕上闪一下；所以这里只改高度，「此刻多宽就保持多宽」。
+        """
+        visible_items = max(min(row_count, _MAX_VISIBLE_ITEMS), 1)
+        new_list_height = visible_items * _ITEM_HEIGHT
+        # 让滚动视口跟上新的行数。list_frame 是 expand=True，实际高度由弹窗决定，
+        # 单独 configure(height=) 改不动画面；真正生效的是下面那句 geometry()。
+        # 这里仍然要写，是为了让内部画布的滚动区域与行数一致，否则会留下
+        # 「行少了却还留着旧滚动范围」这种把滚动条拖到底也看不到内容的空档。
+        list_frame.configure(height=new_list_height)
+
+        scaling = _window_scaling(dialog)
+        try:
+            current_width_phys = dialog.winfo_width()
+        except tk.TclError:
+            current_width_phys = 0
+        logical_width = (
+            max(int(round(current_width_phys / scaling)), _MIN_WIDTH)
+            if current_width_phys > 1  # 1 是窗口尚未映射时 winfo_* 的谎报值
+            else width  # 理论上走不到：能点按钮说明弹窗早就映射过了
+        )
+        # 这条式子必须与建窗时那条**完全一致**（含列表区的圆角增量）：两处只要有一处
+        # 少算，就会在「打开时 7 项、删到只剩 3 项」这种改行数的操作后把高度算矮，
+        # 列表区被 pack 压掉一截、最后一行又看不全。
+        logical_height = (
+            _PAD + new_list_height + _FOOTER_GAP + _FOOTER_HEIGHT + 2 * _LIST_CORNER_RADIUS + _PAD
+        )
+        dialog.geometry(f"{logical_width}x{logical_height}")
+
+    # ---------- 底部操作区 ----------
+    # 结构：第一行 = 新类别输入框 + 「+ 保存」按钮；第二行 = 一行提示语。
+    #
+    # footer 抢先 pack、list_frame 随后 pack，这个顺序是**故意**的，也是本区唯一的
+    # 职责：pack 在空间不够时压缩的是「最后 pack 的那个」，而 expand=True 只负责
+    # 分配多余空间、并不负责压缩。把 footer 排在最前，亏空就整个落在可滚动的列表
+    # 上（表现成可视行数变少、滚动条出来），输入框和提示语始终完整。
+    #
+    # 反过来写（列表先 pack）时，亏空会落在 footer 身上，footer 内部又继续压它最后
+    # pack 的孩子——也就是提示语——于是提示语被压成几个像素高，字全没了。这正是
+    # 之前「提示语被压扁」的成因，所以这个顺序不能改回去。
+    #
+    # side="bottom"/side="top" 是配套的：footer 从底部占走它要的高度，列表再从上边
+    # 铺满剩下的部分（它自己带 expand，负责吃掉剩余空间）。
+    footer = ctk.CTkFrame(dialog, fg_color="transparent", corner_radius=0)
+    footer.pack(side="bottom", fill="x", padx=_PAD, pady=(_FOOTER_GAP, _PAD))
+
+    # pady 上边 _PAD、下边 0：列表与 footer 之间那道缝由 footer 自己的上边 pady
+    # (_FOOTER_GAP) 提供，两头都写会变成两道缝。
+    list_frame.pack(side="top", fill="both", expand=True, padx=_PAD, pady=(_PAD, 0))
+
+    button_row = ctk.CTkFrame(
+        footer, fg_color="transparent", corner_radius=0, height=_BUTTON_ROW_HEIGHT
+    )
+    button_row.pack(fill="x")
+
+    # 输入框刻意不写 placeholder_text：占位符的语义就是「里面没字时才显示」，而这里
+    # 一建出来就要预填 current，两者互斥（CustomTkinter 的占位符还会在失焦且为空时
+    # 自己回来，和预填的内容打架）。这个框干什么用，改由下面第一行提示语说明。
+    save_entry = ctk.CTkEntry(
+        button_row,
+        height=_BUTTON_ROW_HEIGHT,
+        corner_radius=6,
+        border_width=1,
+        border_color=_SCROLLBAR_COLOR,
+        fg_color="#FFFFFF",
+        font=("Microsoft YaHei UI", 11),
+        text_color=_TEXT_COLOR,
+    )
+    # 预填打开时的 current：用户十有八九是「主窗口里已经打好字、想把它存进候选」才
+    # 点开列表的，先填好能省一次重复输入。只在建窗时读这一次，之后两边彻底独立，
+    # 不做双向同步——弹窗里改了又没点 + 保存的话，关掉弹窗不该反过来改动主窗口。
+    if current_text:
+        save_entry.insert(0, current_text)
+
+    # 先 pack 按钮（side="right"）再 pack 输入框（side="left", expand=True）：与调用方
+    # 「输入框 + ▼ 按钮」「日期框 + 📅 按钮」同一套写法，按钮先钉住右端，输入框吃掉
+    # 剩下的宽度，于是这个框能占满「弹窗宽度 − 保存按钮 − 内边距」。
+    ctk.CTkButton(
+        button_row,
+        text=_SAVE_TEXT,
+        command=_save_current,
+        width=_SAVE_BUTTON_WIDTH,
+        height=_BUTTON_ROW_HEIGHT,
+        corner_radius=6,
+        fg_color=_ACCENT_COLOR,
+        hover_color=_ACCENT_HOVER_COLOR,
+        text_color="#FFFFFF",
+        font=("Microsoft YaHei UI", 11),
+    ).pack(side="right")
+    save_entry.pack(side="left", fill="x", expand=True)
+
+    # 回车等价于点「+ 保存」：这是个「打字→提交」的输入框，回车提交是通用习惯；
+    # 弹窗上本来没有别的 <Return> 绑定，不会和谁抢。
+    save_entry.bind("<Return>", lambda _event: _save_current())
+
+    # 提示语直接摆在 footer 的下一行，占满整行宽度（pady=(4,0) 与上面那一行隔开）。
+    # 它同时承担「告诉大家这个输入框怎么用」和「写盘失败时报错」两件事，所以不能省
+    # ——footer 只留一行输入框的话，失败就没地方说了（messagebox 又不能用）。
+    hint_label = ctk.CTkLabel(
+        footer,
+        text=_HINT_LINE_1,
+        # height 与 _HINT_ROW_HEIGHT 严格对齐：不传时 CTkLabel 一律按 28 要空间，
+        # 而 _FOOTER_HEIGHT 的预算里这一行只算了 18，差出来的 10px 会把 footer 顶成
+        # 「实际需求 > 预算」，进而在空间紧张时把提示语自己压扁。
+        height=_HINT_ROW_HEIGHT,
+        font=("Microsoft YaHei UI", 10),
+        text_color=_HINT_COLOR,
+        justify="left",
+        anchor="w",
+    )
+    hint_label.pack(fill="x", pady=(4, 0))
+
+    # ---------- 重画列表 ----------
+    # 只在「数据真的变了」的动作之后调用：打开弹窗、保存、删除。
+
+    def _render_list() -> None:
+        """按当前候选重画列表，并把弹窗高度改到位。
+
+        整块重画而不是增量改动某一项：候选数量本身会变（保存多一项、删除少一项），
+        增量维护得自己记住「哪一项在第几行」，一旦算错就是列表和文件对不上；
+        而重画的代价只是十几个小控件，在用户的点击频率下完全无感。
+        """
+        rows = _candidates()
+
+        # 只销毁列表里的旧行，绝不销毁 list_frame 本身：它是 CTkScrollableFrame，
+        # 连它一起重建会把滚动条与内部画布都换掉，既闪一下、又要重新 pack 和定位。
+        for child in list_frame.winfo_children():
+            child.destroy()
+
+        if rows:
+            for name in rows:
+                _build_row(name)
+        else:
+            # 空列表也要给一句话，而不是弹一个白色空框让人以为卡住了。
+            # 删到一个不剩时走的就是这一支，怎么再添回来由下面那行提示语负责解释。
+            ctk.CTkLabel(
                 list_frame,
-                text=value,
-                # 默认参数绑定 value：闭包直接引用循环变量的话，所有项都会变成最后一项。
-                command=lambda picked=value: _choose(picked),
-                height=_ITEM_HEIGHT,
-                corner_radius=6,
-                anchor="w",
-                fg_color=_ACCENT_COLOR if is_current else "transparent",
-                hover_color=(
-                    _ACCENT_HOVER_COLOR if is_current else _SUBTLE_HOVER_COLOR
-                ),
-                text_color="#FFFFFF" if is_current else _TEXT_COLOR,
+                text="暂无类别",
                 font=dialog_font,
-            ).pack(fill="x", padx=4, pady=1)
-    else:
-        # 理论上不会走到这里（预置类别永远不为空），保底给一句话而不是弹一个空白框。
-        ctk.CTkLabel(
-            list_frame,
-            text="暂无可选类别",
+                text_color=_TEXT_COLOR,
+            ).pack(pady=12)
+
+        # 提示语回到常态：上一次写盘失败留下的红字，只该活到下一次成功动作为止。
+        _set_hint(_HINT_LINE_1)
+
+        _resize_dialog(len(rows))
+
+    def _build_row(name: str) -> None:
+        """画一行类别：透明容器 + 名字按钮（左，撑满）+ 删除按钮（右）。
+
+        高亮只画在名字按钮上、容器保持透明，否则整行（连同右边的 ×）会一起变蓝，
+        看起来像「连删除按钮也一起被选中了」。
+        """
+        is_current = name == current_text
+        row = ctk.CTkFrame(list_frame, fg_color="transparent", corner_radius=0)
+        row.pack(fill="x", padx=4, pady=1)
+
+        ctk.CTkButton(
+            row,
+            text=_ACTION_REMOVE_TEXT,
+            # 默认参数绑定 name：闭包直接引用外层变量的话，所有行都会作用到最后一项。
+            command=lambda picked=name: _delete_category(picked),
+            width=_ACTION_BUTTON_WIDTH,
+            height=_ITEM_HEIGHT - 4,
+            corner_radius=6,
+            fg_color="transparent",
+            hover_color=_SUBTLE_HOVER_COLOR,
+            text_color=_HINT_COLOR,
+            font=("Microsoft YaHei UI", 12),
+        ).pack(side="right")
+
+        ctk.CTkButton(
+            row,
+            text=name,
+            # 同上：默认参数绑定 name，否则每一项都会变成最后一项。
+            command=lambda picked=name: _choose(picked),
+            height=_ITEM_HEIGHT,
+            corner_radius=6,
+            anchor="w",
+            fg_color=_ACCENT_COLOR if is_current else "transparent",
+            hover_color=_ACCENT_HOVER_COLOR if is_current else _SUBTLE_HOVER_COLOR,
+            text_color="#FFFFFF" if is_current else _TEXT_COLOR,
             font=dialog_font,
-            text_color=_TEXT_COLOR,
-        ).pack(pady=12)
+        ).pack(side="left", fill="x", expand=True)
+
+    # 画第一遍。此后只在动作里重画，所以整个弹窗生命周期内 list_frame 只有这一个实例。
+    _render_list()
 
     # ---------- 把弹窗钉到输入框左下方 ----------
     # 位置与宽度都用原生 wm_geometry（物理像素），不用 CTkToplevel.geometry()：

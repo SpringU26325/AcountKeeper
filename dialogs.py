@@ -12,10 +12,11 @@ import customtkinter as ctk
 
 from calendar_picker import ask_date
 from category_picker import ask_category
-# 类别候选统一由 category_prefs 算（预置 + 用户保存 − 被隐藏），与新增记录输入区
-# 走同一条路。合并逻辑只留 category_prefs 那一份，不再由 widgets 导出一个 helper
-# （两份实现早晚会跑偏），依赖方向也从 dialogs -> widgets 降为 dialogs -> category_prefs。
-from category_prefs import EXPENSE, INCOME, build_candidates
+# 类别候选统一由 category_prefs 算（与新增记录输入区走同一条路），这里只借它的
+# EXPENSE / INCOME 两个方向常量来判断「这条记录算支出还是收入」，候选本身由
+# category_picker 在弹窗里现算。依赖方向也因此从 dialogs -> widgets 降为
+# dialogs -> category_prefs。
+from category_prefs import EXPENSE, INCOME
 from store import Account
 
 
@@ -151,9 +152,9 @@ def ask_edit_record(
 ) -> tuple[str, Decimal, str, str] | None:
     """显示预填记录编辑框，并返回通过校验的字段。
 
-    类别候选不再由调用方传入历史类别：弹窗自己按 record.amount 的正负号向
-    category_prefs 现算（预置 + 用户保存 − 被隐藏），所以调用方少两个必传参数，
-    也不会出现「有的调用点忘记传历史类别、候选莫名其妙变少」这种不一致。
+    类别候选不再由调用方传入：点 ▼ 时由 category_picker 按**金额输入框此刻的内容**
+    决定方向、再向 category_prefs 现算该方向的 user 列表，所以调用方少两个必传参数，
+    也不会出现「有的调用点忘记传候选、列表莫名其妙变空」这种不一致。
     """
     dialog = ctk.CTkToplevel(parent)
     dialog.title("编辑记录")
@@ -191,12 +192,34 @@ def ask_edit_record(
         ("备注", note_var),
     )
 
-    # 类别候选（需求 3.13）：按这条记录当前是收还是支取对应的一套。
-    # 负数 = 支出、非负 = 收入，与表格里的符号约定（ui.add_record 的符号转换）保持一致；
-    # 直接读 record.amount 而不是解析输入框内容，是因为这个方向只在打开弹窗时定一次，
-    # 用户后续在金额框里把正负号改过来也不会重算（避免下拉候选随输入字符跳动）。
+    # 类别方向（需求 3.13）：按这条记录当前是收还是支取对应的一套。
+    # 负数 = 支出、非负 = 收入，与表格里的符号约定（ui.add_record 的符号转换）保持一致。
+    # 这个值只当**兜底方向**用（金额框解析不出方向时靠它），不再是全程固定值，
+    # 真正在点 ▼ 那一刻生效的是下面 _current_direction() 的实时结果。
     category_direction = EXPENSE if record.amount < 0 else INCOME
-    category_values = build_candidates(category_direction)[0]
+
+    def _current_direction() -> str:
+        """按金额输入框**此刻**的内容算收支方向，解析不出来时退回原记录的方向。
+
+        为什么用实时金额而不是开窗时算好的固定方向：用户完全可能在编辑过程中把金额
+        符号改过来（-25.00 改成 25.00，或反过来），类别列表应该跟着变化——支出类别与
+        收入类别本来就是两回事，继续显示旧的那一套会让人在一个已经变成「收入」的记录上
+        挑「餐饮」。
+        """
+        # NaN 会让 decimal 的比较运算直接抛 InvalidOperation（不是返回 False），
+        # 所以解析和比较必须包在同一个 try 里，不能只保护 Decimal(...) 那一步。
+        try:
+            amount = Decimal(amount_var.get().strip())
+            if amount > 0:
+                return INCOME
+            if amount < 0:
+                return EXPENSE
+        except (InvalidOperation, ValueError):
+            pass
+        # 走到这里只有三种情况：空串 / 非数字 / NaN（解析或比较失败）、以及金额为 0
+        # （本身是非法值，无从判断用户想选哪一边）。三者都退回原记录方向，
+        # 真正的非法值拦截交给 confirm() 里的校验，这里只负责选一套合理的候选。
+        return category_direction
 
     def _pick_date() -> None:
         """打开日历选择器，把选中的日期回填到日期输入框（需求 3.12）。"""
@@ -232,8 +255,10 @@ def ask_edit_record(
                 border_color="#C6D4DF",
                 fg_color="#FFFFFF",
             )
-            # 与 InputFrame 一致：按钮文字用「▼」（YaHei UI 自带字形），
-            # 不用 emoji 📅（该字体无此字形会渲染成空白方块）。
+            # 与 InputFrame 一致：按钮文字用「▼」（Microsoft YaHei UI 自带字形，
+            # 不靠字体回退）而不是彩色 emoji 📅。📅 在该字体里没有字形，实际是靠
+            # Windows 的字体回退显示出来的（主流环境实测正常，但多绕了一层，
+            # 跨环境一致性差一些），而且它的彩色在灰蓝线框按钮里也显得跳。
             # 按钮先 pack 且 side="right" 钉在右端，宽度 36；
             # 输入框再 pack 且 expand=True 占满剩余空间，高度 34 与按钮齐平。
             ctk.CTkButton(
@@ -298,14 +323,15 @@ def ask_edit_record(
             ) -> None:
                 """打开类别选择器，把选中的类别回填到输入框（需求 3.13）。"""
                 # 锚点用输入框而不是 category_row：弹窗宽度与输入框等宽、左边缘与输入框对齐。
-                # 候选用打开弹窗时按 record.amount 正负号算好的那一套（见上方 category_values），
-                # 不随用户在金额框里改符号而变化，避免候选列表跟着输字符跳动。
                 # toggle 传给弹窗：再点一次这个 ▼ 表示关闭列表（返回 None），输入框原值不动。
-                # 注意：弹窗内部的「保存/隐藏/恢复」需要知道方向（收还是支），
-                # 那个形参归小步 2 一起加（ask_category 与调用点同时改），本轮不动 category_picker.py。
+                # direction 在**点击这一刻**现算（_current_direction 读金额框当前内容）：
+                # 用户可能刚把金额符号改过来，类别列表得跟着换成对应方向的那一套。
+                # 注意 amount_var 不能被写进默认参数列表：它在 for 循环里从头到尾只被赋值一次，
+                # 不存在 entry / variable 那种「下一轮被重新赋成备注框」的晚绑定问题。
                 picked = ask_category(
-                    dialog, target, category_values, var.get(),
+                    dialog, target, var.get(),
                     toggle_button=toggle,
+                    direction=_current_direction(),
                 )
                 # 返回 None 表示用户取消/按 ESC/再点一次 ▼，此时保持输入框原值不变。
                 if picked:

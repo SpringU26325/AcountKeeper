@@ -1,4 +1,4 @@
-"""用户类别偏好（需求 3.13 第二轮）：用户主动保存的类别 + 被隐藏的类别。
+"""用户类别偏好（需求 3.13 第三轮）：用户自己维护的类别列表（user）。
 
 为什么另立一个模块、而不是塞进 settings.py：settings.json 的写入是**整份覆盖**
 （settings.save_settings 直接 json.dump 一个只含 last_export_dir 的字典），
@@ -7,35 +7,37 @@
 而类别是用户显式点过「+ 保存」的**主动意图**，静默丢弃等于数据损失，容错等级根本不同。
 所以这里另开一份 categories.json，与 account.db / settings.json 同目录，便于整体备份迁移。
 
-数据模型（按收支分开，与 config 里那两套预置类别对齐）：
+数据模型（按收支分开，每段就是一个类别名列表）：
 
     {"version": 1,
-     "expense": {"user": [...], "hidden": [...]},
-     "income":  {"user": [...], "hidden": [...]}}
+     "expense": ["餐饮", "打车"],
+     "income":  ["工资"]}
 
-user 与 hidden 刻意分成两个列表而不是 [{"name": ..., "hidden": true}]：
-保存是加法、隐藏是减法，本来就是两组集合运算，分开存读取即用；合并存法还要处理
-「同名两条」的冲突，复杂度全无收益。
+**user 列表就是唯一真源**：往里面加一项，它就出现在下拉候选里；从里面删一项，
+它就真的不再出现。没有 hidden、没有「已隐藏视图」、也没有「恢复」——那是上一轮把
+「移除」做成可逆操作时留下的中间态，把一次删除拆成「隐藏 / 恢复」两步，用户得先
+想明白「我是暂时不想看见，还是永久不要」才能决定点哪个按钮，语义太重。
 
-**hidden 是纯粹的「排除集」，它不会把名字从 user 里删掉**，两者互不干扰。
-这是刻意的：如果隐藏时顺手删掉 user，那么「隐藏一个用户自建类别 → 再恢复它」
-就会两头落空（user 里没了、hidden 里也没了），类别直接人间蒸发。
-拆成两个互不相干的集合后，恢复只要把它从 hidden 里拿掉，它会以原来的身份回来
-（预置项靠预置身份、用户自建项靠 user 身份），重名由 build_candidates 统一去重。
+**预置类别只在首次启动（categories.json 不存在）时作为 user 的初始值写进去一次**，
+之后 config.py 里的 DEFAULT_*_CATEGORIES 就不再参与任何运算。这是刻意的：如果每次
+算候选都把预置常量并进来，用户删掉一个预置项（比如「人情」）之后它下次又会自己
+回来，删除动作等于无效。把预置「一次性转正」成普通列表项，「删了就是真的没了」
+这条语义才立得住。
 
 对外契约：
 - 方向参数只认 "expense" / "income"（模块常量 EXPENSE / INCOME）。
   「支出 / 收入」这种说法属于界面层，数据层不认，避免两边口径漂移。
-- 读：load_state / build_candidates，任何异常都降级成空状态，绝不抛。
-- 写：save_user / hide / restore，返回布尔值表示是否真的落盘成功；
-  文件损坏时**拒绝写入**，宁可不保存也不覆盖用户可能还能手工抢救的文件。
-- 迁移：ensure_migrated，只在文件不存在时把「历史用过的类别」快照进 user。
+- 读：build_candidates，任何异常都降级成空列表，绝不抛。
+- 写：save_user / delete_user，返回布尔值表示是否真的成功了。
+  读到不符合新结构的格式（文件坏了、根不是对象、某一段是 dict 而不是 list）
+  一律当空列表处理并**允许写入**：本项目尚未发布过、没有需要保护的存量数据，
+  下次保存直接覆盖成新结构即可，不必用「拒绝写入」那套保守策略。
+- 首次启动：ensure_migrated，只在文件不存在时把「预置 + 历史类别」写进 user。
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from typing import Callable
 
 from config import (
@@ -48,25 +50,9 @@ from config import (
 EXPENSE = "expense"
 INCOME = "income"
 
-# 文件格式版本。读取时只认这个数字：认不出来就当作「看不懂的文件」拒绝写入，
-# 防止旧版本程序把新版本写的数据洗掉（用户降级运行的场景）。
+# 文件格式版本。只写不校验：本项目从未发布过，不存在需要按版本分支处理的存量文件；
+# 读到不认识的版本只打一条警告，处理方式与其它不认识的格式完全一样（当空、允许覆盖）。
 _SCHEMA_VERSION = 1
-
-# 文件读取的三种状态。单独区分 missing 与 broken 是必要的：
-#   - missing：用户还没用过这个功能 → 用空状态，并**允许写入**（首次保存要能建文件）；
-#   - broken：解析不了或版本不认识 → 必须**拒绝写入**，否则一次保存就会把用户
-#     手工修得回来的文件覆盖成空壳，属于不可逆的数据损失。
-_OK = "ok"
-_MISSING = "missing"
-_BROKEN = "broken"
-
-
-@dataclass(frozen=True)
-class CategoryState:
-    """某一个方向（支出或收入）的类别偏好。"""
-
-    user: tuple[str, ...]  # 用户主动保存过的类别
-    hidden: tuple[str, ...]  # 被隐藏的类别（含预置），按隐藏先后排列
 
 
 def _warn(message: str) -> None:
@@ -88,19 +74,21 @@ def _direction_key(direction: str) -> str:
     return key
 
 
-def _clean_list(value: object, field: str) -> tuple[str, ...]:
-    """把 JSON 里读到的一串值整理成「去空白、去空项、去重」的字符串元组。
+def _clean_list(value: object, field: str) -> list[str]:
+    """把 JSON 里读到的一串值整理成「去空白、去空项、去重」的字符串列表。
 
-    单项脏数据只丢那一项、不判整份文件损坏：手改文件写错一个字符，不该让
-    「保存类别」这个功能整体瘫痪。去重按首次出现的顺序保留，这样 hidden 的
-    「隐藏先后」和 user 的「保存先后」都稳定可预期。用元组是因为这两个集合
-    对外只读，元组能挡住调用方原地 append 而污染缓存。
+    单项脏数据只丢那一项、不判整份文件报废：手改文件写错一个字符，不该让
+    「保存类别」这个功能整体瘫痪。去重按首次出现的顺序保留，这样列表顺序
+    （也就是下拉列表的顺序）稳定可预期。返回的是一份**新列表**，调用方拿到后
+    可以直接原地增删，不会串改到别处的数据。
     """
     if value is None:
-        return ()
+        return []
     if not isinstance(value, list):
-        _warn(f"{field} 不是列表，已忽略该字段。")
-        return ()
+        # 典型情况：上一轮结构下的 {"user": [...], "hidden": [...]}——当空处理即可，
+        # 反正下一次写入会把这一段换成本轮的裸列表。
+        _warn(f"{field} 不是列表（可能是旧结构），本次按空列表处理。")
+        return []
 
     cleaned: list[str] = []
     dropped = 0
@@ -116,13 +104,18 @@ def _clean_list(value: object, field: str) -> tuple[str, ...]:
             cleaned.append(name)
     if dropped:
         _warn(f"{field} 中有 {dropped} 项不是合法类别名，已忽略。")
-    return tuple(cleaned)
+    return cleaned
 
 
-def _read_document() -> tuple[dict | None, str]:
-    """读 categories.json，返回 (文档, 状态)。状态含义见 _OK / _MISSING / _BROKEN。"""
+def _read_document() -> dict | None:
+    """读 categories.json；读不出来时返回 None（不存在 / 解析失败 / 根不是对象）。
+
+    刻意不再区分「文件不存在」与「文件坏了」：新语义下两者处理完全相同——都按空列表
+    算候选，并且都允许写入。本项目尚未发布、没有需要保护的存量数据，坏文件下次保存
+    直接覆盖成新结构即可，不需要「拒绝写入」那套保守策略。
+    """
     if not CATEGORY_PREFS_PATH.exists():
-        return None, _MISSING
+        return None
 
     try:
         # 显式 UTF-8：Windows 上 open() 默认用 GBK，中文类别名会乱码甚至解析失败。
@@ -130,73 +123,44 @@ def _read_document() -> tuple[dict | None, str]:
             raw = json.load(handle)
     except (OSError, ValueError) as error:
         # ValueError 覆盖 json.JSONDecodeError（文件被截断、被手工改坏等情况）。
-        _warn(f"{CATEGORY_PREFS_PATH.name} 读取或解析失败（{error}），将忽略该文件。")
-        return None, _BROKEN
+        _warn(f"{CATEGORY_PREFS_PATH.name} 读取或解析失败（{error}），本次按空列表处理。")
+        return None
 
     if not isinstance(raw, dict):
-        # 内容是合法 JSON 但根节点不是对象（如 []、"abc"），同样按损坏处理。
-        _warn(f"{CATEGORY_PREFS_PATH.name} 根节点不是对象，将忽略该文件。")
-        return None, _BROKEN
+        # 内容是合法 JSON 但根节点不是对象（如 []、"abc"），同样按空处理。
+        _warn(f"{CATEGORY_PREFS_PATH.name} 根节点不是对象，本次按空列表处理。")
+        return None
 
     if raw.get("version") != _SCHEMA_VERSION:
+        # 只警告、不拒绝：见 _SCHEMA_VERSION 处的说明。
         _warn(
             f"{CATEGORY_PREFS_PATH.name} 的格式版本为 {raw.get('version')!r}，"
-            f"当前程序只认识 {_SCHEMA_VERSION}，将忽略该文件。"
+            f"当前程序写的是 {_SCHEMA_VERSION}，本次仍按空列表处理。"
         )
-        return None, _BROKEN
 
-    return raw, _OK
-
-
-def _section(document: dict, key: str) -> CategoryState:
-    """取出文档里某一个方向的偏好；该段缺失或结构不对时按空处理。"""
-    raw = document.get(key)
-    if raw is None:
-        return CategoryState((), ())
-    if not isinstance(raw, dict):
-        _warn(f"{CATEGORY_PREFS_PATH.name} 的 {key} 段不是对象，已忽略该段。")
-        return CategoryState((), ())
-    return CategoryState(
-        _clean_list(raw.get("user"), f"{key}.user"),
-        _clean_list(raw.get("hidden"), f"{key}.hidden"),
-    )
+    return raw
 
 
-def load_state(direction: str) -> CategoryState:
-    """读取某个方向的类别偏好；文件缺失或损坏时返回空状态（不抛异常）。"""
-    key = _direction_key(direction)
-    document, _status = _read_document()
-    if document is None:
-        return CategoryState((), ())
-    return _section(document, key)
+def _user_list(document: dict, key: str) -> list[str]:
+    """取出文档里某一个方向的类别列表；该段缺失或结构不对时按空处理。"""
+    return _clean_list(document.get(key), key)
 
 
-def build_candidates(direction: str) -> tuple[list[str], list[str]]:
-    """算出下拉候选，返回 (可见候选, 已隐藏项)。
+def build_candidates(direction: str) -> list[str]:
+    """算出下拉候选：就是该方向的 user 列表本身。
 
-    可见候选 = 预置类别 + user，整体去重后减去 hidden。预置在前、user 追加在后：
-    常用类别位置固定、用户能形成肌肉记忆，新保存的类别只出现在列表下方，
-    不会把预置项挤走（与第一轮的合并规则保持一致）。
+    user 就是唯一真源——加进去的会出现、删掉的会消失，没有预置常量、也没有 hidden
+    参与运算（预置只在首次启动时被写进 user 一次，见 ensure_migrated）。
 
-    每次都从文件现算、不在内存里留缓存：调用点全是用户点击（点 ▼ / 点 + / 点 ✕），
+    每次都从文件现算、不在内存里留缓存：调用点全是用户点击（点 ▼ / 点 + / 点 ×），
     文件不到 1KB，读一次的代价可以忽略；换来的是「弹窗里改完，界面立刻生效」，
-    不需要任何跨模块通知机制——这正是把合并逻辑收敛到本模块的前提。
+    不需要任何跨模块通知机制——这正是把这份逻辑收敛到本模块的前提。
     """
     key = _direction_key(direction)
-    presets = (
-        DEFAULT_INCOME_CATEGORIES if key == INCOME else DEFAULT_EXPENSE_CATEGORIES
-    )
-    state = load_state(key)
-    hidden = set(state.hidden)
-
-    visible: list[str] = []
-    # 预置项与 user 可能重名（迁移进来的历史类别里就有「餐饮」这类预置名），
-    # 所以这里统一去重，保证同一个名字只出现一次。
-    for name in list(presets) + list(state.user):
-        if name not in hidden and name not in visible:
-            visible.append(name)
-
-    return visible, list(state.hidden)
+    document = _read_document()
+    if document is None:
+        return []
+    return _user_list(document, key)
 
 
 def _write_document(document: dict) -> bool:
@@ -218,9 +182,13 @@ def _write_document(document: dict) -> bool:
 def _apply(
     direction: str,
     name: str,
-    change: Callable[[str, list[str], list[str]], None],
+    change: Callable[[str, list[str]], bool],
 ) -> bool:
-    """保存 / 隐藏 / 恢复三者的公共骨架：读文档 → 改这一个方向的两份列表 → 整份写回。"""
+    """save_user / delete_user 的公共骨架：读文档 → 改这一个方向的列表 → 整份写回。
+
+    change 回调返回「列表是否真的被改动过」：没改动就跳过写盘直接返回 True——
+    例如删一个本来就不在列表里的名字，目标状态已经达成，再整份重写一遍文件是白做功。
+    """
     key = _direction_key(direction)
     cleaned = (name or "").strip()
     if not cleaned:
@@ -228,62 +196,53 @@ def _apply(
         _warn("类别名为空，本次操作未保存。")
         return False
 
-    document, status = _read_document()
-    if status == _BROKEN:
-        # 损坏时不写入：overwrite 掉一个用户可能还修得回来的文件是不可逆的。
-        _warn("配置文件已损坏，为避免覆盖用户数据，本次操作未写入。")
-        return False
+    document = _read_document()
     if document is None:
-        # 首次使用：从最小骨架开始，真正创建文件发生在下面写回的时候。
+        # 首次使用（或文件读不出来）：从最小骨架开始，真正建文件发生在下面写回时。
         document = {}
 
-    state = _section(document, key)
-    user = list(state.user)
-    hidden = list(state.hidden)
-    change(cleaned, user, hidden)
+    names = _user_list(document, key)
+    if not change(cleaned, names):
+        return True
+
     # 只覆盖本方向那一段；另一方向的数据原样保留（document 是原地改的）。
-    document[key] = {"user": user, "hidden": hidden}
+    document[key] = names
     return _write_document(document)
 
 
 def save_user(direction: str, name: str) -> bool:
-    """把类别加进 user（用户主动点「+ 保存」）；已在 user 里则不重复添加。
+    """把类别加进 user（用户主动点「+ 保存」）；已在列表里则不重复添加。
 
-    同时把它从 hidden 里拿掉：用户明确要求这个类别常驻列表，这个动作本身就
-    隐含了「别再隐藏它」，留着 hidden 里的同名项只会自相矛盾（既排除又常驻）。
+    预置项与用户自建项走完全相同的路径：预置项既然已经在首次启动时写进了 user，
+    它在这里就只是一个普通名字，不需要任何特殊分支。
     """
-    def change(name_text: str, user: list[str], hidden: list[str]) -> None:
-        if name_text in hidden:
-            hidden.remove(name_text)
-        if name_text not in user:
-            user.append(name_text)
+    def change(name_text: str, names: list[str]) -> bool:
+        if name_text in names:
+            # 已经在列表里：不改动，交给 _apply 跳过写盘（结果对用户是「已保存」）。
+            return False
+        names.append(name_text)
+        return True
 
     return _apply(direction, name, change)
 
 
-def hide(direction: str, name: str) -> bool:
-    """隐藏类别（用户点 ✕）。语义是「永久隐藏」：不碰数据库，也不动 config 的预置元组。
+def delete_user(direction: str, name: str) -> bool:
+    """把类别从 user 里删掉（用户点列表项右侧的 ×）。
 
-    预置项与用户自建项走完全相同的路径——「人情」这类预置项也能被隐藏。
-    **刻意不把名字从 user 里删掉**（原因见模块开头）：user 记的是「用户保存过什么」，
-    hidden 记的是「现在排除掉什么」，两件事，混在一起会让恢复时无处可寻。
+    这是**真删除**：从列表移除之后，该项目下次不会再出现在候选里。想让它回来，
+    只能重新用「+ 保存」输入同名类别——没有 hidden、没有恢复视图、也没有二次确认
+    对话框（弹窗里不能用 messagebox，见 category_picker 的说明），需求要的就是
+    「删掉就是真的没了」这条简单直白的语义。
+
+    名字本来就不在列表里时同样返回 True，但不写盘（由 _apply 统一处理）：目标状态
+    已经达成，再重写一遍文件只是白做功；返回 True 而不是 False，是因为用户的意图
+    （「让它不在列表里」）确实已经实现了，弹窗不该为此报一个红字。
     """
-    def change(name_text: str, _user: list[str], hidden: list[str]) -> None:
-        if name_text not in hidden:
-            hidden.append(name_text)
-
-    return _apply(direction, name, change)
-
-
-def restore(direction: str, name: str) -> bool:
-    """恢复被隐藏的类别（用户点 ↺）：把它从 hidden 里拿掉即可。
-
-    user 不动：预置项靠预置身份重新出现，用户自建项靠 user 里那条记录重新出现，
-    两种身份都在，恢复后必然能回到列表里。
-    """
-    def change(name_text: str, _user: list[str], hidden: list[str]) -> None:
-        if name_text in hidden:
-            hidden.remove(name_text)
+    def change(name_text: str, names: list[str]) -> bool:
+        if name_text not in names:
+            return False
+        names.remove(name_text)
+        return True
 
     return _apply(direction, name, change)
 
@@ -291,34 +250,35 @@ def restore(direction: str, name: str) -> bool:
 def ensure_migrated(
     expense: list[str] | None, income: list[str] | None
 ) -> bool:
-    """把第一轮的「数据库 DISTINCT 历史类别」一次性快照进 categories.json。
+    """首次启动时给两个方向的 user 写一份初始值 = 预置类别 + 传进来的历史类别。
 
-    这一步是必须的：候选来源从「预置 + 数据库历史」换成「预置 + user − hidden」之后，
-    如果 user 还是空的，用户已经用出来的自定义类别（比如「打车」）会当场从列表里消失。
-    迁移就是把这个「已经用出来的结果」固化成 user，之后数据库不再参与候选
-    ——这正是「越用越乱」的止损点。
+    用「文件是否存在」充当「是否已初始化」的标记，不额外加一个 initialized 字段：
+    - 文件不存在 → 现在写初值（历史为空也会写出文件，避免下次启动又走一遍这里）；
+    - 文件已存在 → 什么都不做。这一道判断就是「删了又回来」的闸门：只要文件还在，
+      config.py 里的预置常量就再也不会被读进候选。
 
-    用「文件是否存在」充当迁移标记，不额外加 migrated 字段：
-    - 文件不存在 → 现在迁移（数据库为空时也写一份空 user 的文件，避免下次又迁一次）；
-    - 文件已存在 → 什么都不做，哪怕它已经损坏（损坏交给 _apply 去拒绝写入，
-      这里绝不能自作主张覆盖用户的文件）。
+    预置在前、历史追加在后，整体去重（历史里本来就可能出现「餐饮」这类预置同名项）。
+    这样首启拿到的候选与改动前完全一致，用户看不出差别；历史为空时（本项目从未发布过，
+    新用户的库里必然是空的）就等同于「候选 = 预置类别」。
 
-    预置同名项不做剔除：迁移是**无损快照**，历史里有「餐饮」就照抄，重名会在
-    build_candidates 合并时自然去重，不影响可见候选。
+    函数名与签名保持不变：名字里的 migrate 是上一轮「从数据库迁移历史类别」的遗留，
+    语义已经变成「初始化 user」。改名要连 ui.py 的调用点一起动，留到清 #47 那一轮
+    （届时 store.get_categories 这个唯一调用点也会一并删掉）。
 
-    返回值：True 表示本次真的执行了迁移（新建了文件），False 表示无需迁移或写失败。
+    返回值：True 表示本次真的写了初值（新建了文件），False 表示无需初始化或写失败。
     """
     if CATEGORY_PREFS_PATH.exists():
         return False
 
+    # 先拼接再去重：_clean_list 会顺手去掉空白项与重名，不用另写一套合并逻辑。
+    expense_seed = list(DEFAULT_EXPENSE_CATEGORIES) + _clean_list(
+        expense, f"{EXPENSE}.history"
+    )
+    income_seed = list(DEFAULT_INCOME_CATEGORIES) + _clean_list(
+        income, f"{INCOME}.history"
+    )
     document = {
-        EXPENSE: {
-            "user": list(_clean_list(expense, f"{EXPENSE}.user")),
-            "hidden": [],
-        },
-        INCOME: {
-            "user": list(_clean_list(income, f"{INCOME}.user")),
-            "hidden": [],
-        },
+        EXPENSE: _clean_list(expense_seed, f"{EXPENSE}.user"),
+        INCOME: _clean_list(income_seed, f"{INCOME}.user"),
     }
     return _write_document(document)

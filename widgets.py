@@ -11,10 +11,11 @@ import customtkinter as ctk
 
 from calendar_picker import ask_date
 from category_picker import ask_category
-# 类别候选统一由 category_prefs 算（预置 + 用户保存 − 被隐藏），
+# 类别候选统一由 category_prefs 算（就是它自己那份 user 列表），
 # 不再从数据库 DISTINCT 取历史类别：那条路会让用户临时输入的写法越积越多，
-# 也正是本轮需求 1 要止住的问题。合并逻辑只有 category_prefs 那一份实现。
-from category_prefs import EXPENSE, INCOME, build_candidates
+# 也正是本轮需求 1 要止住的问题。那份规则只有 category_prefs 一处实现，
+# 所以这里不再自己导出一个 helper，而是把候选留给 category_picker 在弹窗里现算。
+from category_prefs import EXPENSE, INCOME
 
 
 class InputFrame(ctk.CTkFrame):
@@ -42,9 +43,9 @@ class InputFrame(ctk.CTkFrame):
         self.category_var = tk.StringVar()
         self.note_var = tk.StringVar()
         # 这里刻意不再缓存任何「历史类别」：候选由 category_prefs.build_candidates 在
-        # 每次点 ▼ 的那一刻现算。不缓存换来两件事：一是弹窗里保存/隐藏/恢复完
-        # 界面立刻生效，不需要任何跨模块通知；二是调用方不用再记得「新增成功后
-        # 刷新一下」，少一个必守的约定、少一类「忘了刷新」的 bug。
+        # 每次点 ▼ 的那一刻现算。不缓存换来两件事：一是弹窗里保存/删除完界面立刻
+        # 生效，不需要任何跨模块通知；二是调用方不用再记得「新增成功后刷新一下」，
+        # 少一个必守的约定、少一类「忘了刷新」的 bug。
 
         # ---------- 卡片内的整体结构（需求 3.2） ----------
         # 第 0 行 = 标题行（标题 + 支出/收入切换 + 添加按钮），用 title_frame 承载；
@@ -200,9 +201,13 @@ class InputFrame(ctk.CTkFrame):
             fg_color="#F8FAFC",
             textvariable=self.date_var,
         )
-        # 按钮文字用「▼」而不是 emoji 📅：Windows 下 CTkButton 的默认字体
-        # （YaHei UI）不含 emoji 字形，📅 会退化成空白方块；▼（U+25BC）属于
-        # 几何图形区，YaHei UI 自带该字形，兼容性远好于 emoji。
+        # 按钮文字用「▼」而不是 emoji 📅，理由有三条，按重要性排：
+        #   1) 字形来源：「▼」(U+25BC) 是 Microsoft YaHei UI **自带**字形；
+        #      📅 在该字体里没有字形，靠 Windows 的字体回退（Segoe UI Emoji）
+        #      才显示得出来。主流 Windows 上实测能正常显示，但它确实比 ▼ 多绕了
+        #      一层，跨环境一致性差一些。
+        #   2) 视觉重量：📅 是彩色 emoji，在一排灰蓝色线框按钮里显得突兀。
+        #   3) 宽度：emoji 的字宽随字体版本变，▼ 是稳定的单字形，按钮宽度好算。
         # 先 pack 按钮并 side="right"：让它钉在容器右端不被挤压；
         # 再 pack 输入框并 expand=True 占满剩余宽度，两者高度都是 36 保持齐平。
         ctk.CTkButton(
@@ -354,18 +359,19 @@ class InputFrame(ctk.CTkFrame):
         """打开类别选择器，把选中的类别回填到类别输入框（需求 3.13）。"""
         # 候选在「点击 ▼ 的这一刻」现算，而不是提前算好存在控件里：
         # 这样切换支出/收入后弹出的列表自动就是对应的那一套（需求 3.13），
-        # 弹窗里保存/隐藏/恢复完也不需要再回头去改任何控件的缓存。
+        # 弹窗里保存/删除完也不需要再回头去改任何控件的缓存。
         # 以 category_entry 为 anchor：弹窗宽度与它等宽、左边缘与它对齐。
         # toggle_button 传自己这个 ▼：弹窗开着时再点它一次表示关闭列表
         # （ask_category 返回 None），而不是被「点外面」逻辑抢先关掉。
-        # 注意：弹窗内部的「保存/隐藏/恢复」需要知道方向（收还是支），
-        # 那个形参归小步 2 一起加（ask_category 与调用点同时改），本轮不动 category_picker.py。
+        # direction 把本输入区当前的方向交给弹窗：里面的保存/删除要往
+        # 哪一份 categories.json 写，只能由这里说（ask_category 不给默认值，
+        # 取错方向会静默写到另一份列表上去）。
         picked = ask_category(
             self.winfo_toplevel(),
             self.category_entry,
-            build_candidates(self._direction())[0],
             self.category_var.get(),
             toggle_button=self.category_button,
+            direction=self._direction(),
         )
         # 返回 None 表示用户取消/按 ESC/再点一次 ▼，此时保持输入框原值不变。
         if picked:

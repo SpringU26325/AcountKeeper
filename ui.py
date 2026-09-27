@@ -85,12 +85,15 @@ class AccountKeeperApp(ctk.CTk):
             text_color="#607D8B",
         ).pack(anchor="center")
 
-        # 需求 3.13：类别候选已改为「预置 + 用户保存 − 被隐藏」，数据存在 category_prefs
-        # 自己的文件里。这里在窗口组装前做一次「一次性迁移」：把数据库里已有的
-        # 历史类别（store.get_categories）拷进用户类别，否则老用户升级后
-        # 自己用过的类别会一夜之间从下拉列表里消失。
-        # 迁移以「文件是否已存在」为判据，重复调用不会覆盖用户后续的增删；
+        # 需求 3.13：类别候选就是 category_prefs 里那份 user 列表，数据存在它自己的
+        # 文件里。这里在窗口组装前做一次「一次性初始化」：categories.json 不存在时把
+        # 预置类别 + 数据库里已有的历史类别（store.get_categories）写进去当 user 初值，
+        # 否则升级后自己用过的类别会一夜之间从下拉列表里消失。
+        # 初始化以「文件是否已存在」为判据，重复调用不会覆盖用户后续的增删；
         # 两个返回值都是可选的，这里不用管结果，失败也只警告不阻断启动。
+        # #47：ensure_migrated 这名字是上一轮「从数据库搬历史类别」的遗留，语义已经
+        # 变成「初始化 user」。改名要连这个调用点（store.get_categories 的唯一使用者）
+        # 一起动，留到清 #47 那一轮，这次只同步注释，免得同一次改动里既改行为又改签名。
         category_prefs.ensure_migrated(*self.store.get_categories())
         self.input_frame = InputFrame(
             self,
@@ -234,9 +237,9 @@ class AccountKeeperApp(ctk.CTk):
         self.category_var.set("")
         self.note_var.set("")
         # 需求 3.13：这里不再需要「重新查历史类别 + 刷新候选」。
-        # 候选改由 category_prefs 在每次点 ▼ 时现算，用户这次手输并保存下来的类别
-        # 会直接进用户类别文件，下次点 ▼ 自然就在列表里；同时少了一个必守的
-        # 「新增成功后记得刷新」约定，也就少一类「忘了刷新」的 bug。
+        # 候选改由 category_prefs 在每次点 ▼ 时现算，弹窗里点「+ 保存」把类别写进
+        # user 列表之后，弹窗自己会重画列表，这一层什么都不用做；同时少了一个
+        # 必守的「新增成功后记得刷新」约定，也就少一类「忘了刷新」的 bug。
         self.refresh_records()
 
     def delete_record(self) -> None:
