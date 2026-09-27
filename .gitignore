@@ -29,6 +29,7 @@ issues.txt
 *.spec
 PROJECT_RULES.md
 build.bat
+提示词生成要求.txt
 
 # ---------- IDE 配置 ----------
 .vscode/

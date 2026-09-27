@@ -10,12 +10,43 @@ from tkinter import ttk
 import customtkinter as ctk
 
 from calendar_picker import ask_date
+from category_picker import ask_category
+from config import DEFAULT_EXPENSE_CATEGORIES, DEFAULT_INCOME_CATEGORIES
+
+
+def merge_categories(presets: tuple[str, ...], history: list[str] | None) -> list[str]:
+    """把「预置类别」与「用户历史用过的类别」合并成一个去重后的下拉候选列表。
+
+    放在本模块而不是各处各写一份：新增记录的输入区（InputFrame）和编辑记录弹窗
+    （dialogs.ask_edit_record）都需要同一套候选，两份实现早晚会跑偏。
+    它只处理纯数据、不碰控件，所以当成公开辅助函数导出，供 dialogs 复用。
+
+    合并规则（需求 3.13）：预置在前、历史追加在后，整体去重。
+    预置排前面是为了让常用类别位置固定、用户形成肌肉记忆；
+    历史追加在后面，新增的自定义类别只会出现在列表下方，不会把预置项挤走。
+    """
+    # 以预置项为起点，边遍历边判断，因此这一个 merged 列表同时完成了
+    #「历史项与预置项重复」和「历史项彼此重复」两种去重（历史本身可能有重复写法）。
+    merged: list[str] = list(presets)
+    for raw_category in history or []:
+        category = raw_category.strip()
+        # 跳过空白项：库里理论上不会有，但手改库或旧版本脏数据都可能导致空类别，
+        # 一旦进入下拉列表就会变成一个点不了任何意义的空格条目。
+        if category and category not in merged:
+            merged.append(category)
+    return merged
 
 
 class InputFrame(ctk.CTkFrame):
     """Input controls for adding a record."""
 
-    def __init__(self, master: ctk.CTk, add_callback: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        master: ctk.CTk,
+        add_callback: Callable[[], None],
+        history_expense: list[str] | None = None,
+        history_income: list[str] | None = None,
+    ) -> None:
         super().__init__(
             master,
             corner_radius=14,
@@ -32,56 +63,133 @@ class InputFrame(ctk.CTkFrame):
         self.amount_type_var = tk.StringVar(value="支出")
         self.category_var = tk.StringVar()
         self.note_var = tk.StringVar()
+        # 历史类别（来自 store.get_categories）单独存一份，而且是**唯一**一份：
+        # 候选列表不再预先生成塞进控件（CTkComboBox 那种做法），而是等用户点 ▼ 时
+        # 由 _pick_category 现算；所以这里存的就是原始历史数据本身，不会出现
+        # 「合并结果又被当作历史来源」导致候选越刷越长（预置项被重复拼进去）。
+        # 用 list(... or []) 拷贝一份：外部日后修改传入的列表不会意外改动已存的历史。
+        self._history_expense: list[str] = list(history_expense or [])
+        self._history_income: list[str] = list(history_income or [])
 
-        # 标题固定贴在卡片左上角：它是卡片标题，不属于两行字段，不参与列对齐。
+        # ---------- 卡片内的整体结构（需求 3.2） ----------
+        # 第 0 行 = 标题行（标题 + 支出/收入切换 + 添加按钮），用 title_frame 承载；
+        # 第 1 行 = 字段区（两行字段），用 master_frame 承载。
+        # 两个容器都 grid 到 self 的第 0 列并 sticky="ew"，宽度因此完全相同，
+        # 于是标题行最右侧的「添加」按钮与字段区最右侧的「备注框」右边缘严格对齐。
+        # 【为什么要分成两层容器】标题文字的宽度和字段标签的宽度差得远（约 52px vs 22px），
+        # 若把标题行塞进字段网格的第 0 列，网格会按最宽的那一项撑开该列，
+        # 反而在「日期」标签和日期框之间凭空多出一段空隙。
+        # 外面这一列必须是 weight=1，两个容器才能撑满卡片宽度。
+        self.columnconfigure(0, weight=1)
+
+        # ---------- 标题行（需求 3.2）：标题 | 支出/收入切换 | ⋯ | 添加 ----------
+        # 列结构：0=标题（宽度由文字决定）｜1=切换按钮｜2=弹性空白｜3=添加按钮
+        # 第 2 列是唯一的弹性列：它吃掉全部剩余宽度，把添加按钮顶到卡片最右侧，
+        # 同时保证切换按钮始终紧跟在标题后面，不会跟着窗口一起往右漂。
+        title_frame = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
+        title_frame.grid(row=0, column=0, padx=0, pady=(12, 8), sticky="ew")
+        title_frame.columnconfigure(0, weight=0)
+        title_frame.columnconfigure(1, weight=0)
+        title_frame.columnconfigure(2, weight=1)
+        title_frame.columnconfigure(3, weight=0)
+
+        # 标题右侧 padx=0、切换按钮左侧 padx=16，两者之间正好 16px；
+        # 若两边都写 16 会变成 32px，与「间距约 16px」的要求不符。
         ctk.CTkLabel(
-            self,
+            title_frame,
             text="添加记录",
             font=("Microsoft YaHei UI", 13, "bold"),
             text_color="#243447",
-        ).grid(row=0, column=0, padx=16, pady=(12, 8), sticky="w")
+        ).grid(row=0, column=0, padx=(16, 0), pady=0, sticky="w")
 
-        # ---------- 按比例自适应的两行布局（需求 3.2） ----------
-        # 【四条设计意图】
-        #   1. 输入框按比例自适应：日期框、类别框、金额框、备注框都不再写死 width，
+        # 支出/收入切换按钮（需求 3.2）：只决定金额的正负号，不直接改写输入框里的数字。
+        # 它只是从金额框旁边挪到了标题行。
+        # width=100 必须配合 dynamic_resizing=False 才会生效：
+        # CTkSegmentedButton 内部的每个分段按钮都是以 width=0 创建的，
+        # 默认（dynamic_resizing=True）会让外层容器自动收缩到「文字宽度」，
+        # 无论把 width 写成多少，实测都恒为 74px 左右；
+        # 关掉自动收缩后，width=100 才会被完整尊重。
+        self.amount_type_button = ctk.CTkSegmentedButton(
+            title_frame,
+            values=["支出", "收入"],
+            variable=self.amount_type_var,
+            # 这里没有 command 回调，是刻意的：类别候选不再预先算好塞进控件，
+            # 而是等用户点类别框的 ▼ 时由 _pick_category 按「当时的收支类型」现算
+            # （见 _categories_for），所以切换收支时不需要同步任何控件状态。
+            # amount_type_var 由 CTkSegmentedButton 自己维护：用户点击走的是内部
+            # set(value, from_button_callback=True)，那里会写回 self._variable。
+            width=100,
+            height=32,
+            dynamic_resizing=False,
+            corner_radius=8,
+            font=("Microsoft YaHei UI", 10),
+            selected_color="#2F80ED",
+            selected_hover_color="#256AC4",
+            # 浅色主题下必须显式指定未选中态的底色与文字色，否则「收入」二字会看不见。
+            unselected_color="#C6D4DF",
+            unselected_hover_color="#B7C7D4",
+            text_color="#455A64",
+        )
+        # sticky="w"：按钮贴着自己那一列的左边缘，不随第 2 列变宽而漂移。
+        self.amount_type_button.grid(
+            row=0, column=1, padx=(16, 0), pady=0, sticky="w"
+        )
+
+        # 添加按钮（原来在第二行最右侧）：文字由「添加记录」缩为「添加」，
+        # 因为标题已经占了「添加记录」四个字，按钮再重复一遍会显得啰嗦。
+        # 宽度随之从 110px 缩到 88px，仍是「固定宽度」控件（所在列权重为 0）。
+        # 右 padx=16 是卡片内边距，与字段区（master_frame 的右 padx）保持一致，
+        # 所以按钮右边缘与备注框右边缘落在同一条竖线上。
+        # command=add_callback 与原来完全一致。
+        ctk.CTkButton(
+            title_frame,
+            text="添加",
+            command=add_callback,
+            width=88,
+            height=36,
+            corner_radius=10,
+            fg_color="#2F80ED",
+            hover_color="#256AC4",
+            font=font_small,
+        ).grid(row=0, column=3, padx=(0, 16), pady=0, sticky="e")
+
+        # ---------- 字段区：按比例自适应的两行布局（需求 3.2） ----------
+        # 【三条设计意图】
+        #   1. 输入框按比例自适应：日期框、类别框、金额框、备注框都不写死 width，
         #      而是靠 grid 的列权重（weight）分配宽度。窗口拉宽时一起变宽、拉窄时
         #      一起变窄，任何宽度下都填满可用空间，卡片右侧不会留下大片空白。
-        #   2. 只有图标型控件固定宽度：▼ 按钮 36px、支出/收入切换 100px、添加按钮
-        #      110px。它们要么是图标、要么是短文字，跟着伸缩只会变形或拉得很空洞。
+        #   2. 只有图标型控件固定宽度：▼ 按钮 36px（日期、类别各一个）。它只有一个
+        #      字符，跟着伸缩只会变形或拉得很空洞。（支出/收入切换按钮与添加按钮已挪到标题行。）
         #   3. 两行共用同一套列网格：日期与类别占同一列、金额与备注占同一列，
         #      所以两行的标签和输入框天然上下对齐，不用再手工凑像素宽度。
-        #   4. 备注框与金额区共用第 3 列并填满整列，两者右边缘因此严格对齐
-        #      （备注框起点更靠左，所以会比金额输入框宽出约一个切换按钮的宽度）。
-        #      这里刻意不把第 3 列写成 35：权重是整列共享的，写 35 会把金额框
-        #      一起拉到 35%，反而偏离「金额约占 25%」的目标。
         # 【为什么中间要有一层 master_frame】两行共用的列必须落在同一个容器里才可能
         #   对齐；master_frame 用 sticky="ew" 撑满 InputFrame，成为两行共享的列网格。
         # 【权重分配】第 1 列 : 第 3 列 = 15 : 25，对应「日期约占 15%、金额约占 25%」。
-        #   注意权重分配的是「固定部分（两个标签列、三个图标按钮）之外剩余的空间」，
+        #   注意权重分配的是「固定部分（两个标签列、一个 ▼ 按钮）之外剩余的空间」，
         #   所以窗口越宽，各输入框的实际占比会比 15/25 略有放大；但两者的比例关系
         #   始终保持不变，这正是「按比例自适应」的预期行为。
         # 【窄窗口下的安全性】窗口最小尺寸是 820x560（见 ui.py），卡片内部至少 772px，
-        #   而本布局各控件的自然宽度合计约 636px，始终留有余量，所以任何被允许的
+        #   而本布局各控件的自然宽度合计远小于此，始终留有余量，所以任何被允许的
         #   窗口宽度下字段都完整可见、不会重叠，也不会被压缩到看不全。
         # 【列结构】两行共用同一套列：
         #   第 0 列 = 标签（日期 / 类别）—— 权重 0，宽度只由文字决定
-        #   第 1 列 = 日期框组（日期框 + ▼）/ 类别框 —— weight=15，按比例伸缩
+        #   第 1 列 = 日期框组（日期框 + ▼）/ 类别框组（类别框 + ▼）—— weight=15，按比例伸缩
         #   第 2 列 = 标签（金额 / 备注）—— 权重 0，宽度只由文字决定
-        #   第 3 列 = 金额区（切换按钮 + 金额框）/ 备注框 —— weight=25，按比例伸缩
-        #   第 4 列 = 添加记录按钮（固定 110px，只有第二行有）
+        #   第 3 列 = 金额框 / 备注框 —— weight=25，按比例伸缩
         # 两行之间留 10px 垂直间距：上行下边距 5px + 下行上边距 5px。
         master_frame = ctk.CTkFrame(
             self,
             fg_color="transparent",
             corner_radius=0,
         )
-        master_frame.grid(row=1, column=0, padx=0, pady=(0, 14), sticky="ew")
+        # 右 padx=16：添加按钮已搬到标题行，字段区不再有「按钮列」来提供这圈内边距，
+        # 所以改由 master_frame 自己留白；否则备注框、金额框会顶死在卡片右边框上。
+        # 留 16px 后，字段区右边缘与标题行添加按钮的右边缘严格对齐。
+        master_frame.grid(row=1, column=0, padx=(0, 16), pady=(0, 14), sticky="ew")
         # 只给两个「输入列」权重：它们会吃掉全部剩余宽度，所以卡片右侧不会留白。
-        # 两个标签列和按钮列的权重保持 0，宽度只由内容决定，两行才能始终左对齐。
+        # 两个标签列的权重保持 0，宽度只由内容决定，两行才能始终左对齐。
         master_frame.columnconfigure(1, weight=15)
         master_frame.columnconfigure(3, weight=25)
-        # master 撑满卡片宽度，两行的对齐完全由它内部的列决定。
-        self.columnconfigure(0, weight=1)
 
         # ---------- 第一行左侧：日期（输入框 + ▼ 日历按钮） ----------
         ctk.CTkLabel(
@@ -137,7 +245,7 @@ class InputFrame(ctk.CTkFrame):
         # 窗口变宽时新增的宽度全部落在日期框上（▼ 按钮宽度始终保持 36px）。
         self.date_entry.pack(side="left", fill="both", expand=True)
 
-        # ---------- 第一行右侧：金额（支出/收入切换按钮 + 输入框） ----------
+        # ---------- 第一行右侧：金额（只有输入框） ----------
         ctk.CTkLabel(
             master_frame,
             text="金额",
@@ -147,51 +255,21 @@ class InputFrame(ctk.CTkFrame):
         # 之间留出约 40px 水平间距（总计 12+22+6=40），避免两个组合粘在一起。
         ).grid(row=0, column=2, padx=(12, 6), pady=(0, 5), sticky="w")
 
-        # 金额区域使用一个透明的内部容器，确保切换按钮和输入框在同一行水平排列。
-        # 若把两个控件各自 grid 到不同列，行高会被撑开，导致整行控件全部错位。
-        amount_frame = ctk.CTkFrame(
-            master_frame,
-            fg_color="transparent",
-            corner_radius=0,
-        )
-        # sticky="ew" + 右 padx=0：金额区随第 3 列的权重一起伸缩。
-        # 容器内的切换按钮固定 100px，多出来的宽度全部给金额输入框（内部 expand=True），
-        # 于是金额框与备注框的右边缘落在同一条竖线上。
-        # 右 padx 保持 0：若在这里加一段间距，备注框右边缘就会比金额框更靠右。
-        amount_frame.grid(row=0, column=3, padx=(0, 0), pady=(0, 5), sticky="ew")
-        # 这里不设置「列权重」：容器内部用 pack 水平排列子控件，列的伸缩权重不会生效，
-        # 留着只会让人误以为宽度分配由 grid 控制，所以直接省略。
-
-        # 支出/收入切换按钮（需求 3.2）：只决定金额的正负号，不直接改写输入框里的数字。
-        # width=100 必须配合 dynamic_resizing=False 才会生效：
-        # CTkSegmentedButton 内部的每个分段按钮都是以 width=0 创建的，
-        # 默认（dynamic_resizing=True）会让外层容器自动收缩到「文字宽度」，
-        # 无论把 width 写成多少，实测都恒为 74px 左右；
-        # 关掉自动收缩后，width=100 才会被完整尊重，与日期框、金额框形成整齐的一组。
-        self.amount_type_button = ctk.CTkSegmentedButton(
-            amount_frame,
-            values=["支出", "收入"],
-            variable=self.amount_type_var,
-            width=100,
-            height=32,
-            dynamic_resizing=False,
-            corner_radius=8,
-            font=("Microsoft YaHei UI", 10),
-            selected_color="#2F80ED",
-            selected_hover_color="#256AC4",
-            # 浅色主题下必须显式指定未选中态的底色与文字色，否则「收入」二字会看不见。
-            unselected_color="#C6D4DF",
-            unselected_hover_color="#B7C7D4",
-            text_color="#455A64",
-        )
-        self.amount_type_button.pack(side="left", padx=(0, 8), pady=0)
-
+        # 金额字段占第 3 列并填满整列（sticky="ew"）。
+        # 这里不再需要透明容器：支出/收入切换按钮已经挪到标题行，金额框是这一列里
+        # 唯一的控件，直接 grid 即可；去掉容器也顺带避开了「容器 + 内部 pack」
+        # 两层布局叠在一起带来的行高偏差。
+        # 腾出来的约 100px（原切换按钮宽度）全部归金额框，所以金额框变宽了，
+        # 并且与第二行的备注框等宽、左右边缘都对齐。
+        # 不写 width：宽度完全由第 3 列的权重决定，窗口拉宽时金额框同步变宽。
+        # 右 padx 保持 0：间距统一由「金额」标签的左侧 padx 控制，
+        # 否则两处同时加空隙实际间距会翻倍。
         # 金额输入框刻意不用 textvariable，而是用 placeholder_text 显示占位提示；
         # 代价是取用户输入时必须读控件本身（amount_entry.get()），不能读 StringVar。
         # 也正因为如此，这里不绑定 <KeyRelease> 去回写 StringVar：粘贴（尤其右键粘贴）
         # 只发送 <<Paste>> 之类的虚拟事件、不产生按键事件，靠按键回写必然漏掉粘贴内容。
         self.amount_entry = ctk.CTkEntry(
-            amount_frame,
+            master_frame,
             height=36,
             font=font_regular,
             corner_radius=9,
@@ -200,11 +278,9 @@ class InputFrame(ctk.CTkFrame):
             fg_color="#F8FAFC",
             placeholder_text=" 请输入金额 ",
         )
-        # expand=True + fill="both"：金额框吃掉容器里切换按钮之外的全部宽度，
-        # 无论窗口多宽都完整填满，不会在按钮右侧留下一段空隙。
-        self.amount_entry.pack(side="left", fill="both", expand=True)
+        self.amount_entry.grid(row=0, column=3, padx=(0, 0), pady=(0, 5), sticky="ew")
 
-        # ---------- 第二行：类别 | 备注 | 添加记录按钮 ----------
+        # ---------- 第二行：类别 | 备注 ----------
         ctk.CTkLabel(
             master_frame,
             text="类别",
@@ -212,8 +288,27 @@ class InputFrame(ctk.CTkFrame):
             text_color="#455A64",
         ).grid(row=1, column=0, padx=(16, 6), pady=(5, 0), sticky="w")
 
-        category_entry = ctk.CTkEntry(
+        # 需求 3.13：类别字段 = 「输入框 + ▼ 按钮」，与上一行的日期字段是同一套组合。
+        # 上一版用的 CTkComboBox 有两个问题：一是它的下拉箭头是从控件内部右上角
+        # 伸出来的小折角，与日期那个独立的 ▼ 按钮并排放在一起风格不统一；
+        # 二是它的下拉是 Tk 原生菜单（原因详见 category_picker.py 的模块注释），
+        # 弹出位置压不住，左边缘会跑到输入框左边。改成这个组合后两个问题一起消失。
+        # 与日期字段一样，输入框和 ▼ 按钮放进透明容器水平排布：若各自 grid 到不同列，
+        # 会把整行高度撑高并让「类别」标签错位。
+        category_frame = ctk.CTkFrame(
             master_frame,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        # sticky="ew" + 右 padx=0：类别框组与第一行的日期框组共用第 1 列并填满整列，
+        # 两行在同一列里两端对齐，所以两组的输入框、▼ 按钮左右边缘都落在同一批竖线上。
+        category_frame.grid(row=1, column=1, padx=(0, 0), pady=(5, 0), sticky="ew")
+        # 这里刻意不写 placeholder_text：本项目已确认 CTkEntry 不能同时给
+        # placeholder_text 和 textvariable（Python 3.13 下占位符会永久失效）。
+        # 类别框必须绑定 category_var（ui.py 和编辑弹窗都直接读它），所以只能放弃占位提示。
+        # 手动输入新类别依然可用：这只是个普通输入框，打字即可。
+        self.category_entry = ctk.CTkEntry(
+            category_frame,
             height=36,
             font=font_regular,
             corner_radius=9,
@@ -222,10 +317,23 @@ class InputFrame(ctk.CTkFrame):
             fg_color="#F8FAFC",
             textvariable=self.category_var,
         )
-        # sticky="ew" + 右 padx=0：类别框与第一行的日期框组共用第 1 列并填满整列，
-        # 两行在同一列里两端对齐，所以「类别框」与「日期框组」左右边缘都对齐。
-        # 不写 width：宽度跟着第 1 列的权重走。
-        category_entry.grid(row=1, column=1, padx=(0, 0), pady=(5, 0), sticky="ew")
+        # ▼ 按钮与日期字段的那个逐项对齐：36x36、圆角 9、浅青灰底、同一字体与文字色，
+        # 所以两行的 ▼ 看起来是同一个控件。
+        # 先 pack 按钮（side="right"）再 pack 输入框（expand=True），写法与日期字段一致，
+        # 保证「输入框右边缘」和「▼ 按钮右边缘」两行都落在同一条竖线上。
+        ctk.CTkButton(
+            category_frame,
+            text="▼",
+            command=self._pick_category,
+            width=36,
+            height=36,
+            corner_radius=9,
+            fg_color="#E3EAF2",
+            hover_color="#D2DEE9",
+            text_color="#243447",
+            font=("Microsoft YaHei UI", 11),
+        ).pack(side="right", padx=(6, 0))
+        self.category_entry.pack(side="left", fill="both", expand=True)
 
         ctk.CTkLabel(
             master_frame,
@@ -234,9 +342,9 @@ class InputFrame(ctk.CTkFrame):
             text_color="#455A64",
         ).grid(row=1, column=2, padx=(12, 6), pady=(5, 0), sticky="w")
 
-        # 备注框与第一行的金额区共用第 3 列，并用 sticky="ew" 填满整列：
-        # 两者右边缘因此严格对齐；而金额区左侧还要放下一个固定 100px 的切换按钮，
-        # 所以备注框会比金额输入框宽出约一个按钮的宽度（起点更靠左、终点相同）。
+        # 备注框与第一行的金额框共用第 3 列，并用 sticky="ew" 填满整列：
+        # 两者现在都是该列里唯一的控件，所以宽度完全相同、左右边缘都严格对齐
+        # （切换按钮挪到标题行后，金额框不再被占用 100px，两个框终于等宽了）。
         # 不写 width：宽度完全由列权重决定，窗口拉宽时备注框同步变宽。
         note_entry = ctk.CTkEntry(
             master_frame,
@@ -248,28 +356,10 @@ class InputFrame(ctk.CTkFrame):
             fg_color="#F8FAFC",
             textvariable=self.note_var,
         )
-        # 右侧不留 padx：那 12px 间距统一由按钮自己的 padx=(12, 0) 提供；
-        # 若这里也加一段，间距会翻倍，备注框右边缘也会与金额框错开。
+        # 右侧不留 padx：输入列带权重、会吃掉全部剩余宽度，右边缘的留白
+        # 统一由 master_frame 自己的右 padx=(0, 16) 提供，
+        # 这样备注框右边缘才能与标题行的添加按钮右边缘对齐。
         note_entry.grid(row=1, column=3, padx=(0, 0), pady=(5, 0), sticky="ew")
-
-        # 按钮占第 4 列（备注框右边一列），sticky="w" 让它紧贴备注框右侧不漂移；
-        # 左 padx=12 就是需求里那 12px 间距，右 padx=16 是卡片内边距。
-        # 这个右内边距不能省：两个输入列带权重、会吃掉全部剩余宽度，按钮列因此
-        # 正好顶到卡片右边缘，不留 16px 的话按钮会贴死在卡片边框上。
-        # 它只是一圈内边距，不是以前那种「一块空的留白列」，窗口拉宽时宽度不变。
-        # 按钮是「固定宽度」控件：所在列权重为 0、宽度写死 110px，不跟着伸缩。
-        # 回调保持原样。
-        ctk.CTkButton(
-            master_frame,
-            text="添加记录",
-            command=add_callback,
-            width=110,
-            height=36,
-            corner_radius=10,
-            fg_color="#2F80ED",
-            hover_color="#256AC4",
-            font=font_small,
-        ).grid(row=1, column=4, padx=(12, 16), pady=(5, 0), sticky="w")
 
     def _pick_date(self) -> None:
         """打开日历选择器，把选中的日期回填到日期输入框（需求 3.12）。"""
@@ -279,6 +369,52 @@ class InputFrame(ctk.CTkFrame):
         # 返回 None 表示用户取消/按 ESC，此时保持输入框原值不变。
         if picked:
             self.date_var.set(picked)
+
+    def _pick_category(self) -> None:
+        """打开类别选择器，把选中的类别回填到类别输入框（需求 3.13）。"""
+        # 候选在「点击 ▼ 的这一刻」现算，而不是提前算好存在控件里：
+        # 这样切换支出/收入后弹出的列表自动就是对应的那一套（需求 3.13），
+        # 保存新记录后刷新历史也不需要再回头去改任何控件的 values。
+        # 以 category_entry 为 anchor：弹窗宽度与它等宽、左边缘与它对齐。
+        picked = ask_category(
+            self.winfo_toplevel(),
+            self.category_entry,
+            self._categories_for(self.amount_type_var.get()),
+            self.category_var.get(),
+        )
+        # 返回 None 表示用户取消/按 ESC，此时保持输入框原值不变。
+        if picked:
+            self.category_var.set(picked)
+
+    def _categories_for(self, amount_type: str) -> list[str]:
+        """按当前收/支类型算出候选类别：预置在前、历史追加在后。"""
+        # 只有「收入」用收入那套；其余一律当支出处理（等价于 amount_type_var 的默认值），
+        # 这样即使日后 amount_type_var 被赋了意外值，也不会退化成空候选列表。
+        if amount_type == "收入":
+            return merge_categories(DEFAULT_INCOME_CATEGORIES, self._history_income)
+        return merge_categories(DEFAULT_EXPENSE_CATEGORIES, self._history_expense)
+
+    def refresh_categories(
+        self,
+        history_expense: list[str] | None = None,
+        history_income: list[str] | None = None,
+    ) -> None:
+        """记下最新的历史类别，供下次点 ▼ 时算候选（主窗口在新增记录成功后调用）。
+
+        刷新时机只有一个：store.add() 成功之后。之所以不是「每敲一个字就重算」，
+        是因为历史类别来源于数据库，不落库的输入根本不算「用过」；
+        而每次写库前重查一次 DISTINCT 足够便宜，也避免了维护一个内存里的类别集合
+        （那种做法在删除记录后会留下已经没人用的类别）。
+        """
+        # 两个参数都是可选的：允许主窗口只更新其中一套（例如只改了支出记录）。
+        # 传 None 表示「这一套没变化」，保留上次的值，避免误清空。
+        if history_expense is not None:
+            self._history_expense = list(history_expense)
+        if history_income is not None:
+            self._history_income = list(history_income)
+        # 这里不再需要回头改控件：候选是等用户点 ▼ 时按当时的收支类型现算的，
+        # 「提前算好塞进控件 values」的写法已随 CTkComboBox 一起删掉了
+        # —— 那也正是切换收支时那个 command 回调存在的唯一理由。
 
 
 class ToolbarFrame(ctk.CTkFrame):

@@ -11,7 +11,13 @@ import tkinter as tk
 import customtkinter as ctk
 
 from calendar_picker import ask_date
+from category_picker import ask_category
+from config import DEFAULT_EXPENSE_CATEGORIES, DEFAULT_INCOME_CATEGORIES
 from store import Account
+# 候选列表的「预置 + 历史去重」合并逻辑与新增记录输入区完全一致，
+# 所以直接复用 widgets.merge_categories，而不是在弹窗里再写一份（两份实现早晚会跑偏）。
+# 依赖方向是 dialogs -> widgets -> calendar_picker，widgets 不反向引用 dialogs，不会循环导入。
+from widgets import merge_categories
 
 
 def _apply_logo_icon(window: tk.Misc) -> None:
@@ -143,8 +149,14 @@ def ask_month(parent: ctk.CTk, title: str, prompt: str) -> str | None:
 def ask_edit_record(
     parent: ctk.CTk,
     record: Account,
+    history_expense: list[str] | None = None,
+    history_income: list[str] | None = None,
 ) -> tuple[str, Decimal, str, str] | None:
-    """显示预填记录编辑框，并返回通过校验的字段。"""
+    """显示预填记录编辑框，并返回通过校验的字段。
+
+    history_expense / history_income 是 store.get_categories() 查出的「用户历史用过的类别」，
+    用于给类别字段组成下拉候选；不传则只有预置类别，弹窗依然可用。
+    """
     dialog = ctk.CTkToplevel(parent)
     dialog.title("编辑记录")
     # 编辑框比月份框更高，因为要纵向排列四个字段。
@@ -181,6 +193,19 @@ def ask_edit_record(
         ("备注", note_var),
     )
 
+    # 类别候选（需求 3.13）：按这条记录当前是收还是支取对应的一套。
+    # 负数 = 支出、非负 = 收入，与表格里的符号约定（ui.add_record 的符号转换）保持一致；
+    # 直接读 record.amount 而不是解析输入框内容，是因为这个列表只在打开弹窗时算一次，
+    # 用户后续在金额框里把正负号改过来也不会重算（避免下拉候选随输入字符跳动）。
+    if record.amount < 0:
+        category_values = merge_categories(
+            DEFAULT_EXPENSE_CATEGORIES, history_expense
+        )
+    else:
+        category_values = merge_categories(
+            DEFAULT_INCOME_CATEGORIES, history_income
+        )
+
     def _pick_date() -> None:
         """打开日历选择器，把选中的日期回填到日期输入框（需求 3.12）。"""
         picked = ask_date(dialog, date_var.get().strip())
@@ -189,6 +214,8 @@ def ask_edit_record(
             date_var.set(picked)
 
     # 按顺序收集输入框，用于最后把焦点落到第一个字段上。
+    # 四个字段现在都是 CTkEntry（类别字段在需求 3.13 的改版里从 CTkComboBox 换回了输入框，
+    # 那个 ▼ 按钮不进这个列表），所以 entries[0].focus_set() 一定落在日期框上。
     entries: list[ctk.CTkEntry] = []
     for label, variable in fields:
         ctk.CTkLabel(
@@ -221,6 +248,66 @@ def ask_edit_record(
                 date_row,
                 text="▼",
                 command=_pick_date,
+                width=36,
+                height=34,
+                corner_radius=9,
+                fg_color="#E3EAF2",
+                hover_color="#D2DEE9",
+                text_color="#243447",
+                font=("Microsoft YaHei UI", 11),
+            ).pack(side="right", padx=(6, 0))
+            entry.pack(side="left", fill="x", expand=True)
+            entries.append(entry)
+            continue
+
+        # 类别字段（需求 3.13）：与新增记录输入区用同一套「输入框 + ▼」组合，
+        # 既能点 ▼ 从预置/历史候选里挑，也能直接手输改成新写法。
+        # （上一版用的是 CTkComboBox，箭头样式与日期那个 ▼ 不统一，
+        # 且它的原生下拉菜单压不住位置，原因详见 category_picker.py 的模块注释。）
+        if label == "类别":
+            category_row = ctk.CTkFrame(content, fg_color="transparent")
+            category_row.pack(fill="x")
+            entry = ctk.CTkEntry(
+                category_row,
+                textvariable=variable,
+                font=dialog_font,
+                height=34,
+                corner_radius=9,
+                border_width=1,
+                border_color="#C6D4DF",
+                fg_color="#FFFFFF",
+            )
+
+            # 参数必须用「默认参数」把 entry / variable 当场绑死，不能直接引用外层名字：
+            # 这两个名字在同一个 for 循环里会被后一轮（备注字段）重新赋值，
+            # 闭包晚绑定拿到的就是备注框——实测类别列表会锚到备注框上，
+            # 位置整体下移 92px、宽度多出 52px，而且选中项会被写进备注。
+            def _pick_category(
+                target: ctk.CTkEntry = entry,
+                var: ctk.StringVar = variable,
+            ) -> None:
+                """打开类别选择器，把选中的类别回填到输入框（需求 3.13）。"""
+                # 锚点用输入框而不是 category_row：弹窗宽度与输入框等宽、左边缘与输入框对齐。
+                # 候选用打开弹窗时按 record.amount 正负号算好的那一套（见上方 category_values），
+                # 不随用户在金额框里改符号而变化，避免候选列表跟着输字符跳动。
+                picked = ask_category(dialog, target, category_values, var.get())
+                # 返回 None 表示用户取消/按 ESC，此时保持输入框原值不变。
+                if picked:
+                    var.set(picked)
+                # 类别列表自己是另一个 grab 窗口：它关闭时 Tk 会把 grab 一并释放掉，
+                # 而「上一个 grab」并不会自动恢复，不补这一行编辑弹窗就丢了模态
+                # （列表关掉后还能点到主窗口）。这里把它抢回来。
+                # winfo_exists() 判断是必须的：列表开着时用户仍能点编辑弹窗的右上角关闭，
+                # 那种情况下这里的 dialog 已经被销毁，直接 grab_set() 会抛 TclError。
+                if dialog.winfo_exists():
+                    dialog.grab_set()
+
+            # 与日期行同一套写法：按钮先 pack 且 side="right" 钉在右端（36x34），
+            # 输入框再 pack 且 expand=True 占满剩余宽度，两者高度齐平。
+            ctk.CTkButton(
+                category_row,
+                text="▼",
+                command=_pick_category,
                 width=36,
                 height=34,
                 corner_radius=9,

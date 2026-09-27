@@ -96,6 +96,39 @@ class AccountStore:
             )
         self.records = records
 
+    def get_categories(self) -> tuple[list[str], list[str]]:
+        """返回 (支出类别列表, 收入类别列表)，来自数据库中的 DISTINCT category。
+
+        供需求 3.13 的类别下拉列表使用：下拉候选 = 预置类别 + 这里查出的「历史用过的类别」。
+        之所以直接从库里聚合，而不是让界面层自己攒：界面状态一重启就没了，
+        只有数据库才是跨会话的长期记忆，用户手打过的新类别必须落库后才能被记住。
+
+        按金额正负拆成两组：业务约定「负数 = 支出、非负 = 收入」（见 ui.add_record 的符号转换），
+        所以金额本身就是最可靠的分类依据，不需要再额外加一个「收支类型」字段去维护。
+        DISTINCT 负责去重，ORDER BY 保证同一批数据每次刷新顺序都一样，
+        否则下拉列表会随机重排，用户刚记住的位置下次就变了。
+
+        注意 amount 列是 TEXT（见 _initialize_database），SQLite 的类型亲和规则会让
+        `amount < 0` 退化成字符串比较。这里的结果依然是正确的：
+        store.add / update 一律按 f"{amount:.2f}" 写入，所以负数必定以 '-'（0x2D）开头，
+        非负数必定以数字（'0'~'9'，0x30 起）开头，而 '-' < '0'，
+        字符串比较与数值比较在所有正常数据上完全一致；
+        手工改库产生的 'abc' / 'NaN' 这类脏值只会被判入收入组，不会抛异常。
+        """
+        with self._connect() as connection:
+            expense_rows = connection.execute(
+                "SELECT DISTINCT category FROM accounts "
+                "WHERE amount < 0 ORDER BY category"
+            ).fetchall()
+            income_rows = connection.execute(
+                "SELECT DISTINCT category FROM accounts "
+                "WHERE amount >= 0 ORDER BY category"
+            ).fetchall()
+        return (
+            [row[0] for row in expense_rows],
+            [row[0] for row in income_rows],
+        )
+
     def next_id(self) -> int:
         # 取当前最大 ID 加一；空表时 default=0 返回 1，避免 max() 在空序列上报错。
         return max((record.record_id for record in self.records), default=0) + 1

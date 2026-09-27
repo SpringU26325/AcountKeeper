@@ -84,7 +84,15 @@ class AccountKeeperApp(ctk.CTk):
             text_color="#607D8B",
         ).pack(anchor="center")
 
-        self.input_frame = InputFrame(self, self.add_record)
+        # 需求 3.13：先查出用户历史用过的类别（按收支分开），作为类别下拉候选的一部分。
+        # 启动时查一次就够了，之后每次新增成功会再查一次（见 add_record）。
+        history_expense, history_income = self.store.get_categories()
+        self.input_frame = InputFrame(
+            self,
+            self.add_record,
+            history_expense=history_expense,
+            history_income=history_income,
+        )
         self.input_frame.pack(fill="x", padx=24, pady=(0, 8))
         # 把这些控件引用提升到主窗口，方便各回调直接读取/清空；控件本身仍归 InputFrame 所有。
         self.date_var = self.input_frame.date_var
@@ -222,6 +230,12 @@ class AccountKeeperApp(ctk.CTk):
         self.amount_entry.delete(0, "end")
         self.category_var.set("")
         self.note_var.set("")
+        # 需求 3.13：新类别入库后重新查一次历史类别并刷新下拉候选，
+        # 用户这次手输的类别下次就能直接选。必须放在 store.add() 之后——
+        # 候选来自数据库，没写进 accounts 表的类别不算「用过」；
+        # 也放在清空之后，此时输入框已空，刷新只改候选列表、不会意外回填内容。
+        history_expense, history_income = self.store.get_categories()
+        self.input_frame.refresh_categories(history_expense, history_income)
         self.refresh_records()
 
     def delete_record(self) -> None:
@@ -259,8 +273,13 @@ class AccountKeeperApp(ctk.CTk):
         if record is None:
             return
 
+        # 类别候选按这条记录的正负号取对应的一套，每次打开弹窗都现查一次，
+        # 这样别的窗口/会话新加的类别也能立即出现在下拉列表里。
+        history_expense, history_income = self.store.get_categories()
         # 用户取消编辑时返回 None，此时保持原样不做任何改动。
-        edited_values = dialogs.ask_edit_record(self, record)
+        edited_values = dialogs.ask_edit_record(
+            self, record, history_expense, history_income
+        )
         if edited_values is None:
             return
         record_date, amount, category, note = edited_values
@@ -386,4 +405,9 @@ class AccountKeeperApp(ctk.CTk):
         record: Account,
     ) -> tuple[str, Decimal, str, str] | None:
         """保留旧接口，实际对话框由 dialogs 模块负责。"""
-        return dialogs.ask_edit_record(self, record)
+        # 需求 3.13：这个旧接口也要带上历史类别，否则从这里打开的编辑弹窗
+        # 只会剩预置类别，与双击表格打开的效果不一致。
+        history_expense, history_income = self.store.get_categories()
+        return dialogs.ask_edit_record(
+            self, record, history_expense, history_income
+        )

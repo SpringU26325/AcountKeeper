@@ -19,6 +19,15 @@ except ImportError:
 # CSV 表头字段顺序，必须与数据库查询列的顺序保持一致，否则导出后列会错位。
 # 旧 CSV 迁移逻辑已在 #40 中删除，该常量现仅被 store.export_month_csv 用于写表头。
 CSV_FIELDS = ("id", "date", "amount", "category", "note")
+
+# 预置类别（需求 3.13）：类别下拉列表的「底表」，即使用户一条记录都没有也有可选项。
+# 之所以按支出/收入拆成两套而不是合并成一个大列表：两边的用词几乎不重叠
+# （「工资」「奖金」不会出现在支出场景，「餐饮」「水电」也不会出现在收入场景），
+# 混在一起只会让下拉列表变长、选错率变高，所以按业务语义分开维护。
+# 用元组而不是列表：这两组是全局常量，元组是不可变的，能防止调用方
+# 不小心用 append() 原地修改而污染配置（下拉列表需要 list，转换由 UI 层负责）。
+DEFAULT_EXPENSE_CATEGORIES = ("餐饮", "交通", "购物", "居住", "水电", "通讯", "医疗", "娱乐", "人情", "其他")
+DEFAULT_INCOME_CATEGORIES = ("工资", "奖金", "投资", "兼职", "红包", "报销", "退款", "其他")
 # 源码所在目录，用于开发环境下定位 image、snail_messages.json 等资源文件。
 BASE_DIR = Path(__file__).resolve().parent
 # 用户数据目录（Windows 下通常是 C:\Users\用户名\AppData\Local\AccountKeeper）。
