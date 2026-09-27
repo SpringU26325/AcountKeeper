@@ -12,12 +12,11 @@ import customtkinter as ctk
 
 from calendar_picker import ask_date
 from category_picker import ask_category
-from config import DEFAULT_EXPENSE_CATEGORIES, DEFAULT_INCOME_CATEGORIES
+# 类别候选统一由 category_prefs 算（预置 + 用户保存 − 被隐藏），与新增记录输入区
+# 走同一条路。合并逻辑只留 category_prefs 那一份，不再由 widgets 导出一个 helper
+# （两份实现早晚会跑偏），依赖方向也从 dialogs -> widgets 降为 dialogs -> category_prefs。
+from category_prefs import EXPENSE, INCOME, build_candidates
 from store import Account
-# 候选列表的「预置 + 历史去重」合并逻辑与新增记录输入区完全一致，
-# 所以直接复用 widgets.merge_categories，而不是在弹窗里再写一份（两份实现早晚会跑偏）。
-# 依赖方向是 dialogs -> widgets -> calendar_picker，widgets 不反向引用 dialogs，不会循环导入。
-from widgets import merge_categories
 
 
 def _apply_logo_icon(window: tk.Misc) -> None:
@@ -149,13 +148,12 @@ def ask_month(parent: ctk.CTk, title: str, prompt: str) -> str | None:
 def ask_edit_record(
     parent: ctk.CTk,
     record: Account,
-    history_expense: list[str] | None = None,
-    history_income: list[str] | None = None,
 ) -> tuple[str, Decimal, str, str] | None:
     """显示预填记录编辑框，并返回通过校验的字段。
 
-    history_expense / history_income 是 store.get_categories() 查出的「用户历史用过的类别」，
-    用于给类别字段组成下拉候选；不传则只有预置类别，弹窗依然可用。
+    类别候选不再由调用方传入历史类别：弹窗自己按 record.amount 的正负号向
+    category_prefs 现算（预置 + 用户保存 − 被隐藏），所以调用方少两个必传参数，
+    也不会出现「有的调用点忘记传历史类别、候选莫名其妙变少」这种不一致。
     """
     dialog = ctk.CTkToplevel(parent)
     dialog.title("编辑记录")
@@ -195,16 +193,10 @@ def ask_edit_record(
 
     # 类别候选（需求 3.13）：按这条记录当前是收还是支取对应的一套。
     # 负数 = 支出、非负 = 收入，与表格里的符号约定（ui.add_record 的符号转换）保持一致；
-    # 直接读 record.amount 而不是解析输入框内容，是因为这个列表只在打开弹窗时算一次，
+    # 直接读 record.amount 而不是解析输入框内容，是因为这个方向只在打开弹窗时定一次，
     # 用户后续在金额框里把正负号改过来也不会重算（避免下拉候选随输入字符跳动）。
-    if record.amount < 0:
-        category_values = merge_categories(
-            DEFAULT_EXPENSE_CATEGORIES, history_expense
-        )
-    else:
-        category_values = merge_categories(
-            DEFAULT_INCOME_CATEGORIES, history_income
-        )
+    category_direction = EXPENSE if record.amount < 0 else INCOME
+    category_values = build_candidates(category_direction)[0]
 
     def _pick_date() -> None:
         """打开日历选择器，把选中的日期回填到日期输入框（需求 3.12）。"""
@@ -309,6 +301,8 @@ def ask_edit_record(
                 # 候选用打开弹窗时按 record.amount 正负号算好的那一套（见上方 category_values），
                 # 不随用户在金额框里改符号而变化，避免候选列表跟着输字符跳动。
                 # toggle 传给弹窗：再点一次这个 ▼ 表示关闭列表（返回 None），输入框原值不动。
+                # 注意：弹窗内部的「保存/隐藏/恢复」需要知道方向（收还是支），
+                # 那个形参归小步 2 一起加（ask_category 与调用点同时改），本轮不动 category_picker.py。
                 picked = ask_category(
                     dialog, target, category_values, var.get(),
                     toggle_button=toggle,

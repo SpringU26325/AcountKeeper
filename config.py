@@ -49,6 +49,12 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 # settings.json 缺失、损坏、路径非法，或记住的目录已被删除/不可写时，一律回退到它。
 DEFAULT_EXPORT_DIR = DATA_DIR
 
+# 用户类别偏好文件（需求 3.13 第二轮）的路径：记录用户主动保存的类别与被隐藏的类别。
+# 刻意与 settings.json 分开两个文件，因为 settings 的写入是整份覆盖，
+# 两类数据放一起会互相洗掉（原因详见 category_prefs.py 的模块说明）。
+# 与 account.db 同目录，便于用户整体备份/迁移。
+CATEGORY_PREFS_PATH = DATA_DIR / "categories.json"
+
 # 资源根目录：PyInstaller 打包后资源会被解压到 sys._MEIPASS，
 # 用 getattr 做兼容，未打包时回退到源码目录，保证两种运行方式都能找到图片。
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR))

@@ -14,6 +14,7 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+import category_prefs
 import dialogs
 import settings
 from chart_window import show_chart_window
@@ -84,14 +85,16 @@ class AccountKeeperApp(ctk.CTk):
             text_color="#607D8B",
         ).pack(anchor="center")
 
-        # 需求 3.13：先查出用户历史用过的类别（按收支分开），作为类别下拉候选的一部分。
-        # 启动时查一次就够了，之后每次新增成功会再查一次（见 add_record）。
-        history_expense, history_income = self.store.get_categories()
+        # 需求 3.13：类别候选已改为「预置 + 用户保存 − 被隐藏」，数据存在 category_prefs
+        # 自己的文件里。这里在窗口组装前做一次「一次性迁移」：把数据库里已有的
+        # 历史类别（store.get_categories）拷进用户类别，否则老用户升级后
+        # 自己用过的类别会一夜之间从下拉列表里消失。
+        # 迁移以「文件是否已存在」为判据，重复调用不会覆盖用户后续的增删；
+        # 两个返回值都是可选的，这里不用管结果，失败也只警告不阻断启动。
+        category_prefs.ensure_migrated(*self.store.get_categories())
         self.input_frame = InputFrame(
             self,
             self.add_record,
-            history_expense=history_expense,
-            history_income=history_income,
         )
         self.input_frame.pack(fill="x", padx=24, pady=(0, 8))
         # 把这些控件引用提升到主窗口，方便各回调直接读取/清空；控件本身仍归 InputFrame 所有。
@@ -230,12 +233,10 @@ class AccountKeeperApp(ctk.CTk):
         self.amount_entry.delete(0, "end")
         self.category_var.set("")
         self.note_var.set("")
-        # 需求 3.13：新类别入库后重新查一次历史类别并刷新下拉候选，
-        # 用户这次手输的类别下次就能直接选。必须放在 store.add() 之后——
-        # 候选来自数据库，没写进 accounts 表的类别不算「用过」；
-        # 也放在清空之后，此时输入框已空，刷新只改候选列表、不会意外回填内容。
-        history_expense, history_income = self.store.get_categories()
-        self.input_frame.refresh_categories(history_expense, history_income)
+        # 需求 3.13：这里不再需要「重新查历史类别 + 刷新候选」。
+        # 候选改由 category_prefs 在每次点 ▼ 时现算，用户这次手输并保存下来的类别
+        # 会直接进用户类别文件，下次点 ▼ 自然就在列表里；同时少了一个必守的
+        # 「新增成功后记得刷新」约定，也就少一类「忘了刷新」的 bug。
         self.refresh_records()
 
     def delete_record(self) -> None:
@@ -273,13 +274,8 @@ class AccountKeeperApp(ctk.CTk):
         if record is None:
             return
 
-        # 类别候选按这条记录的正负号取对应的一套，每次打开弹窗都现查一次，
-        # 这样别的窗口/会话新加的类别也能立即出现在下拉列表里。
-        history_expense, history_income = self.store.get_categories()
         # 用户取消编辑时返回 None，此时保持原样不做任何改动。
-        edited_values = dialogs.ask_edit_record(
-            self, record, history_expense, history_income
-        )
+        edited_values = dialogs.ask_edit_record(self, record)
         if edited_values is None:
             return
         record_date, amount, category, note = edited_values
@@ -405,9 +401,4 @@ class AccountKeeperApp(ctk.CTk):
         record: Account,
     ) -> tuple[str, Decimal, str, str] | None:
         """保留旧接口，实际对话框由 dialogs 模块负责。"""
-        # 需求 3.13：这个旧接口也要带上历史类别，否则从这里打开的编辑弹窗
-        # 只会剩预置类别，与双击表格打开的效果不一致。
-        history_expense, history_income = self.store.get_categories()
-        return dialogs.ask_edit_record(
-            self, record, history_expense, history_income
-        )
+        return dialogs.ask_edit_record(self, record)

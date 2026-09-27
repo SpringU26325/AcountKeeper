@@ -41,8 +41,6 @@ _TEXT_COLOR = "#455A64"
 _ACCENT_COLOR = "#2F80ED"
 _ACCENT_HOVER_COLOR = "#256AC4"
 _SUBTLE_HOVER_COLOR = "#D2DEE9"
-_CANCEL_COLOR = "#90A4AE"
-_CANCEL_HOVER_COLOR = "#78909C"
 _SCROLLBAR_COLOR = "#C6D4DF"
 _SCROLLBAR_HOVER_COLOR = "#90A4AE"
 
@@ -50,10 +48,17 @@ _SCROLLBAR_HOVER_COLOR = "#90A4AE"
 _ITEM_HEIGHT = 32
 _MAX_VISIBLE_ITEMS = 7
 
+# 调用方那个 ▼ 按钮的文字：弹窗开着时翻成 ▲，关掉时翻回 ▼。
+# ▲/▼ 是 U+25B2 / U+25BC，Microsoft YaHei UI 自带字形（当初日期/类别按钮选 ▼
+# 而不是 emoji 📅，就是这个原因），翻转不会出现缺字方块。
+# 「关态」刻意与调用方创建按钮时写的初始文字保持一致——本模块拿到的是别人建好的
+# 控件，只能保证「关掉之后回到 ▼」；一旦有人改了 widgets.py / dialogs.py 里建按钮处
+# 的文字，这两处必须同步改，否则会出现「关掉了但图标没回原样」的错觉。
+_TOGGLE_TEXT_CLOSED = "▼"
+_TOGGLE_TEXT_OPEN = "▲"
+
 _LIST_CORNER_RADIUS = 8
 _PAD = 10  # 弹窗四周内边距
-_FOOTER_HEIGHT = 34  # 「取消」按钮高度
-_BUTTON_GAP = 6  # 列表与「取消」按钮之间的竖向间距
 _GAP_ABOVE = 6  # 弹窗与输入框之间的竖向缝隙
 _MIN_WIDTH = 180  # 输入框窄到离谱时的兜底宽度（逻辑像素）
 _SCREEN_MARGIN = 8  # 贴边保护，避免弹窗压在屏幕边缘上
@@ -143,6 +148,25 @@ def _clear_picker(dialog: tk.Misc) -> None:
         _active_picker = None
 
 
+def _set_toggle_text(toggle: tk.Misc | None, text: str) -> None:
+    """把调用方那个 ▼ 按钮的文字改成 text（▲ 或 ▼），失败一律静默。
+
+    只做「换个图标」这一件事，所以任何异常都不值得往外冒：按钮可能早就没了
+    （用户关编辑记录弹窗时，那个 ▼ 会和弹窗一起被连带销毁），而形参类型也只承诺
+    是 tk.Misc、并不保证它有 text 选项。图标属于提示性信息——宁可这一次没翻过来，
+    也绝不能让关闭流程卡在半路。
+    """
+    if toggle is None:
+        return
+    try:
+        if not toggle.winfo_exists():
+            return
+        toggle.configure(text=text)
+    except (tk.TclError, AttributeError, ValueError):
+        # TclError：控件已销毁；AttributeError / ValueError：该控件没有 text 选项。
+        pass
+
+
 def _on_any_click(event: tk.Event) -> None:
     """全局 <Button-1> 监视：点到弹窗外的地方就把弹窗关掉。
 
@@ -207,10 +231,12 @@ def ask_category(
         values: 候选类别（预置 + 历史，调用方已去重）。
         current: 输入框里的当前内容，用于在列表里高亮当前项。
         toggle_button: 调用方那个 ▼ 按钮。点它属于「再点一次关闭」而不是「点外面」，
-            所以全局点击监视器要把它排除掉；不传只是少这一个白名单，功能不受影响。
+            所以全局点击监视器要把它排除掉。弹窗显示期间它的文字会被翻成 ▲，
+            关闭时无论走哪条路径都由 _cleanup 翻回 ▼。不传只是少这一个白名单
+            和图标切换，功能不受影响。
 
     Returns:
-        选中的类别；用户点「取消」、按 ESC、点右上角关闭、再点一次同一个 ▼，
+        选中的类别；用户按 ESC、点右上角关闭、再点一次同一个 ▼，
         或者点弹窗外的别处时返回 None。
     """
     # 【toggle / 防叠加】先处理「已经有一个类别弹窗开着」的情况，必须早于建窗：
@@ -266,9 +292,12 @@ def ask_category(
 
     # 【高度】最多露出 _MAX_VISIBLE_ITEMS 项，其余靠滚动条看：候选 = 预置 + 历史，
     # 数量只增不减，不限高的话弹窗迟早会长到屏幕外面去。
+    # 弹窗里现在只剩列表这一块（底部「取消」按钮已删掉：关闭已有 toggle / 点外面 /
+    # ESC / 点选项 / 右上角 × 五条路，再摆一个「取消」纯属重复），
+    # 所以高度 = 上下内边距 + 列表视口高度。
     visible_items = max(min(len(values), _MAX_VISIBLE_ITEMS), 1)
     list_height = visible_items * _ITEM_HEIGHT
-    height = _PAD + list_height + _BUTTON_GAP + _FOOTER_HEIGHT + _PAD
+    height = _PAD + list_height + _PAD
 
     dialog.geometry(f"{width}x{height}")
 
@@ -288,12 +317,20 @@ def ask_category(
         就发一次 <Configure>。不摘的话，每开合一次列表就在主窗口和锚点上多积一个
         死回调，回调里还各要跑一次 Tcl 调用（winfo_exists），越用越漏。
 
-        用 _cleaned 标记保证只跑一次：点选、ESC、取消、右上角关闭、父窗口被销毁
-        把它连带销毁、以及函数返回前兜底，这六条路径最终都汇到这里。
+        用 _cleaned 标记保证只跑一次：点选、ESC 与右上角关闭（后两者都走 _cancel）、
+        父窗口被销毁把它连带销毁、以及函数返回前兜底，这几条路径最终都汇到这里。
         """
         if _cleaned[0]:
             return
         _cleaned[0] = True
+        # 先把唤起本次弹窗的那个 ▼ 还原成关态图标。放在这个统一出口而不是各条关闭
+        # 路径里，是因为关闭路径共六条（点选、ESC、右上角 ×、点外面、再点同一个 ▼、
+        # 父窗口销毁把它连带销毁），分散写必漏；_cleaned 标记又保证这里只跑一次。
+        # 时序上也不可能误伤新弹窗：即使本次关闭属于「换一个锚点重开」，这里翻回去的
+        # 也是**旧**按钮（toggle_button 取自本函数闭包，与调用方新传进来的那个 ▼ 是
+        # 两个不同对象），而新按钮的 ▲ 要等本函数返回、新一次 ask_category 建完窗
+        # 才设置，两者不会互相覆盖。
+        _set_toggle_text(toggle_button, _TOGGLE_TEXT_CLOSED)
         # 定时器先停：否则清理完之后还可能再回调一次 _reanchor。
         if poll_id[0] is not None:
             try:
@@ -362,7 +399,11 @@ def ask_category(
         _close_dialog()
 
     def _cancel() -> None:
-        """取消：result 保持 None，关闭弹窗。"""
+        """取消：result 保持 None，关闭弹窗。
+
+        现在只剩 ESC 和右上角 × 两个入口（底部「取消」按钮已删），保留它是因为
+        「不改动输入框内容地关掉弹窗」这条路必须还在。
+        """
         _close_dialog()
 
     # ---------- 列表区 ----------
@@ -377,7 +418,7 @@ def ask_category(
         scrollbar_button_color=_SCROLLBAR_COLOR,
         scrollbar_button_hover_color=_SCROLLBAR_HOVER_COLOR,
     )
-    list_frame.pack(fill="both", expand=True, padx=_PAD, pady=(_PAD, _BUTTON_GAP))
+    list_frame.pack(fill="both", expand=True, padx=_PAD, pady=_PAD)
 
     if values:
         for value in values:
@@ -407,20 +448,6 @@ def ask_category(
             text_color=_TEXT_COLOR,
         ).pack(pady=12)
 
-    # ---------- 底部「取消」 ----------
-    footer = ctk.CTkFrame(dialog, fg_color="transparent", corner_radius=0)
-    footer.pack(fill="x", padx=_PAD, pady=(0, _PAD))
-    ctk.CTkButton(
-        footer,
-        text="取消",
-        command=_cancel,
-        height=_FOOTER_HEIGHT,
-        corner_radius=9,
-        fg_color=_CANCEL_COLOR,
-        hover_color=_CANCEL_HOVER_COLOR,
-        font=dialog_font,
-    ).pack(fill="x")
-
     # ---------- 把弹窗钉到输入框左下方 ----------
     # 位置与宽度都用原生 wm_geometry（物理像素），不用 CTkToplevel.geometry()：
     # 后者会把宽高**和坐标**一起按 DPI 缩放（见 ctk_toplevel.geometry 的
@@ -435,6 +462,17 @@ def ask_category(
         if not dialog.winfo_exists():
             # 列表已经关掉、但挂在锚点和它所在窗口上的 <Configure> 还活着，
             # 下次布局一变动就会回调到这里，不挡掉会直接抛 bad window path name。
+            return
+        # 光守 dialog 不够，必须连锚点一起守：锚点所在的父窗口被销毁时（典型路径见
+        # _cleanup 注释里那条——编辑记录弹窗开着且类别列表已经弹出，用户直接点它右上角 ×），
+        # 作为子控件的锚点会**先于**弹窗被销毁，而本回调同时还挂在锚点所在顶层窗口的
+        # <Configure> 上，紧接着的一次布局变动就会带一个死的窗口路径找上来，
+        # 在下面的 anchor.winfo_width() 抛 TclError: bad window path name（实测 traceback
+        # 正落在那一行，只是被 Tk 的回调包装吞成 stderr 噪音，现象是用户关编辑弹窗时
+        # 控制台多出一段 traceback）。锚点已经不存在，「对齐锚点」这件事本身就不成立了，
+        # 直接返回即可；此时 dialog 可能还活着（销毁顺序就是如此），它的收尾由 _cleanup 负责，
+        # 不在这里销毁弹窗。
+        if not anchor.winfo_exists():
             return
         anchor_width = anchor.winfo_width()
         anchor_height = anchor.winfo_height()
@@ -484,7 +522,20 @@ def ask_category(
         （实测旧 y 偏 92px、旧宽偏 52px），而窗口真正移动到位时并不会再给弹窗补发
         <Configure>，纯事件驱动就会一直卡在旧位置。50ms 轮询只在目标值真的变了
         才调用 wm_geometry，稳定后每轮只是一次纯算术比较。
+
+        锚点一旦被销毁（父窗口连带销毁）就不再有对齐目标——_reanchor 里那道守卫
+        会让它直接返回，定时器也就没必要再续期了，见下面开头那段守卫。
         """
+        # 锚点已经销毁时「对齐锚点」本身就不成立，再每 50ms 醒一次只是白跑（和
+        # _reanchor 同一道判断）。所以这里直接 return、不再 after 续期；已触发的这次
+        # 定时器 id 已经失效，用 None 标记「没有待处理的定时器」，_cleanup 里便跳过
+        # after_cancel（对已失效的 id 调用本就是空操作，这里只是把状态说准）。
+        # 注意只停定时器，**不动 dialog**：弹窗的收尾仍归 _cleanup，与 _reanchor 的守卫
+        # 保持同一原则——守卫只负责让这个回调早退，不负责替别人决定弹窗的生死，
+        # 否则会把「锚点没了但弹窗还活着」这种中间态提前变成「弹窗也没了」。
+        if not anchor.winfo_exists():
+            poll_id[0] = None
+            return
         _reanchor()
         if dialog.winfo_exists():
             poll_id[0] = dialog.after(_POLL_INTERVAL_MS, _poll)
@@ -569,6 +620,12 @@ def ask_category(
             close=_close_dialog,
         )
     )
+
+    # 图标翻成「开态」：必须在本行之后、wait_window 之前设。
+    # 早于 wait_window 是硬要求——_cleanup 会在弹窗关闭时把图标还原成 ▼，
+    # 若这一行排在 wait_window 之后，它会先看到弹窗已经关闭、把 ▲ 又盖回去。
+    # 晚于 _register_picker 则是因为登记之后弹窗才算真正进入「可交互」状态。
+    _set_toggle_text(toggle_button, _TOGGLE_TEXT_OPEN)
 
     # 这里刻意不 grab_set（与 calendar_picker 相反）：一旦 grab，弹窗外的一切点击都被
     # Tk 拒绝，「再点一次同一个 ▼ 关闭」和「点外面关闭」这两条需求就永远实现不了。

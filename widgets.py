@@ -11,30 +11,10 @@ import customtkinter as ctk
 
 from calendar_picker import ask_date
 from category_picker import ask_category
-from config import DEFAULT_EXPENSE_CATEGORIES, DEFAULT_INCOME_CATEGORIES
-
-
-def merge_categories(presets: tuple[str, ...], history: list[str] | None) -> list[str]:
-    """把「预置类别」与「用户历史用过的类别」合并成一个去重后的下拉候选列表。
-
-    放在本模块而不是各处各写一份：新增记录的输入区（InputFrame）和编辑记录弹窗
-    （dialogs.ask_edit_record）都需要同一套候选，两份实现早晚会跑偏。
-    它只处理纯数据、不碰控件，所以当成公开辅助函数导出，供 dialogs 复用。
-
-    合并规则（需求 3.13）：预置在前、历史追加在后，整体去重。
-    预置排前面是为了让常用类别位置固定、用户形成肌肉记忆；
-    历史追加在后面，新增的自定义类别只会出现在列表下方，不会把预置项挤走。
-    """
-    # 以预置项为起点，边遍历边判断，因此这一个 merged 列表同时完成了
-    #「历史项与预置项重复」和「历史项彼此重复」两种去重（历史本身可能有重复写法）。
-    merged: list[str] = list(presets)
-    for raw_category in history or []:
-        category = raw_category.strip()
-        # 跳过空白项：库里理论上不会有，但手改库或旧版本脏数据都可能导致空类别，
-        # 一旦进入下拉列表就会变成一个点不了任何意义的空格条目。
-        if category and category not in merged:
-            merged.append(category)
-    return merged
+# 类别候选统一由 category_prefs 算（预置 + 用户保存 − 被隐藏），
+# 不再从数据库 DISTINCT 取历史类别：那条路会让用户临时输入的写法越积越多，
+# 也正是本轮需求 1 要止住的问题。合并逻辑只有 category_prefs 那一份实现。
+from category_prefs import EXPENSE, INCOME, build_candidates
 
 
 class InputFrame(ctk.CTkFrame):
@@ -44,8 +24,6 @@ class InputFrame(ctk.CTkFrame):
         self,
         master: ctk.CTk,
         add_callback: Callable[[], None],
-        history_expense: list[str] | None = None,
-        history_income: list[str] | None = None,
     ) -> None:
         super().__init__(
             master,
@@ -63,13 +41,10 @@ class InputFrame(ctk.CTkFrame):
         self.amount_type_var = tk.StringVar(value="支出")
         self.category_var = tk.StringVar()
         self.note_var = tk.StringVar()
-        # 历史类别（来自 store.get_categories）单独存一份，而且是**唯一**一份：
-        # 候选列表不再预先生成塞进控件（CTkComboBox 那种做法），而是等用户点 ▼ 时
-        # 由 _pick_category 现算；所以这里存的就是原始历史数据本身，不会出现
-        # 「合并结果又被当作历史来源」导致候选越刷越长（预置项被重复拼进去）。
-        # 用 list(... or []) 拷贝一份：外部日后修改传入的列表不会意外改动已存的历史。
-        self._history_expense: list[str] = list(history_expense or [])
-        self._history_income: list[str] = list(history_income or [])
+        # 这里刻意不再缓存任何「历史类别」：候选由 category_prefs.build_candidates 在
+        # 每次点 ▼ 的那一刻现算。不缓存换来两件事：一是弹窗里保存/隐藏/恢复完
+        # 界面立刻生效，不需要任何跨模块通知；二是调用方不用再记得「新增成功后
+        # 刷新一下」，少一个必守的约定、少一类「忘了刷新」的 bug。
 
         # ---------- 卡片内的整体结构（需求 3.2） ----------
         # 第 0 行 = 标题行（标题 + 支出/收入切换 + 添加按钮），用 title_frame 承载；
@@ -115,7 +90,8 @@ class InputFrame(ctk.CTkFrame):
             variable=self.amount_type_var,
             # 这里没有 command 回调，是刻意的：类别候选不再预先算好塞进控件，
             # 而是等用户点类别框的 ▼ 时由 _pick_category 按「当时的收支类型」现算
-            # （见 _categories_for），所以切换收支时不需要同步任何控件状态。
+            # （即 _direction() + category_prefs.build_candidates），所以切换收支时
+            # 不需要同步任何控件状态。
             # amount_type_var 由 CTkSegmentedButton 自己维护：用户点击走的是内部
             # set(value, from_button_callback=True)，那里会写回 self._variable。
             width=100,
@@ -378,14 +354,16 @@ class InputFrame(ctk.CTkFrame):
         """打开类别选择器，把选中的类别回填到类别输入框（需求 3.13）。"""
         # 候选在「点击 ▼ 的这一刻」现算，而不是提前算好存在控件里：
         # 这样切换支出/收入后弹出的列表自动就是对应的那一套（需求 3.13），
-        # 保存新记录后刷新历史也不需要再回头去改任何控件的 values。
+        # 弹窗里保存/隐藏/恢复完也不需要再回头去改任何控件的缓存。
         # 以 category_entry 为 anchor：弹窗宽度与它等宽、左边缘与它对齐。
         # toggle_button 传自己这个 ▼：弹窗开着时再点它一次表示关闭列表
         # （ask_category 返回 None），而不是被「点外面」逻辑抢先关掉。
+        # 注意：弹窗内部的「保存/隐藏/恢复」需要知道方向（收还是支），
+        # 那个形参归小步 2 一起加（ask_category 与调用点同时改），本轮不动 category_picker.py。
         picked = ask_category(
             self.winfo_toplevel(),
             self.category_entry,
-            self._categories_for(self.amount_type_var.get()),
+            build_candidates(self._direction())[0],
             self.category_var.get(),
             toggle_button=self.category_button,
         )
@@ -393,35 +371,13 @@ class InputFrame(ctk.CTkFrame):
         if picked:
             self.category_var.set(picked)
 
-    def _categories_for(self, amount_type: str) -> list[str]:
-        """按当前收/支类型算出候选类别：预置在前、历史追加在后。"""
-        # 只有「收入」用收入那套；其余一律当支出处理（等价于 amount_type_var 的默认值），
-        # 这样即使日后 amount_type_var 被赋了意外值，也不会退化成空候选列表。
-        if amount_type == "收入":
-            return merge_categories(DEFAULT_INCOME_CATEGORIES, self._history_income)
-        return merge_categories(DEFAULT_EXPENSE_CATEGORIES, self._history_expense)
+    def _direction(self) -> str:
+        """把界面上的收支类型翻译成 category_prefs 的方向标识。
 
-    def refresh_categories(
-        self,
-        history_expense: list[str] | None = None,
-        history_income: list[str] | None = None,
-    ) -> None:
-        """记下最新的历史类别，供下次点 ▼ 时算候选（主窗口在新增记录成功后调用）。
-
-        刷新时机只有一个：store.add() 成功之后。之所以不是「每敲一个字就重算」，
-        是因为历史类别来源于数据库，不落库的输入根本不算「用过」；
-        而每次写库前重查一次 DISTINCT 足够便宜，也避免了维护一个内存里的类别集合
-        （那种做法在删除记录后会留下已经没人用的类别）。
+        只有「收入」走收入那套；其余一律当支出处理（等价于 amount_type_var 的默认值），
+        这样即使日后 amount_type_var 被赋了意外值，也不会退化成空候选列表。
         """
-        # 两个参数都是可选的：允许主窗口只更新其中一套（例如只改了支出记录）。
-        # 传 None 表示「这一套没变化」，保留上次的值，避免误清空。
-        if history_expense is not None:
-            self._history_expense = list(history_expense)
-        if history_income is not None:
-            self._history_income = list(history_income)
-        # 这里不再需要回头改控件：候选是等用户点 ▼ 时按当时的收支类型现算的，
-        # 「提前算好塞进控件 values」的写法已随 CTkComboBox 一起删掉了
-        # —— 那也正是切换收支时那个 command 回调存在的唯一理由。
+        return INCOME if self.amount_type_var.get() == "收入" else EXPENSE
 
 
 class ToolbarFrame(ctk.CTkFrame):
