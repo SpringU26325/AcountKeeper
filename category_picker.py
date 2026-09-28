@@ -27,7 +27,8 @@
 
 弹窗底部是一条操作区（footer，见下方 _FOOTER_* 常量与「底部操作区」那一段）：
 第一行是「新类别输入框 + 「+ 保存」按钮」，第二行是一行提示语；列表里每一项右侧
-各有一个「×」按钮，点它就把该类别从候选里**真删掉**（category_prefs.delete_user）。
+有「顶」和「×」两个按钮：「顶」把该类别移到候选列表最前（category_prefs.move_to_top），
+「×」把它从候选里**真删掉**（category_prefs.delete_user）。
 这些动作全部交给 category_prefs 落盘，本模块只负责「改完之后把列表重画一遍」
 （_render_list）。
 
@@ -47,7 +48,7 @@ import customtkinter as ctk
 # 候选与增删都交给 category_prefs（user 列表就是唯一真源，那份规则只有一份实现）。
 # 这里只导入函数、不导入 EXPENSE/INCOME：方向由调用方按关键字传进来，
 # 本模块不替调用方决定「没传时算哪一个方向」——猜错方向会静默写错一份列表。
-from category_prefs import build_candidates, delete_user, save_user
+from category_prefs import build_candidates, delete_user, move_to_top, save_user
 
 # 与 calendar_picker.py / dialogs.py 的弹窗保持同一套浅色主题配色。
 _BG_COLOR = "#F0F4F8"
@@ -88,6 +89,12 @@ _ERROR_COLOR = "#D64545"  # 写盘失败时把提示语染成警示色
 # 刻意不用 ✕(U+2715)：它在 YaHei UI 里没有字形，靠系统字体回退才显示得出来，
 # 跨环境一致性不如上面这个原生字符。
 _ACTION_REMOVE_TEXT = "×"
+# 置顶按钮用汉字「顶」。备选是 ↑(U+2191)：它同样是 YaHei UI **自带**字形
+# （实测 glyph 0x0251，不靠字体回退），但箭头太容易读成「上移一位」这个相邻操作，
+# 而「顶」是常用汉字、YaHei UI 必然收录（实测 glyph 0x0bbd），单字宽 20 逻辑像素
+# （字号 12），28px 的按钮装得下，语义也比箭头直白。
+# 用两个字「置顶」则实测要 40px，按钮得加宽到 44px，会挤掉类别名的位置，不用。
+_ACTION_PIN_TEXT = "顶"
 _SAVE_TEXT = "+ 保存"
 
 _SAVE_BUTTON_WIDTH = 64
@@ -324,10 +331,15 @@ def ask_category(
 
     dialog = ctk.CTkToplevel(parent)
     dialog.title("选择类别")
-    dialog.resizable(False, False)
+    # 【Step 2.1】改用 tk.Wm.resizable 绕开 CTkToplevel.resizable 的覆写：后者在 Windows 上
+    # 会额外安排一次 after(10, _windows_set_titlebar_color)，实测白耗 sync 12.5ms / visible 34.8ms。
+    # 代价可忽略：_last_resizable_args 只是被写入、CTk 内部无读取点，而本弹窗尺寸由 _resize_dialog 自算。
+    tk.Wm.resizable(dialog, False, False)
     dialog.transient(parent)
     dialog.configure(fg_color=_BG_COLOR)
-    _apply_logo_icon(dialog)
+    # logo 图标（iconbitmap）刻意不在这里设：它要读一次 image/logo.ico，属于
+    # 「晚一帧再设也看不出来」的工作，和 protocol / <Escape> 一起挪到下面的
+    # _deferred_setup 里做。判断标准见那里那段注释。
 
     dialog_font = ("Microsoft YaHei UI", 11)
     # 与 calendar_picker 同一个闭包捕获写法：Tk 的回调没有返回值可用，
@@ -375,6 +387,17 @@ def ask_category(
     poll_id: list[str | None] = [None]
     _cleaned: list[bool] = [False]
 
+    # 列表里每一行的引用（名字、行容器、「顶」按钮），顺序与屏幕上的顺序严格一致。
+    # 局部更新（置顶只重排一行、删除只销毁一行）全靠它找到「要动的那个控件」，
+    # 它同时也是 _scroll_list 算式里「一共有几行」的唯一依据。
+    # _build_row 每画一行就往里追加一条，_render_list 整表重画时整个清空重填。
+    _row_refs: list[tuple[str, tk.Misc, tk.Misc]] = []
+
+    # 两个 after_idle 定时器的 id：setup_idle = 开窗时压后做的非关键绑定，
+    # scroll_idle = 挂起的滚动。两者都要在 _cleanup 里取消，原因见那里。
+    setup_idle: list[str | None] = [None]
+    scroll_idle: list[str | None] = [None]
+
     def _cleanup() -> None:
         """关闭弹窗时统一收尾：摘掉 <Configure> 回调和轮询定时器。
 
@@ -405,6 +428,17 @@ def ask_category(
                 # 弹窗已销毁时定时器可能已被 Tk 回收，取消不到也不算错。
                 pass
             poll_id[0] = None
+        # 两个 after_idle 挂起的回调也要一起取消。after_idle 的回调**不随控件销毁
+        # 而失效**（它不是挂在窗口上的绑定，而是解释器空闲队列里的一张便条），
+        # 弹窗关掉之后它照样会醒一次，届时对死窗口做绑定 / 滚动会抛 TclError。
+        for pending in (setup_idle, scroll_idle):
+            if pending[0] is not None:
+                try:
+                    dialog.after_cancel(pending[0])
+                except Exception:
+                    # 已执行或已被 Tk 回收的 id：取消不到不算错。
+                    pass
+                pending[0] = None
         for widget, sequence, funcid in bound:
             if funcid is None:
                 # 走不到：下面三处都用 tk.Misc.bind 绑定，一定有 id 返回。
@@ -495,6 +529,81 @@ def ask_category(
     # 定义顺序说明：下面「底部操作区」里建按钮时要用命令参数引用它们，
     # 所以函数必须先于控件出现（闭包里的 list_frame/hint_label 等反而是调用时才
     # 取值，控件建在函数后面没有关系）。
+    def _scroll_list(fraction: float) -> None:
+        """把列表滚到指定位置（0.0 = 最顶，1.0 = 最底），真正的滚动推迟到 after_idle。
+
+        需要它是因为置顶与保存都会把「用户想看的项」挪到视野之外：置顶后那一项跑到
+        了最上面、保存后新项落在最末尾，而列表超过 _MAX_VISIBLE_ITEMS 项时视口装不下，
+        不滚就等于「点了没反应」——用户只看到某一项从原位消失，会误以为是删除。
+
+        第一版是同步滚的，三步里的第一步是 list_frame.update_idletasks()，它在
+        「刚重建完几十个控件」的积压状态下实测要 67.5ms（点「顶」那次更高达 91.9ms，
+        占该次点击总耗时的 54%）：update_idletasks 会把**整个应用**待处理的布局与绘制
+        一次性泵完，而此刻积压的正是刚刚重建的那一整列行，于是这笔钱是在用户的点击
+        回调里同步付掉的。本次改成两条：
+
+          1. 整段挪进 dialog.after_idle()。等这一轮点击事件处理完、控件也画完了再滚，
+             代价是滚动最多晚一帧（≤16ms）发生，期间那一项已经跳到新位置但视口还没
+             跟上——用户感知不到；换来的是不再用同步全量刷新去卡住点击回调。
+          2. 内容高不再问 canvas.bbox("all")，改用算式：
+                 行数 × (行高 × 窗口缩放 + 上下各 1 像素的 pady)
+             bbox("all") 之所以贵，是因为它逼 Tk 先把积压的几何全部算完才给得出答案
+             （这正是第一步 update_idletasks 存在的原因）；而行高是我们自己写死的
+             （_ITEM_HEIGHT，pady 见 _build_row），算术结果与 bbox 完全一致。
+             到了 after_idle 这个时点，布局本来就已经算完，算式与 bbox 不会有差别。
+
+        剩下的两步与第一版一致，缺一不可：
+          - 重设 scrollregion：CTkScrollableFrame 只在**它自己**收到 <Configure> 时
+            才刷新 scrollregion（ctk_scrollable_frame.py 的绑定就是这一句），而我们
+            增删 / 重排的是它内部的行，它自己的尺寸没变，所以此刻 scrollregion 还是
+            旧的——表现是「行数从 12 减到 4 之后滚到底，视口仍停在旧的中段」。
+          - yview_moveto(fraction)：按比例移动视口。
+        顺序不能颠倒：先移动再刷新 scrollregion 的话，移动用的还是旧范围。
+        整段仍留在同一个 after_idle 回调里，所以「刷 scrollregion」和「移动」之间
+        不会被别的事件插进来。
+
+        这里必须碰 CTkScrollableFrame 的私有属性 _parent_canvas：CustomTkinter 6.0.0
+        没有对外暴露任何滚动 API（既没有 yview，也没有 see / scroll_to 之类的方法），
+        公开途径只有内部那个 tk.Canvas。接受这个依赖的理由：本工程已锁定该版本；
+        退路是「不滚」，只是体验损失、不涉及数据。整段包在 try/except 里，私有属性
+        一旦改名也只是少滚一下，绝不至于让置顶 / 保存这种写入操作跟着报错。
+        """
+        # 同一时刻只留一个待执行的滚动：连着点两次「顶」时把上一次作废，
+        # 否则两次 after_idle 会一前一后各滚一次，屏幕上闪一下。
+        if scroll_idle[0] is not None:
+            try:
+                dialog.after_cancel(scroll_idle[0])
+            except Exception:
+                pass
+            scroll_idle[0] = None
+
+        def _do_scroll() -> None:
+            scroll_idle[0] = None
+            # 守卫：after_idle 的回调不随弹窗销毁而失效，用户「点完顶马上按 ESC」时
+            # 它会对着一个已经没了的窗口醒过来，直接往下走会抛 bad window path name。
+            try:
+                if not dialog.winfo_exists():
+                    return
+                canvas = list_frame._parent_canvas
+                # 每行实际占的高度：行容器 = _ITEM_HEIGHT（逻辑像素，CTk 内部再乘缩放
+                # 变成物理像素），外面还套着 _build_row 里那个 pady=1（上下各 1 物理像素）。
+                row_phys = int(round(_ITEM_HEIGHT * _window_scaling(dialog))) + 2
+                content_height = len(_row_refs) * row_phys
+                # 内容比视口还矮时（例如删到只剩 2 项），scrollregion 不能比视口还小：
+                # yview_moveto 是按「可滚动距离」的比例算的，范围设成 0 就没得可算。
+                scroll_height = max(content_height, canvas.winfo_height())
+                canvas.configure(scrollregion=(0, 0, canvas.winfo_width(), scroll_height))
+                canvas.yview_moveto(fraction)
+            except Exception:
+                # 只剩体验损失：滚不动就不滚。
+                pass
+
+        try:
+            scroll_idle[0] = dialog.after_idle(_do_scroll)
+        except Exception:
+            # 挂不上只可能是弹窗已经没了（wait_window 期间理论上不会），那就当作不滚。
+            scroll_idle[0] = None
+
     def _set_hint(text: str, error: bool = False) -> None:
         """改 footer 提示语。error=True 时换成警示色，用来报告写盘失败。"""
         hint_label.configure(text=text, text_color=_ERROR_COLOR if error else _HINT_COLOR)
@@ -521,6 +630,10 @@ def ask_category(
             # 不清空的话用户分不清刚才那一下到底生效没有，只会忍不住再点一次。
             save_entry.delete(0, "end")
             _render_list()
+            # 新类别按 save_user 的语义追加在 user 列表末尾，所以它多半落在折叠线
+            # 以下（默认支出就有 10 项、视口只露 _MAX_VISIBLE_ITEMS 项）。滚到底让用户
+            # 看见自己刚存的那一项——这是「追加到末尾」这条语义唯一的不良后果。
+            _scroll_list(1.0)
         else:
             # 失败时保留框里的内容：用户多半想照着这个名字重试，或者去手工检查文件，
             # 清空等于逼他重新打一遍。
@@ -532,11 +645,98 @@ def ask_category(
         没有二次确认：弹窗里不能用 messagebox（它是另一个顶层窗口，会被「点弹窗外
         就关闭」的监视器当成外部点击，反而先把列表关掉），而需求要的就是「删掉就是
         真的没了」这条直白语义；想找回来只能重新用「+ 保存」输入同名类别。
+
+        列表只做**局部**更新，不再整表重画：删掉一行对其余行没有任何影响，而整表
+        重画要销毁并重建全部行控件（实测约 6.2ms/行，20 项时要 137ms），其中绝大
+        部分行的内容根本没变，属于白烧。
         """
-        if delete_user(direction, name):
-            _render_list()
-        else:
+        if not delete_user(direction, name):
             _set_hint(f"删除失败：{name} 没能写入类别文件", error=True)
+            return
+        # 成功就把上一次失败留下的红字抹掉。原实现走 _render_list()，那里顺带做了
+        # 复位；现在走局部更新、不再经过 _render_list，这一步必须自己补上，
+        # 否则一条早就过期的报错会一直挂在 footer 上。
+        _set_hint(_HINT_LINE_1)
+        target = next((item for item in _row_refs if item[0] == name), None)
+        if target is None:
+            # 名字不在当前列表里（候选被别的路径改动过）：退回整表重画。
+            # 宁可多花一次重画的钱，也不能让屏幕上的列表和文件长期对不上。
+            _render_list()
+            return
+        # 必须在 remove 之前问「这一行是不是第一行」，移除之后下标就全串了。
+        was_first = _row_refs[0][0] == name
+        _row_refs.remove(target)
+        try:
+            target[1].destroy()
+        except tk.TclError:
+            # 行已经被连带销毁（父窗口关掉时整棵控件树一起没），忽略即可。
+            pass
+        if not _row_refs:
+            # 删到一项不剩：走整表重画，把「暂无类别」那句占位提示画出来。
+            _render_list()
+            return
+        if was_first:
+            # 删掉的正好是原首行 → 原第二行刚升为第一位，它的「顶」必须跟着置灰。
+            # 这是「首行状态双向同步」的另一半：置顶那条路负责把旧首行解禁，
+            # 这里负责把新首行禁用；漏掉任何一半，屏幕上就会出现两个可点的「顶」
+            # 或者两个一起灰掉。
+            _set_pin_state(_row_refs[0][2], disabled=True)
+        # 行数变了必须重算弹窗高度：高度算式与行数挂钩，不重算会留下「行少了、
+        # 滚动范围还是旧的」那段空白，滚动条拖到底也看不到内容。
+        # 删除**不**滚动（与第一版一致）：用户的眼睛还停在被删那一行附近，
+        # 此时动视口只会让人失去参照。
+        _resize_dialog(len(_row_refs))
+
+    def _pin_category(name: str) -> None:
+        """把某一项移到列表最前（用户点该行右侧的「顶」）。
+
+        与 _delete_category 同构：落盘成功就原地更新列表、失败才报告。置顶**不关弹窗、
+        也不回填输入框**——用户的意图是「把常用项挪上去」，不是「选中它」。
+
+        没有变化时（名字不在列表里、或本来就在第一位）move_to_top 同样返回 True 但
+        没写盘（见其 docstring）：两种情况按下面的分支分别处理，都不给用户报红字。
+
+        列表只做**局部**重排：置顶只改变行的先后顺序，行数不变、高度不变、行控件
+        本身也不用重建，所以把那一行摘下来再插回最前面就够了，不必重画整张表。
+        这一点与删除不同——删除会改变行数，行数一变高度算式与 scrollregion 都得重算。
+        """
+        if not move_to_top(direction, name):
+            _set_hint(f"置顶失败：{name} 没能写入类别文件", error=True)
+            return
+        # 同 _delete_category：成功要把上一条失败报错抹掉（原靠 _render_list 顺带复位）。
+        _set_hint(_HINT_LINE_1)
+        if _row_refs and _row_refs[0][0] == name:
+            # 本来就在第一位：数据没变、顺序没变，一个控件都不必动。
+            # 仍然滚一次顶——用户很可能是先滚到下面再点这一行的，视口此刻停在别处。
+            _scroll_list(0.0)
+            return
+        target = next((item for item in _row_refs if item[0] == name), None)
+        if target is None:
+            # 名字不在当前列表里（候选被别的路径改动过）：退回整表重画兜底。
+            _render_list()
+            _scroll_list(0.0)
+            return
+        # 先把引用表按新顺序摆好，再动控件：pack(before=) 需要一个**此刻还在列表
+        # 里**的兄弟控件当锚点，所以锚点必须在改顺序之前取出来。
+        old_first = _row_refs[0]
+        _row_refs.remove(target)
+        _row_refs.insert(0, target)
+        # 「顶」的可点状态跟着名次走：新首行置灰、旧首行解禁。两件都要做，
+        # 少做一件屏幕上就会同时出现两个灰按钮或两个可点按钮。
+        _set_pin_state(target[2], disabled=True)
+        _set_pin_state(old_first[2], disabled=False)
+        try:
+            row = target[1]
+            # 同一容器里 pack(before=某兄弟) 就是「排到它前面」。
+            # 行控件本身（连同它下面那三个按钮、以及当前高亮）原样复用，一个不重建。
+            row.pack_forget()
+            row.pack(fill="x", padx=4, pady=1, before=old_first[1])
+        except tk.TclError:
+            # 控件已经不在了（弹窗正在被销毁）：退回整表重画，保证屏幕与数据一致。
+            _render_list()
+        # 列表超过 _MAX_VISIBLE_ITEMS 项时视口装不下：这一项刚跑到最上面，不滚
+        # 上去的话用户只看到它从原来的位置消失、看不到它去了哪，会误以为删除。
+        _scroll_list(0.0)
 
     def _resize_dialog(row_count: int) -> None:
         """按行数改弹窗高度，宽度保持不变。
@@ -657,12 +857,43 @@ def ask_category(
     # ---------- 重画列表 ----------
     # 只在「数据真的变了」的动作之后调用：打开弹窗、保存、删除。
 
-    def _render_list() -> None:
-        """按当前候选重画列表，并把弹窗高度改到位。
+    def _set_pin_state(pin_button: tk.Misc, *, disabled: bool) -> None:
+        """同步某一行的「顶」按钮可不可点。
 
-        整块重画而不是增量改动某一项：候选数量本身会变（保存多一项、删除少一项），
-        增量维护得自己记住「哪一项在第几行」，一旦算错就是列表和文件对不上；
-        而重画的代价只是十几个小控件，在用户的点击频率下完全无感。
+        只有列表的**第一行**该是灰的（它已经在最上面了）。置顶与删除都会让「谁是
+        第一行」换人，所以这个状态必须双向同步：要么「旧首行解禁 + 新首行禁用」，
+        要么反过来；只做一半就会出现两个灰按钮或两个可点按钮。
+        两条调用路径：_build_row（首次画行时定初值）、_pin_category / _delete_category
+        （首行换人时改）。
+
+        text_color_disabled 必须显式给值——不传时 CustomTkinter 用的是主题里的
+        gray74，比 _HINT_COLOR 深得多，看起来反而比可点的按钮还醒目，与「不可点」
+        的语义刚好相反。这条口径与 _build_row 里那段说明是同一件事，集中在这里做
+        是为了不再两处各写一遍。
+        """
+        try:
+            if disabled:
+                pin_button.configure(
+                    state="disabled", text_color_disabled=_SUBTLE_HOVER_COLOR
+                )
+            else:
+                # 回到 normal 时 CTk 会重新应用建行时设的 text_color，不必手动恢复。
+                pin_button.configure(state="normal")
+        except tk.TclError:
+            # 控件已随弹窗一起被销毁：置灰与否已经没有意义，静默跳过。
+            pass
+
+    def _render_list() -> None:
+        """按当前候选整表重画列表，并把弹窗高度改到位。
+
+        只有「首次打开」和「保存新类别」还会走到这里：这两件事都会**改变行数**
+        （保存多一项；打开时列表还是空的），而行数一变，高度算式、scrollregion、
+        以及「哪一行是第一行」就全得重算，老老实实重画一遍最省心也不容易错。
+
+        删除与置顶不再走这里——它们各自在 _delete_category / _pin_category 里做局部
+        更新。第一版是所有动作都调本函数，实测代价 6.2ms/行（20 项时 137ms），其中
+        绝大部分行的内容根本没变，属于白烧。剩下的调用点都是低频动作（保存需要
+        用户先打字再点按钮），重画那十几个小控件的代价可以接受。
         """
         rows = _candidates()
 
@@ -670,10 +901,16 @@ def ask_category(
         # 连它一起重建会把滚动条与内部画布都换掉，既闪一下、又要重新 pack 和定位。
         for child in list_frame.winfo_children():
             child.destroy()
+        # 引用表跟着一起清空重建：它和屏幕上的行必须严格一一对应，
+        # 局部更新（置顶重排 / 删除单行）与滚动算式（取行数）全靠它。
+        _row_refs.clear()
 
         if rows:
-            for name in rows:
-                _build_row(name)
+            # 带上「是不是第一行」这个标记传给 _build_row：第一行的「顶」要置灰禁用
+            # （它已经在最上面了）。用下标而不是让 _build_row 自己去判断候选顺序，
+            # 是为了让「哪一行是第一行」只有一个判断点，日后改排序时不会两处口径不一。
+            for index, name in enumerate(rows):
+                _row_refs.append((name, *_build_row(name, first=index == 0)))
         else:
             # 空列表也要给一句话，而不是弹一个白色空框让人以为卡住了。
             # 删到一个不剩时走的就是这一支，怎么再添回来由下面那行提示语负责解释。
@@ -689,16 +926,38 @@ def ask_category(
 
         _resize_dialog(len(rows))
 
-    def _build_row(name: str) -> None:
-        """画一行类别：透明容器 + 名字按钮（左，撑满）+ 删除按钮（右）。
+    def _build_row(name: str, first: bool = False) -> tuple[tk.Misc, tk.Misc]:
+        """画一行类别：透明容器 + 名字按钮（左，撑满）+「顶」+「×」（右）。
 
-        高亮只画在名字按钮上、容器保持透明，否则整行（连同右边的 ×）会一起变蓝，
+        高亮只画在名字按钮上、容器保持透明，否则整行（连同右边两个按钮）会一起变蓝，
         看起来像「连删除按钮也一起被选中了」。
+
+        Args:
+            first: 这一行是不是候选里的第一项。是的话「顶」置灰禁用——它已经在最上面
+                了，再点也没有任何作用。刻意「置灰」而不是「这一行不画这个按钮」：
+                不画会让第一行的名字按钮变宽，鼠标从第二行往上移时点击落点会跳；
+                置灰则每一行的宽度完全一致。
+
+        Returns:
+            (行容器, 「顶」按钮)：_render_list 会把它们连同名字一起记进 _row_refs，
+            供 _pin_category / _delete_category 做局部更新时**找到要动的那个控件**。
+            返回值刻意不含「×」按钮也不含名字按钮：删除整个行都销毁、置顶只需重排 +
+            改「顶」的状态，两者都用不到它们。
         """
         is_current = name == current_text
         row = ctk.CTkFrame(list_frame, fg_color="transparent", corner_radius=0)
         row.pack(fill="x", padx=4, pady=1)
 
+        # 【pack 顺序】三个孩子必须按「× → 顶 → 名字」的顺序 pack：同侧 pack 时先
+        # pack 的占最外端，所以 × 拿到最右边、顶紧挨着它左边、名字最后一个 pack 并
+        # 靠 expand=True 吃掉剩余宽度。这个顺序同时也是「空间不足时压谁」的顺序——
+        # 最后 pack 的名字才会被压缩，两个动作按钮始终是完整的 _ACTION_BUTTON_WIDTH。
+        # 反过来写的话，最窄窗口（_MIN_WIDTH=180）下被裁掉的就是「×」，用户会突然
+        # 找不到删除按钮。
+        #
+        # 【为什么 × 在最右、顶在它左边】× 已经是「整行最右那个按钮 = 删除」，把顶
+        # 插到最右会变成「想删除却点了置顶」——置顶可逆、删除不可逆，误点方向刚好
+        # 反了。顶放左边，× 的位置一个像素都不动。
         ctk.CTkButton(
             row,
             text=_ACTION_REMOVE_TEXT,
@@ -713,11 +972,45 @@ def ask_category(
             font=("Microsoft YaHei UI", 12),
         ).pack(side="right")
 
+        pin_button = ctk.CTkButton(
+            row,
+            text=_ACTION_PIN_TEXT,
+            # 同上：默认参数绑定 name，否则每一行都会去置顶最后一项。
+            command=lambda picked=name: _pin_category(picked),
+            width=_ACTION_BUTTON_WIDTH,
+            height=_ITEM_HEIGHT - 4,
+            corner_radius=6,
+            fg_color="transparent",
+            hover_color=_SUBTLE_HOVER_COLOR,
+            text_color=_HINT_COLOR,
+            font=("Microsoft YaHei UI", 12),
+        )
+        # padx 只在左边留 2px：两个按钮都是透明底 + 圆角，紧挨着会让 hover 的两块
+        # 底色连成一片，看不出是两个独立按钮。
+        pin_button.pack(side="right", padx=(0, 2))
+        # 已经在第一位就置灰禁用（具体口径与 text_color_disabled 的理由见 _set_pin_state）。
+        _set_pin_state(pin_button, disabled=first)
+
         ctk.CTkButton(
             row,
             text=name,
             # 同上：默认参数绑定 name，否则每一项都会变成最后一项。
             command=lambda picked=name: _choose(picked),
+            # 【width=1 修的是既有缺陷，不是置顶带来的新需求】「行内容比视口宽、
+            # 右侧按钮被裁」这件事在加「顶」之前就存在了：CTkButton 的 width 默认
+            # 140，实际请求宽 175 物理像素，而 pack 请求宽会**把行容器撑大**
+            # （CTkScrollableFrame 内部那层 frame 的宽度 = max(列表可视宽, 内容请求宽)），
+            # 行一宽就横向溢出到视口之外、右侧的动作按钮会被整块裁掉。旧口径下这个
+            # 临界宽度约 228 逻辑像素，已经高过主窗口的常见布局，所以从没被撞见；
+            # 本次加「顶」多占一个按钮，把临界宽度从约 228 压到约 211 逻辑像素，而
+            # 主窗口 minsize(820, 560) 时类别框约 200 → 弹窗约 220，**正好落进这个
+            # 区间**，于是真实场景下「×」和「顶」会一起消失。所以这里不是在配合新
+            # 功能，是在修一个早就埋好的坑——排查时若发现它「跟着置顶一起出现」，
+            # 别误判成置顶引入的回归，也别为了简化把它删掉。
+            # 修法：给一个极小的 width 让请求宽不再是约束，实际宽度交给下面
+            # fill="x" + expand=True 按剩余空间分配，行宽永远贴住视口，名字长了就
+            # 裁名字——拿「名字被裁」换「按钮始终可点」，方向上一定是对的。
+            width=1,
             height=_ITEM_HEIGHT,
             corner_radius=6,
             anchor="w",
@@ -726,6 +1019,10 @@ def ask_category(
             text_color="#FFFFFF" if is_current else _TEXT_COLOR,
             font=dialog_font,
         ).pack(side="left", fill="x", expand=True)
+
+        # 把这一行的两个「手柄」交回去：_render_list 拿它们填 _row_refs，
+        # 之后的置顶重排 / 删除单行 / 滚动算式都靠这份引用，不再需要整表重画。
+        return row, pin_button
 
     # 画第一遍。此后只在动作里重画，所以整个弹窗生命周期内 list_frame 只有这一个实例。
     _render_list()
@@ -850,8 +1147,33 @@ def ask_category(
     poll_id[0] = dialog.after(_POLL_INTERVAL_MS, _poll)
 
     # ESC 与右上角关闭都等同于「取消」，返回 None 时调用方保持输入框原值不动。
-    dialog.protocol("WM_DELETE_WINDOW", _cancel)
-    dialog.bind("<Escape>", lambda _event: _cancel())
+    #
+    # 【方案 4】这两条绑定、上面的 logo 图标、以及全局点击监视器，都属于「窗口第一眼
+    # 显示出来时不必须已经在位」的工作，统一压到首次 after_idle 再做。
+    # 判断标准是「花不花得起」：iconbitmap 要读 .ico 文件，bind_all 要往解释器里装
+    # 一段脚本，都不便宜；而 protocol / <Escape> 只是顺手一起挪，省得留下「一半同步
+    # 一半异步」的割裂。
+    #
+    # 刻意**留在同步段**的四样东西，理由各自不同，都不可挪：
+    #   - 上面三处 <Configure> 与 _poll 的启动：它们就是「把弹窗摆到输入框正下方」
+    #     这件事本身。延后 10ms 等于让弹窗先在默认位置露一帧再跳过去，比不优化还糟。
+    #   - <Map>：它只在窗口**映射的那一刻**触发，绑定装晚了就是彻底错过，
+    #     焦点抢不到、ESC 跟着失效。
+    #   - <Destroy>：它是「父窗口关掉时把回调摘干净」的兜底网，漏一次的代价是
+    #     永久泄漏一串死回调。
+    def _deferred_setup() -> None:
+        setup_idle[0] = None
+        # 同 _scroll_list 里的守卫：after_idle 的回调不随控件销毁而失效。
+        if not dialog.winfo_exists():
+            return
+        _apply_logo_icon(dialog)
+        dialog.protocol("WM_DELETE_WINDOW", _cancel)
+        dialog.bind("<Escape>", lambda _event: _cancel())
+        # 「点弹窗外面就关」的全局监视器：装一次，之后一直留着（原因见
+        # _click_monitor_installed 处的注释）。首次之后这里就是个空转的 return。
+        _ensure_click_monitor(dialog)
+
+    setup_idle[0] = dialog.after_idle(_deferred_setup)
 
     def _on_destroy(event: tk.Event) -> None:
         """兜底：弹窗被外部销毁（如父窗口关闭把它连带销毁）时同样要摘回调。"""
@@ -888,12 +1210,10 @@ def ask_category(
 
     dialog.bind("<Map>", _on_map, add="+")
 
-    # 「点弹窗外面就关」的全局监视器：装一次，之后一直留着（原因见
-    # _click_monitor_installed 处的注释）。
-    _ensure_click_monitor(dialog)
-
     # 登记为「当前打开的类别弹窗」：下一次 ask_category 靠它判断是 toggle 关闭
     # 还是「换一个锚点重开」，见函数开头那一段。
+    # 这一句与下面那句图标翻转必须留在同步段、且在 wait_window 之前，因为它决定了
+    # 「再点一次同一个 ▼」进来时能不能认出这是旧弹窗（迟一步就会开出第二个窗）。
     _register_picker(
         _ActivePicker(
             dialog=dialog,

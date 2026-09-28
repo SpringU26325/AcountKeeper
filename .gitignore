@@ -18,7 +18,8 @@ dist/
 
 # ---------- 你的真实数据（必须忽略！） ----------
 account.db
-account.csv
+# 注：account.csv 已随 #40（删除 legacy CSV 迁移逻辑）作废——现在 CSV 只由用户在
+# 「另存为」对话框里自行决定路径，项目内不再有固定名字的 account.csv，故不再忽略。
 account_export_*.csv
 
 # ---------- 临时文件和笔记 ----------
@@ -30,6 +31,7 @@ issues.txt
 PROJECT_RULES.md
 build.bat
 提示词生成要求.txt
+_probe/
 
 # ---------- IDE 配置 ----------
 .vscode/

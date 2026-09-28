@@ -18,6 +18,9 @@
 「移除」做成可逆操作时留下的中间态，把一次删除拆成「隐藏 / 恢复」两步，用户得先
 想明白「我是暂时不想看见，还是永久不要」才能决定点哪个按钮，语义太重。
 
+**列表的顺序也是真实顺序**：下拉列表就照这个顺序显示，所以「置顶」不需要任何额外
+的权重字段，在数据层就是把该项挪到列表最前（见 move_to_top）。
+
 **预置类别只在首次启动（categories.json 不存在）时作为 user 的初始值写进去一次**，
 之后 config.py 里的 DEFAULT_*_CATEGORIES 就不再参与任何运算。这是刻意的：如果每次
 算候选都把预置常量并进来，用户删掉一个预置项（比如「人情」）之后它下次又会自己
@@ -28,7 +31,7 @@
 - 方向参数只认 "expense" / "income"（模块常量 EXPENSE / INCOME）。
   「支出 / 收入」这种说法属于界面层，数据层不认，避免两边口径漂移。
 - 读：build_candidates，任何异常都降级成空列表，绝不抛。
-- 写：save_user / delete_user，返回布尔值表示是否真的成功了。
+- 写：save_user / delete_user / move_to_top，返回布尔值表示是否真的成功了。
   读到不符合新结构的格式（文件坏了、根不是对象、某一段是 dict 而不是 list）
   一律当空列表处理并**允许写入**：本项目尚未发布过、没有需要保护的存量数据，
   下次保存直接覆盖成新结构即可，不必用「拒绝写入」那套保守策略。
@@ -242,6 +245,34 @@ def delete_user(direction: str, name: str) -> bool:
         if name_text not in names:
             return False
         names.remove(name_text)
+        return True
+
+    return _apply(direction, name, change)
+
+
+def move_to_top(direction: str, name: str) -> bool:
+    """把类别移到 user 列表最前（用户点列表项右侧的「顶」）。
+
+    不需要新增任何字段：user 列表的顺序本身就是真实顺序，下拉列表直接照它显示，
+    所以「置顶」在数据层就是一次列表内重排。反过来说，一旦引入独立的权重 / 置顶
+    标志，就出现了「两份真相」（列表顺序与权重）需要同步，而这正是本模块一直在
+    避免的东西。
+
+    两个边界与 delete_user 保持同一套口径（都返回 True、都不写盘）：
+    - 名字本来就不在列表里：用户的意图无从实现是因为它根本不存在，界面重画一遍
+      列表它就会消失，不该为此报错。
+    - 名字已经在第 0 位：置顶是幂等操作，目标状态已经达成，再整份重写一遍文件
+      只是白做功（由 _apply 按 change 回调的返回值统一跳过写盘）。
+    """
+    def change(name_text: str, names: list[str]) -> bool:
+        if name_text not in names or names[0] == name_text:
+            # 不存在、或已经在最前：目标状态已达成，交给 _apply 跳过写盘。
+            return False
+        # 先摘下来再插到最前，**不是**与第 0 位交换：交换会把原来第一项扔到被置顶项
+        # 原来所在的位置上，等于把其余各项的相对顺序也一并打乱；摘下重插只让
+        # 「这一项提前、其余整体后移一格」，符合「移到最前」的直觉。
+        names.remove(name_text)
+        names.insert(0, name_text)
         return True
 
     return _apply(direction, name, change)
