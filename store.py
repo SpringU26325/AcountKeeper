@@ -26,8 +26,31 @@ class Account:
     record_id: int
     record_date: str
     amount: Decimal
-    category: str
+    # 标签用 tuple 而不是 list（§3.14.2）：records 是全局内存缓存、UI 多处直接读同一批
+    # Account 对象，list 允许某处 append() 静默改掉内存里这条记录而数据库没变；
+    # tuple 使这种误改直接抛 AttributeError，第一时间暴露不一致。
+    # tuple 不可变可哈希、能当 set/dict 键（Step 4 聚合会用到），而 Account 自身在
+    # dataclass(eq=True) 下不可哈希，所以这层好处只是 tags 这一项的。
+    # 顺序有语义（就是展示顺序），tuple 有序正好承载；具体顺序见 _merge_tags 的说明。
+    tags: tuple[str, ...]
     note: str
+
+    @property
+    def category(self) -> str:
+        """临时兼容层：把 tags 拼成单类别字符串（#58 Step 2a 新增，Step 2b 删除）。
+
+        为什么要它：category → tags 改名会立刻打断 UI 的 6 处 record.category 读取
+        （ui.py:165/179/374、chart_window.py:52/55、dialogs.py:93），其中 ui.py:165 就在
+        启动后的 _refresh_tree 里——不加这个兼容层，程序**启动即崩**，Step 2a 就无法
+        单独验收（违反二.2「修完一个、验证一个」）。
+        Step 2a 里每条记录最多 1 个标签，所以返回值与改造前**逐字符相同**（0 标签 → ""）。
+        用顿号连接：§3.14.4 规定表格单元格就是这个口径，顺带已经是对齐目标的写法。
+
+        【切勿给这个 property 加类型注解】dataclass 会把带注解的类属性当成字段：
+        写成 `category: str` 就会多出一个 category 形参、并把这个 property 整个盖掉，
+        使 load() 里按位置传的 5 个参数整体错位（note 被喂给 category）。去掉注解才是属性。
+        """
+        return "、".join(self.tags)
 
 
 class AccountStore:
@@ -173,19 +196,70 @@ class AccountStore:
             # 覆盖「读版本」与「备份后写库」两条路径上的数据库错误。
             print(f"警告：标签迁移失败，本次跳过（下次启动重试）：{error}")
 
+    @staticmethod
+    def _merge_tags(
+        account_rows: list[tuple[int, str]],
+        tag_rows: list[tuple[int, str]],
+    ) -> dict[int, tuple[str, ...]]:
+        """把两条查询的结果按 record_id 归并成 {记录 ID: 标签元组}。
+
+        两条查询分别取 accounts 与 record_tags，在 Python 里归并——**不用 JOIN**：
+        JOIN 会把一条多标签记录膨胀成 N 行、调用方还得再折叠一次，反而多一步
+        （§3.14.5 已定此口径）。
+        为什么抽成独立方法：load() 与 export_month_csv() 都要这套规则，各写一遍就是
+        「口径改动易漏改」（正是 issues #16 的主题），所以归并规则只留这一份。
+
+        【B1 回退，Step 2a 的过渡逻辑，Step 2b 删除】：record_tags 里有行就以它为准；
+        一行都没有的记录才回退去读 accounts.category。因为本步的 add / update 仍然只写
+        accounts.category、不写 record_tags，不回退的话「Step 1 迁移之后新增/编辑的记录」
+        在界面上会显示成 0 标签。这也正好对应 §3.14.2 对 category 列的定性：
+        保留、停止写入、**降为 legacy 只读**。
+        回退只针对「一条关联行都没有」的记录：有行的记录严格以 record_tags 为准，
+        免得把用户主动删空标签的记录又从旧 category 里携回一个标签。
+        """
+        merged: dict[int, list[str]] = {}
+        # tag_rows 已按 (record_id, tag) 排序，逐行 append 就保住了这个顺序
+        # （也就是字典序，见 load() 里的说明）。
+        for record_id, tag in tag_rows:
+            merged.setdefault(record_id, []).append(tag)
+        for record_id, category in account_rows:
+            if record_id in merged:
+                # 已经在 record_tags 里出现过：以关联表为准，不看旧列。
+                continue
+            legacy = str(category).strip() if category else ""
+            if legacy:
+                # 旧列里的空白值当「无标签」处理，与迁移 SQL 的 TRIM 口径保持一致。
+                merged[record_id] = [legacy]
+        # 一次性冻结成 tuple：调用方拿到的是不可变值，不可能被原地修掉。
+        return {record_id: tuple(tags) for record_id, tags in merged.items()}
+
     def load(self) -> None:
         """Read all records from SQLite."""
         with self._connect() as connection:
-            rows = connection.execute(
+            # 两条 SELECT 走同一个连接 = 同一个事务快照，不会出现「读完 accounts 再去读
+            # record_tags 时库已被改动」的错位，也省掉一次开文件。
+            account_rows = connection.execute(
                 "SELECT id, record_date, amount, category, note "
                 "FROM accounts ORDER BY id"
             ).fetchall()
+            # ORDER BY record_id, tag：一条记录的多个标签顺序由 SQL 定，落到 tags 里
+            # 就是**字典序**（不是用户打字顺序）。DDL 没有顺序列，这是直接后果，
+            # 取舍已备案在 _issues.txt #58；顺带让 idx_record_tags_tag 派上用场。
+            tag_rows = connection.execute(
+                "SELECT record_id, tag FROM record_tags ORDER BY record_id, tag"
+            ).fetchall()
+        # 归并规则（含 B1 回退）收在 _merge_tags 里，与 export_month_csv 共用同一份。
+        # 第 0 列 = id、第 3 列 = category，与上面 SELECT 的列序一致。
+        tags_by_id = self._merge_tags(
+            [(row[0], row[3]) for row in account_rows], tag_rows
+        )
         # 数据库里金额是字符串，这里重新构造 Decimal，保证后续汇总计算不损失精度。
         # 但要逐行捕获异常：历史库或手工改过的库里可能出现 "abc" 这类无法解析的金额，
         # Decimal() 会抛出 InvalidOperation，而 load() 是在 __init__ 里调用的，
         # 一旦抛出就会让整个程序在启动阶段闪退（用户只看到「双击没反应」）。
         records: list[Account] = []
-        for record_id, record_date, amount, category, note in rows:
+        # category 列在这里已无用（标签已由 _merge_tags 算好），用下划线开头表明刻意不用。
+        for record_id, record_date, amount, _category, note in account_rows:
             try:
                 parsed_amount = Decimal(amount)
             except (InvalidOperation, TypeError, ValueError) as error:
@@ -195,7 +269,15 @@ class AccountStore:
                 )
                 continue
             records.append(
-                Account(record_id, record_date, parsed_amount, category, note)
+                Account(
+                    record_id,
+                    record_date,
+                    parsed_amount,
+                    # 没查到关联、又没有旧 category 的记录在这里是 ()，
+                    # 即 Q2 允许的「0 个标签」。
+                    tags_by_id.get(record_id, ()),
+                    note,
+                )
             )
         self.records = records
 
@@ -221,6 +303,14 @@ class AccountStore:
         非负数必定以数字（'0'~'9'，0x30 起）开头，而 '-' < '0'，
         字符串比较与数值比较在所有正常数据上完全一致；
         手工改库产生的 'abc' / 'NaN' 这类脏值只会被判入收入组，不会抛异常。
+
+        【#58 Step 2a 起的现状（只追加说明，实现一个字未改）】
+        - 本方法已被 get_tags() 取代，进入退场倒计时。
+        - 当前唯一生产调用点是 ui.py:97（category_prefs.ensure_migrated 的入参）；
+          Step 2b 改 UI + category_prefs.py → tag_prefs.py 时一并删除，同时结掉 #47。
+        - 保留期内**禁止新增调用点**，否则 Step 2b 删不干净。
+        上面那段 #47 的定性分析（不是死代码、而是一次性迁移依赖 + 每次启动的无效查询）
+        是历史结论，一个字都不删。
         """
         with self._connect() as connection:
             expense_rows = connection.execute(
@@ -235,6 +325,30 @@ class AccountStore:
             [row[0] for row in expense_rows],
             [row[0] for row in income_rows],
         )
+
+    def get_tags(self) -> list[str]:
+        """返回库里所有用过的标签（去重、按字典序）。
+
+        与 get_categories() 的三点差异：
+        1. 数据源是 record_tags（新世界的真源），不读 accounts.category；
+        2. 不再按金额正负拆成 (支出, 收入) 两组——Q1 取消收支方向，标签池只有一份；
+        3. 排序口径固定为 tag 的字典序（顺着 idx_record_tags_tag，结果稳定可复现）。
+
+        刻意不做并集回退（Step 2a 决策 3）：不把 accounts.category 的非空值并进来。
+        本方法是「新世界」的接口；其生产用途（Step 2b 的首启迁移候选池）届时读同一批数据，
+        而 Step 1 → Step 2b 之间新增记录的标签进不了候选池是可接受的（未发布、无存量用户）。
+
+        已知现状：本步（Step 2a）里它**还没有任何生产调用点**，是纯新增，Step 2b 才会被
+        tag_prefs 的首启迁移接上。请勿因为「没人用」就当死代码删掉——#47 踩过这个坑
+        （get_categories 曾因「看起来没人用」被误判成死代码）。
+        """
+        with self._connect() as connection:
+            # DISTINCT + ORDER BY 都由 SQLite 做，既能命中 idx_record_tags_tag，
+            # 也避免把全表标签捞回 Python 再去重排序。
+            rows = connection.execute(
+                "SELECT DISTINCT tag FROM record_tags ORDER BY tag"
+            ).fetchall()
+        return [row[0] for row in rows]
 
     def next_id(self) -> int:
         # 取当前最大 ID 加一；空表时 default=0 返回 1，避免 max() 在空序列上报错。
@@ -318,16 +432,49 @@ class AccountStore:
         """Export one month's records to the provided save path and return it."""
         # 用 "YYYY-MM-%" 做 LIKE 前缀匹配，可精确命中该月所有日期，且不会误伤其它月份。
         with self._connect() as connection:
-            rows = connection.execute(
+            account_rows = connection.execute(
                 "SELECT id, record_date, amount, category, note "
                 "FROM accounts WHERE record_date LIKE ? ORDER BY id",
                 (f"{month}-%",),
             ).fetchall()
+            # record_tags 不做月份过滤：归并时只按 record_id 取值、而 accounts 已被月份筛过，
+            # 多带回来的那几个月的关联行不会被用到（好处是不用给 record_tags 再拼一次月份条件）。
+            # 注意这里**不能**用 _merge_tags 的回退去导「当月新记录」以外的场景——
+            # account_rows 已限月，回退只会作用在当月记录上，口径与界面显示一致。
+            tag_rows = connection.execute(
+                "SELECT record_id, tag FROM record_tags ORDER BY record_id, tag"
+            ).fetchall()
+        # 与 load() 共用同一份归并规则（含 B1 回退），保证导出内容与界面显示一致。
+        # 第 0 列 = id、第 3 列 = category，与上面 SELECT 的列序一致。
+        tags_by_id = self._merge_tags(
+            [(row[0], row[3]) for row in account_rows], tag_rows
+        )
+
+        # 表头按「名字」把 category 换成 tags，而不是按下标拼一份新顺序：
+        # 将来 config.CSV_FIELDS 的列序若调整，两边会一起跟着走；写死元组等于复制一份顺序真源。
+        # 本步刻意不改 config.CSV_FIELDS（Step 2b 才改），所以这个替换只在函数内部做，
+        # 属过渡逻辑（TODO(Step 2b)：改掉 config.CSV_FIELDS 后这里也一并简化）。
+        header = ["tags" if field == "category" else field for field in CSV_FIELDS]
+        # 多标签用竖线连接（§3.14.4）：若用逗号，csv.writer 会给该字段自动加双引号
+        # （"日用,家庭"）——虽然合法，但用户拿 Excel「文本分列」或脚本 split(',') 时会踩坑；
+        # 竖线在标签名里极罕见，整行仍是规整的逗号分隔。
+        # 0 标签时 "|".join(()) 天然得到空串，正好对应「0 标签写空串」，无需特判。
+        rows = [
+            (
+                record_id,
+                record_date,
+                amount,
+                "|".join(tags_by_id.get(record_id, ())),
+                note,
+            )
+            # category 列已无用（标签已由 _merge_tags 算好），下划线开头表明刻意不用。
+            for record_id, record_date, amount, _category, note in account_rows
+        ]
 
         # utf-8-sig 会写入 BOM，目的是让 Excel 双击打开中文 CSV 时不出现乱码。
         # 这里不吞异常：权限不足、磁盘已满等情况交给 UI 层捕获并提示（需求 3.6）。
         with save_path.open("w", newline="", encoding="utf-8-sig") as file:
             writer = csv.writer(file)
-            writer.writerow(CSV_FIELDS)
+            writer.writerow(header)
             writer.writerows(rows)
         return save_path
