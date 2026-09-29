@@ -350,7 +350,13 @@ class InputFrame(ctk.CTkFrame):
         """打开日历选择器，把选中的日期回填到日期输入框（需求 3.12）。"""
         # 用 winfo_toplevel() 而不是 self：弹窗必须挂在主窗口上，
         # 否则 transient 会认错父窗口，导致弹窗跑到主窗口下面或被最小化时一起消失。
-        picked = ask_date(self.winfo_toplevel(), self.date_var.get().strip())
+        # anchor 传日期输入框本体：日历会贴在它的左下角弹出（与类别 ▼ 一致），
+        # 而不是摆到屏幕中心——用户从哪一行点的 ▼，弹窗就出现在哪一行旁边。
+        picked = ask_date(
+            self.winfo_toplevel(),
+            self.date_var.get().strip(),
+            anchor=self.date_entry,
+        )
         # 返回 None 表示用户取消/按 ESC，此时保持输入框原值不变。
         if picked:
             self.date_var.set(picked)

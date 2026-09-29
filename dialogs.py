@@ -223,7 +223,16 @@ def ask_edit_record(
 
     def _pick_date() -> None:
         """打开日历选择器，把选中的日期回填到日期输入框（需求 3.12）。"""
-        picked = ask_date(dialog, date_var.get().strip())
+        # anchor 传日期输入框本体：日历会贴着它弹出，而不是摆到屏幕中心。
+        # 日期框是 entries 里的第一个（见下面 for 循环里那个 continue——
+        # 日期行单独 append 后就跳过了剩余分支），而本闭包在定义时 entries
+        # 还空着，所以必须按**调用时**求值的 entries[0] 取，不能提前存变量；
+        # 空列表守卫只是防“字段配置被改得没有日期行”这种将来才会发生的事。
+        picked = ask_date(
+            dialog,
+            date_var.get().strip(),
+            anchor=entries[0] if entries else None,
+        )
         # 返回 None 表示用户取消/按 ESC，此时保持输入框原值不变。
         if picked:
             date_var.set(picked)

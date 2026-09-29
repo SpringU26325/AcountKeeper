@@ -3,6 +3,10 @@
 对外只暴露 ask_date()：给「添加记录」和「编辑记录」的日期字段提供一个
 可视化日历，减少用户手动敲 YYYY-MM-DD 时的格式错误。
 
+定位方式与「类别」弹窗保持一致：贴着日期输入框的左下角弹出，下方空间不够时
+翻到上方。调用方通过 anchor 把输入框交进来；不传（或输入框已经不存在）时退回
+屏幕居中，见 _anchor_to_input。
+
 实现上刻意不引入 tkcalendar 等新依赖，纯 CustomTkinter 拼装，
 以便和项目内其他弹窗共用同一套配色、圆角与字体。
 """
@@ -20,6 +24,13 @@ import customtkinter as ctk
 # 弹窗尺寸：宽 320 刚好容纳 7 列日期，高 380 容纳表头 + 最多 6 行网格 + 底部按钮。
 _DIALOG_WIDTH = 320
 _DIALOG_HEIGHT = 380
+
+# 贴输入框弹出的两个几何常量。取值与 category_picker 的 _GAP_ABOVE / _SCREEN_MARGIN
+# 严格一致：两个 ▼ 的弹窗相邻出现时，缝隙与贴边距离看起来才是同一套规则。
+# 刻意不 import category_picker 的同名常量——category_picker 反过来不依赖本模块，
+# 但为两个整数建一条交叉依赖不划算，宁可各自留一份并在这里注明同源。
+_GAP_ABOVE = 6  # 弹窗与输入框之间的竖向缝隙（物理像素）
+_SCREEN_MARGIN = 8  # 贴边保护，避免弹窗压在屏幕边缘上（物理像素）
 
 # 与 dialogs.py 内其他弹窗保持一致的浅色主题配色。
 _BG_COLOR = "#F0F4F8"
@@ -52,15 +63,31 @@ def _apply_logo_icon(window: tk.Misc) -> None:
         pass
 
 
+def _physical_size(window: tk.Misc) -> tuple[int, int]:
+    """把弹窗的**逻辑**尺寸常量换算成当前 DPI 下的物理像素。
+
+    需要它是因为「摆位」这条路径上只有两个尺寸来源，且两种都不能读 winfo_width()：
+      - 复用打开：上一次真正显示时量到的尺寸（见 _close 里记的 last_size）；
+      - 首次打开：窗口还没映射，winfo_width() 只会谎报 200（CTkToplevel 的初始值），
+        只能由「逻辑常量 × 窗口缩放」算。
+    """
+    scale = ctk.ScalingTracker.get_window_scaling(window)
+    return (int(_DIALOG_WIDTH * scale), int(_DIALOG_HEIGHT * scale))
+
+
 def _center_window(window: tk.Misc, size: tuple[int, int] | None = None) -> None:
     """按窗口的真实尺寸，把它摆到屏幕水平居中、垂直略偏上的位置。
+
+    **这是没有 anchor 时的兜底**：正常路径走 _anchor_to_input（贴输入框）。
+    保留它的三条理由：anchor 是可选形参；anchor 可能在打开期间被连带销毁
+    （编辑记录弹窗关掉的时候）；_ensure_window 建窗那一刻也还没有 anchor。
 
     这里用原生 wm_geometry 而不是 CTkToplevel.geometry()：后者会把宽高**和坐标**
     一起按 DPI 缩放（见 ctk_toplevel.geometry 的 _apply_geometry_scaling），
     而 winfo_* 系列返回的都是物理像素，两者混用会让窗口整体偏几十像素。
 
-    size 用来传入「上一次显示时量到的尺寸」：复用打开要在 deiconify 之前摆位，
-    而那里不能读 winfo_width()（见 ask_date 的约束说明）。
+    size 传入「预置坐标要用的尺寸」：复用打开用上次量到的真实尺寸，首次打开用
+    「逻辑常量 × DPI 缩放」换算出的物理尺寸。两种情况都不能读 winfo_width()。
     """
     width, height = size if size is not None else (window.winfo_width(), window.winfo_height())
     target_x = max((window.winfo_screenwidth() - width) // 2, 0)
@@ -70,6 +97,68 @@ def _center_window(window: tk.Misc, size: tuple[int, int] | None = None) -> None
     # 少了这个判断就会无限自我触发（死循环）。
     if (window.winfo_x(), window.winfo_y()) != (target_x, target_y):
         window.wm_geometry(f"+{target_x}+{target_y}")
+
+
+def _anchor_to_input(
+    window: tk.Misc,
+    anchor: tk.Misc | None,
+    size: tuple[int, int] | None = None,
+) -> None:
+    """把弹窗贴到 anchor（日期输入框）的左下角，下方放不下时翻到它上方。
+
+    算式逐条照抄 category_picker._reanchor（横向钳制、竖向翻转、同一组常量），
+    两个 ▼ 的行为才会一致。四处刻意偏离它，都是「日历不是下拉列表」带来的：
+
+    1. **宽度不跟 anchor**。category_picker 是列表、宽度与输入框等宽；日历是 7 列
+       日期网格，宽度是内容决定的（_DIALOG_WIDTH），跟输入框走会被压窄、日期列
+       挤成一团。所以这里只借 anchor 的**位置**，不借它的宽度。
+    2. **不挂 anchor 的 <Configure>、也不挂 50ms 轮询**。category_picker 需要它们，
+       是因为它的列表可能在编辑弹窗**还没完成布局**时就弹出来了（它自己的注释里
+       记着实测旧宽偏 52px、旧 y 偏 92px）。日历没有这个问题：用户必须先在屏幕上
+       点中 ▼ 按钮，而按钮能被点中就意味着 anchor 早已布局完毕，读数可信。
+    3. **恰恰因为不挂 anchor 的事件**，用户把日历拖走后不会有任何回调把它拽回来——
+       这是需要的：日历是模态窗（grab_set），用户很可能想把它挪开去看主窗口里的
+       数字。category_picker 是不可拖动的下拉列表，没有这个诉求，两者该有差异。
+    4. **anchor 读不出有效高度时退回屏幕居中**，而不是像 category_picker 那样直接
+       return 等下一轮；日历没有等待窗口，退回兜底才能保证任何情况下都有位置。
+
+    坐标口径：winfo_* 与 wm_geometry 都是物理像素，不经过 CTk 的缩放换算。
+    """
+    if anchor is not None:
+        try:
+            anchor_exists = bool(anchor.winfo_exists())
+        except tk.TclError:
+            anchor_exists = False
+        if anchor_exists:
+            anchor_height = anchor.winfo_height()
+            # <=1 是「控件尚未完成布局」的谎报值：此时 rooty 指向的还不是最终位置。
+            if anchor_height > 1:
+                if size is None:
+                    size = (window.winfo_width(), window.winfo_height())
+                width, height = size
+                screen_width = window.winfo_screenwidth()
+                screen_height = window.winfo_screenheight()
+                anchor_x = anchor.winfo_rootx()
+                anchor_y = anchor.winfo_rooty()
+                # 左边缘与输入框左边缘对齐；越界时往回收，保证整条弹窗都留在屏幕内。
+                target_x = max(min(anchor_x, screen_width - width - _SCREEN_MARGIN), _SCREEN_MARGIN)
+                target_y = anchor_y + anchor_height + _GAP_ABOVE
+                if target_y + height > screen_height - _SCREEN_MARGIN:
+                    # 下方空间不够就翻到输入框上方；上方也不够时贴着屏幕底边放。
+                    above_y = anchor_y - height - _GAP_ABOVE
+                    target_y = (
+                        above_y
+                        if above_y >= _SCREEN_MARGIN
+                        else max(screen_height - height - _SCREEN_MARGIN, _SCREEN_MARGIN)
+                    )
+                # 只在位置真的变了才发 wm_geometry：本函数会在「预置坐标」和「尺寸
+                # 变化后的校正」两条路径上被连续调用，少了这个判断就会多一次无谓的
+                # 移动（移动又各自触发 <Configure>）。
+                if (window.winfo_x(), window.winfo_y()) != (target_x, target_y):
+                    window.wm_geometry(f"+{target_x}+{target_y}")
+                return
+    # 走到这里说明没有可用的锚点：交回屏幕居中。
+    _center_window(window, size)
 
 
 def _parse_iso_date(value: str) -> date | None:
@@ -184,20 +273,23 @@ def _cancel() -> None:
 
 
 def _recenter(_event: tk.Event | None = None) -> None:
-    """按「真实尺寸」把窗口摆到屏幕中央，且只在尺寸变化时动手。
+    """按「真实尺寸」把窗口重新贴到输入框下方，且只在尺寸变化时动手。
 
     不能用 winfo_reqwidth() 预算：CustomTkinter 会按 DPI 缩放控件，Tk 随后还会把
     窗口撑到内容所需大小，一次算出的坐标必然偏斜；而窗口未映射时 winfo_width()
     又会谎报 1。所以监听 <Configure>，用当时的真实宽高重算，自我校正。
 
-    但 <Configure> 在「尺寸变化」和「位置变化」时**都会**触发，所以不能每次都居中：
-    用户拖动标题栏 → 坐标改变 → 若此时重新居中，窗口会被立刻拽回屏幕中心，
-    手感上就是「窗口拖不动」。因此只在尺寸变化时居中，纯位移直接忽略。
+    但 <Configure> 在「尺寸变化」和「位置变化」时**都会**触发，所以不能每次都重摆：
+    用户拖动标题栏 → 坐标改变 → 若此时重新贴位，窗口会被立刻拽回输入框旁边，
+    手感上就是「窗口拖不动」。因此只在尺寸变化时重摆，纯位移直接忽略。
+
+    尺寸变化时也仍然按**锚点**（而不是屏幕）重算，这样换月导致行数从 6 行变 5 行、
+    弹窗变矮时，它会自己重新贴回输入框下方，而不是跑到屏幕中央去。
     """
     dialog = _win.dialog
     width, height = dialog.winfo_width(), dialog.winfo_height()
     # 窗口尚未映射时 winfo_width() 只返回 1，用它算出的坐标毫无意义，
-    # 居中反而会让窗口先闪一下再归位，所以跳过，等真正的尺寸事件。
+    # 重摆反而会让窗口先闪一下再归位，所以跳过，等真正的尺寸事件。
     if width <= 1 or height <= 1:
         return
     size = (width, height)
@@ -206,7 +298,7 @@ def _recenter(_event: tk.Event | None = None) -> None:
     if size == _ses.last_size:
         return  # 尺寸没变却收到事件 → 是拖动产生的位移，尊重用户摆的位置
     _ses.last_size = size
-    _center_window(dialog)
+    _anchor_to_input(dialog, _ses.anchor, size)
 
 
 def _deferred_setup() -> None:
@@ -219,7 +311,7 @@ def _deferred_setup() -> None:
     刻意**留在同步段**的三样东西，都不可挪：
       - _render_month()：它是弹窗的主体内容。挪到 after_idle 就会先弹出一个
         空白日历再填进去，属于观感倒退，不是优化。
-      - _recenter()：窗口先按内容撑大、再被摆到屏幕中央，靠的就是它；
+      - _recenter()：窗口先按内容撑大、再被贴到输入框下方，靠的就是它；
         延后会让窗口先在默认位置露一帧。
       - grab_set()：它是模态性本身，不是性能开关（实测只要 0.01ms，
         既跑得快又不可省）。
@@ -334,6 +426,12 @@ def _ensure_window(parent: tk.Misc) -> None:
     # 先给一个尺寸提示：CTk 会把逻辑像素按 DPI 放大；随后 Tk 还可能按内容再撑大，
     # 所以最终位置交给下面的 <Configure> 回调按真实尺寸校正。
     dialog.geometry(f"{_DIALOG_WIDTH}x{_DIALOG_HEIGHT}")
+    # 【A1】坐标必须就在这里预置：上面那句只给尺寸、不给坐标，坐标会被 Win32 按
+    # CW_USEDEFAULT 随机分配（实测 32/96/192/224，跨进程都不一致），窗口会先在错误
+    # 位置露一帧再被 _recenter 拉回（错位帧约 85ms）。这里没有 anchor（建窗时还
+    # 没进入 ask_date），所以 _anchor_to_input 会退回屏幕居中；紧接着 ask_date 会用
+    # 真的 anchor 再摆一次并覆盖它。两次都在 deiconify 之前完成，所以仍然只露一帧。
+    _anchor_to_input(dialog, None, _physical_size(dialog))
 
     dialog_font = ("Microsoft YaHei UI", 11)
 
@@ -437,12 +535,15 @@ def _ensure_window(parent: tk.Misc) -> None:
     )
 
 
-def ask_date(parent: ctk.CTk, initial_date: str) -> str | None:
+def ask_date(parent: ctk.CTk, initial_date: str, anchor: tk.Misc | None = None) -> str | None:
     """弹出日历选择器。
 
     Args:
         parent: 父窗口，弹窗会以 transient 方式挂在它上面。
         initial_date: 预选日期（YYYY-MM-DD），同时决定初始展示的月份。
+        anchor: 锚点控件（日期输入框）：弹窗左边缘与它左边缘对齐、上边缘贴在它
+            下边缘再往下 _GAP_ABOVE 像素，下方放不下时翻到它上方。不传，或传进来
+            的控件已经不存在时，退回屏幕居中（见 _anchor_to_input）。
 
     Returns:
         选中日期（YYYY-MM-DD 字符串）；用户点「取消」、按 ESC 或点右上角关闭时返回 None。
@@ -479,9 +580,12 @@ def ask_date(parent: ctk.CTk, initial_date: str) -> str | None:
         today=today,
         # 用 dict 保存可变状态（当前展示的年月 + 高亮日期），方便被多个回调共享修改。
         state={"year": initial.year, "month": initial.month, "selected": initial},
-        # 必须复位：不复位时复用打开「尺寸没变」，_recenter 会把居中逻辑整个拦掉，
+        # 必须复位：不复位时复用打开「尺寸没变」，_recenter 会把重摆逻辑整个拦掉，
         # 弹窗就会停在用户上次拖动到的位置。
         last_size=None,
+        # 本次打开的锚点（日期输入框）。_recenter 在尺寸变化时要靠它重算位置，
+        # 所以必须跟着「本次打开」每回重建，不能留在窗口级的 _win 里。
+        anchor=anchor,
         # 两个单元素列表当句柄槽，回调内部可原地改写（省掉一遍 nonlocal）。
         setup_idle=[None],
         configure_funcid=[None],
@@ -493,11 +597,12 @@ def ask_date(parent: ctk.CTk, initial_date: str) -> str | None:
     if not _win.setup_done and _ses.setup_idle[0] is None:
         _ses.setup_idle[0] = dialog.after_idle(_deferred_setup)
 
-    # 【(b) 预置坐标】复用打开时改用「上一次显示量到的尺寸」先摆到中心再显示：
-    # 窗口第一帧就落在中心，不会先在用户上次拖到的位置露一帧再跳回来（实测那段
-    # 错位帧 29~46ms）。首次打开没有可信尺寸，跳过，交给后面的 _recenter。
-    if _win.last_size is not None:
-        _center_window(dialog, _win.last_size)
+    # 【预置坐标】deiconify 之前先摆好，窗口第一帧就落在正确位置，不会先在
+    # 用户上次拖到的位置露一帧再跳回来（实测那段错位帧 29~46ms）。
+    # 尺寸优先用「上一次显示量到的真实尺寸」；首次打开没有可信尺寸，用逻辑常量
+    # 换算（不能读 winfo_width()，未映射时它只会谎报 200）。
+    # 两条路径都走 _anchor_to_input：anchor 可用就贴输入框，不可用才退回屏幕居中。
+    _anchor_to_input(dialog, anchor, _win.last_size or _physical_size(dialog))
 
     # 【先显示】deiconify 必须早于任何依赖 winfo_width()/height() 的计算：
     # 窗口未映射时这些值不可信（首次映射前恒为 1）。

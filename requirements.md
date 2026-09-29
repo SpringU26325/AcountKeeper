@@ -206,8 +206,11 @@
 
 #### 实现方式
 - 新建 `calendar_picker.py`，对外提供一个函数：
-  - `ask_date(parent, initial_date: str) -> str | None`
+  - `ask_date(parent, initial_date: str, anchor: tk.Misc | None = None) -> str | None`
     - 返回值：选中日期的字符串（格式 `YYYY-MM-DD`），或 `None`（用户取消 / 按 ESC）。
+    - `anchor`：日历弹出位置的锚点控件（日期输入框）。弹窗左边缘与它左边缘对齐、
+      上边缘贴在它下边缘再往下 6 物理像素，下方放不下时翻到它上方；不传或已销毁时
+      回落为屏幕居中。
 - 弹窗内容：
   - 当前月份标题（如 `2026-09`）。
   - 上一月 / 下一月按钮。
