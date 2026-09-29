@@ -4,27 +4,30 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
-import re
 import tkinter as tk
 
 import customtkinter as ctk
 
-from calendar_picker import ask_date
+# 月份选择也走 calendar_picker：本模块原来那份自绘的 CTkEntry 输入框已删除，
+# ask_month 只做一层薄封装。导入时改别名 picker_ask_month，避免与本模块下面
+# 同名的 ask_month 包装函数互相覆盖（后者会遮蔽前者的名字）。
+from calendar_picker import ask_date, ask_month as picker_ask_month
 from category_picker import ask_category
 # 类别候选统一由 category_prefs 算（与新增记录输入区走同一条路），这里只借它的
 # EXPENSE / INCOME 两个方向常量来判断「这条记录算支出还是收入」，候选本身由
 # category_picker 在弹窗里现算。依赖方向也因此从 dialogs -> widgets 降为
 # dialogs -> category_prefs。
 from category_prefs import EXPENSE, INCOME
+from config import RESOURCE_DIR
 from store import Account
 
 
 def _apply_logo_icon(window: tk.Misc) -> None:
     """为窗口设置项目 logo 图标。"""
     try:
-        # 用 __file__ 定位图片，保证无论从哪个工作目录启动都能找到 logo。
-        icon_path = Path(__file__).resolve().parent / "image" / "logo.ico"
+        # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，
+        # 打包成 exe 后资源被解压到临时目录，也能正确定位到 logo。
+        icon_path = RESOURCE_DIR / "image" / "logo.ico"
         if icon_path.exists():
             window.iconbitmap(str(icon_path))
     except Exception:
@@ -32,118 +35,32 @@ def _apply_logo_icon(window: tk.Misc) -> None:
         pass
 
 
-def ask_month(parent: ctk.CTk, title: str, prompt: str) -> str | None:
-    """显示自定义月份输入框，并返回通过校验的月份。"""
-    # 不用 simpledialog/messagebox，是为了统一配色、圆角和 logo 图标风格。
-    dialog = ctk.CTkToplevel(parent)
-    dialog.title(title)
-    dialog.geometry("420x240")
-    dialog.resizable(False, False)
-    # transient 让对话框始终显示在父窗口之上，父窗口最小化时它也跟着最小化。
-    dialog.transient(parent)
-    dialog.configure(fg_color="#F0F4F8")
-    _apply_logo_icon(dialog)
+def ask_month(
+    parent: ctk.CTk,
+    title: str,
+    initial_month: str | None = None,
+    anchor: tk.Misc | None = None,
+) -> str | None:
+    """选择月份（严格返回 YYYY-MM），用户取消时返回 None。
 
-    dialog_font = ("Microsoft YaHei UI", 11)
-    title_font = ("Microsoft YaHei UI", 13, "bold")
-    # 用单元素列表而非普通变量保存结果：闭包能直接写入，且无需 nonlocal 声明。
-    result: list[str | None] = [None]
+    本函数只是 calendar_picker.ask_month 的一层薄封装（issues #3.2）：既统一了
+    「月份选择」这一件事的入口，也让上层（ui.py）不必直接依赖 calendar_picker。
+    改造前这里是自绘的 CTkEntry 输入框：一个 420x240 的独立窗口，靠正则 +
+    strptime 校验用户手敲的内容，与「日期选择器」是两套实现、两套观感。
+    现在两者共用同一个复用弹窗，选择行为、配色、定位规则完全一致。
 
-    content = ctk.CTkFrame(dialog, fg_color="transparent")
-    content.pack(fill="both", expand=True)
-    ctk.CTkLabel(
-        content,
-        text=title,
-        font=title_font,
-        text_color="#243447",
-    ).pack(anchor="w", padx=24, pady=(20, 0))
-    ctk.CTkLabel(
-        content,
-        text=prompt,
-        font=dialog_font,
-        text_color="#455A64",
-    ).pack(anchor="w", padx=24, pady=(12, 8))
+    **形参顺序**：parent 之后只有 title 是必需的（它带语境，调用方必须给），
+    initial_month / anchor 都可省略——只写 dialogs.ask_month(self, "导出账单")
+    也是合法调用，此时定位到今天所在月份、弹窗退回屏幕居中。
+    prompt 形参已在 issues #3.2 改造中删除：弹窗里不再有说明文字。
 
-    month_var = tk.StringVar()
-    entry = ctk.CTkEntry(
-        content,
-        textvariable=month_var,
-        font=dialog_font,
-        height=38,
-        corner_radius=9,
-        border_width=1,
-        border_color="#C6D4DF",
-        fg_color="#FFFFFF",
-    )
-    entry.pack(fill="x", padx=24)
-    # 错误提示预留在这个标签里，避免每输错一次都弹出一个 messagebox 打断用户。
-    error_var = tk.StringVar()
-    ctk.CTkLabel(
-        content,
-        textvariable=error_var,
-        text_color="#C62828",
-        font=("Microsoft YaHei UI", 10),
-    ).pack(anchor="w", padx=24, pady=(5, 0))
-
-    buttons = ctk.CTkFrame(content, fg_color="transparent")
-    buttons.pack(fill="x", padx=24, pady=(14, 0))
-    # 左右两列等宽，让「取消」和「确定」两个按钮宽度一致、整体对称。
-    buttons.grid_columnconfigure((0, 1), weight=1)
-
-    def cancel() -> None:
-        # 保持 result[0] 为 None，调用方据此判断用户取消。
-        dialog.destroy()
-
-    def confirm() -> None:
-        month = month_var.get().strip()
-        try:
-            # 先用正则卡住明显的格式错误（如 2024/01、2024-1），
-            # 再用 strptime 做二次校验，拦住 2024-13 这类月份越界的输入。
-            valid_format = re.fullmatch(r"\d{4}-\d{2}", month) is not None
-            if not valid_format:
-                raise ValueError
-            datetime.strptime(month, "%Y-%m")
-        except ValueError:
-            # 校验失败不关闭窗口，只显示错误并把焦点交回输入框，方便用户直接改正。
-            error_var.set("格式错误，请输入有效的 YYYY-MM 月份。")
-            entry.focus_set()
-            return
-        result[0] = month
-        dialog.destroy()
-
-    ctk.CTkButton(
-        buttons,
-        text="取消",
-        command=cancel,
-        width=120,
-        height=34,
-        corner_radius=9,
-        fg_color="#90A4AE",
-        hover_color="#78909C",
-        font=dialog_font,
-    ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
-    ctk.CTkButton(
-        buttons,
-        text="确定",
-        command=confirm,
-        width=120,
-        height=34,
-        corner_radius=9,
-        fg_color="#2F80ED",
-        hover_color="#256AC4",
-        font=dialog_font,
-    ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
-    # 把窗口右上角的关闭按钮也当作「取消」，避免出现无法关闭或状态不明确的对话框。
-    dialog.protocol("WM_DELETE_WINDOW", cancel)
-    # 回车等于确定、Esc 等于取消，符合桌面软件的通用操作习惯。
-    dialog.bind("<Return>", lambda _event: confirm())
-    dialog.bind("<Escape>", lambda _event: cancel())
-    entry.focus_set()
-    # grab_set 把键盘/鼠标焦点锁在对话框内，主窗口在接受输入期间不可操作；
-    # wait_window 会阻塞在这里，直到对话框被销毁，因此下面的 return 一定能拿到最终结果。
-    dialog.grab_set()
-    parent.wait_window(dialog)
-    return result[0]
+    Args:
+        title: 窗口标题栏文字，调用方带语境（如「导出账单」「选择统计月份」「查看图表」）。
+        initial_month: 预选月份（YYYY-MM），同时决定初始展示的年份；不传、或字符串
+            不合法时定位到今天所在月份。
+        anchor: 锚点控件（触发月份选择的按钮）：弹窗贴它的左下角弹出，不传则屏幕居中。
+    """
+    return picker_ask_month(parent, initial_month=initial_month, anchor=anchor, title=title)
 
 
 def ask_edit_record(

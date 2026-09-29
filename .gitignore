@@ -26,12 +26,12 @@ account_export_*.csv
 temp.py
 *.tmp
 *.log
-issues.txt
+_issues.txt
 *.spec
 PROJECT_RULES.md
 build.bat
 _提示词生成要求.txt
-_probe/
+_probe
 
 # ---------- IDE 配置 ----------
 .vscode/

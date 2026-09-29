@@ -8,15 +8,31 @@ import tkinter as tk
 from typing import TYPE_CHECKING
 from tkinter import messagebox
 
+# config 是叶子模块（不导入任何项目模块），引用它的 RESOURCE_DIR 不会形成循环依赖。
+from config import RESOURCE_DIR
+
 if TYPE_CHECKING:
     # 仅在类型检查时导入，避免 ui.py 与 chart_window.py 在运行时互相 import 形成循环依赖。
     from ui import AccountKeeperApp
 
 
+def _apply_logo_icon(window: tk.Misc) -> None:
+    """为图表窗口设置项目 logo 图标。"""
+    try:
+        # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，打包成 exe 后也能定位到 logo。
+        icon_path = RESOURCE_DIR / "image" / "logo.ico"
+        if icon_path.exists():
+            window.iconbitmap(str(icon_path))
+    except Exception:
+        # 图标只是装饰，缺失或平台不支持时静默忽略，绝不能因此让图表窗口打不开。
+        pass
+
+
 def show_chart_window(app: AccountKeeperApp) -> None:
     """按月份汇总各分类收入和支出并显示图表。"""
-    # 复用主窗口的月份输入对话框，保持交互方式一致（需求 3.6）。
-    month = app.ask_month("查看图表", "请输入要查看的月份（格式：YYYY-MM）")
+    # 复用主窗口的月份选择器，保持交互方式一致（需求 3.10：图表按月份汇总）。
+    # issues #3.2 后月份改为月历点选，弹窗内不再有 prompt 说明文字，故只传标题。
+    month = app.ask_month("查看图表")
     if month is None:
         return
 
@@ -74,6 +90,10 @@ def _render_chart_window(
         plt.rcParams["axes.unicode_minus"] = False
 
         chart_window = tk.Toplevel(app)
+        # 图标要在窗口刚建出来、还没显示时设，晚了会看到图标先闪一下再变；
+        # 而且必须自带 try/except——外层那个 except 会 destroy 窗口并弹「图表渲染失败」，
+        # 装饰性失败绝不能升级成功能性失败。
+        _apply_logo_icon(chart_window)
         # 图表同时画收入和支出两组柱子，标题必须体现"收入与支出"，与图内标题保持一致。
         chart_window.title(f"{month} 收入与支出统计")
         width, height = 700, 550

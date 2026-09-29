@@ -39,7 +39,6 @@ footer 里那个输入框是**弹窗自己的**，不绑主窗口的 category_va
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 import tkinter as tk
 from typing import Callable
 
@@ -49,6 +48,8 @@ import customtkinter as ctk
 # 这里只导入函数、不导入 EXPENSE/INCOME：方向由调用方按关键字传进来，
 # 本模块不替调用方决定「没传时算哪一个方向」——猜错方向会静默写错一份列表。
 from category_prefs import build_candidates, delete_user, move_to_top, save_user
+# config 是叶子模块（不导入任何项目模块），引用它的 RESOURCE_DIR 不会形成循环依赖。
+from config import RESOURCE_DIR
 
 # 与 calendar_picker.py / dialogs.py 的弹窗保持同一套浅色主题配色。
 _BG_COLOR = "#F0F4F8"
@@ -150,9 +151,11 @@ def _apply_logo_icon(window: tk.Misc) -> None:
 
     这里没有复用 dialogs._apply_logo_icon：dialogs.py 需要导入本模块调用
     ask_category，若再反向导入会形成循环导入，所以保留一份极小的私有实现。
+    路径来源则统一走 config.RESOURCE_DIR（issues #17），不再各自用 __file__ 拼。
     """
     try:
-        icon_path = Path(__file__).resolve().parent / "image" / "logo.ico"
+        # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，打包后也能定位到 logo。
+        icon_path = RESOURCE_DIR / "image" / "logo.ico"
         if icon_path.exists():
             window.iconbitmap(str(icon_path))
     except Exception:

@@ -289,12 +289,9 @@ class AccountKeeperApp(ctk.CTk):
         self.refresh_records()
 
     def export_csv(self) -> None:
-        # 先让用户输入要导出的月份，取消则直接返回。
-        month = dialogs.ask_month(
-            self,
-            "导出账单",
-            "请输入要导出的月份（格式：YYYY-MM）",
-        )
+        # 月份由月历弹窗点选（issues #3.2，不再手输），用户取消时返回 None。
+        # 第三个实参 prompt 已删：弹窗里不再有说明文字，标题栏 + 月历本身已自解释。
+        month = dialogs.ask_month(self, "导出账单")
         if month is None:
             return
 
@@ -339,11 +336,8 @@ class AccountKeeperApp(ctk.CTk):
         )
 
     def show_stats(self) -> None:
-        month = dialogs.ask_month(
-            self,
-            "选择统计月份",
-            "请输入要统计的月份（格式：YYYY-MM）",
-        )
+        # 与 export_csv 同一套口径：月份由月历弹窗点选（issues #3.2），取消返回 None。
+        month = dialogs.ask_month(self, "选择统计月份")
         if month is None:
             return
         # 只保留该月份的记录；要求存储的日期带前导零，所以前缀匹配是安全的（需求 3.4）。
@@ -397,9 +391,33 @@ class AccountKeeperApp(ctk.CTk):
         )
         messagebox.showinfo("月度统计", f"{summary}\n\n{details}")
 
-    def ask_month(self, title: str, prompt: str) -> str | None:
-        """保留旧接口，实际对话框由 dialogs 模块负责。"""
-        return dialogs.ask_month(self, title, prompt)
+    def ask_month(
+        self,
+        title: str,
+        initial_month: str | None = None,
+        anchor: tk.Misc | None = None,
+    ) -> str | None:
+        """保留旧接口，实际对话框由 dialogs 模块负责。
+
+        分层刻意保持 ui -> dialogs -> calendar_picker：本方法不直接 import
+        calendar_picker，月份弹窗的实现细节一律经 dialogs 转发，避免多出一条
+        横向依赖。
+
+        Args:
+            title: 窗口标题栏文字，带语境（如「查看图表」）。
+            initial_month: 预选月份（YYYY-MM），同时决定初始展示的年份；
+                不传或字符串不合法时定位到今天所在月份。
+            anchor: 锚点控件（触发月份选择的按钮）：弹窗贴它的左下角弹出，
+                不传则屏幕居中。三个工具栏按钮目前没留控件引用，故先按居中走。
+        """
+        # 可选项一律关键字透传：dialogs.ask_month 的形参顺序将来若有调整，
+        # 这里不会静默错位（例如把 initial_month 当 anchor 传下去）。
+        return dialogs.ask_month(
+            self,
+            title,
+            initial_month=initial_month,
+            anchor=anchor,
+        )
 
     def ask_edit_record(
         self,

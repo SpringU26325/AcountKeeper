@@ -1,11 +1,11 @@
 """AccountKeeper application entry point."""
 
 import ctypes
-from pathlib import Path
 from tkinter import messagebox
 
 import customtkinter as ctk
 
+from config import RESOURCE_DIR
 from settings import get_last_export_dir
 from store import AccountStore
 from ui import AccountKeeperApp
@@ -41,7 +41,8 @@ def main() -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
             "AccountKeeper.App"
         )
-        icon_path = Path(__file__).resolve().parent / "image" / "logo.ico"
+        # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，打包成 exe 后也能定位到 logo。
+        icon_path = RESOURCE_DIR / "image" / "logo.ico"
         app.iconbitmap(str(icon_path))
     except Exception as e:
         print(f"设置图标失败：{e}")
