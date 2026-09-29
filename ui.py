@@ -299,7 +299,9 @@ class AccountKeeperApp(ctk.CTk):
             return
 
         # 该月一条记录都没有时不必生成空文件，直接告知用户更友好。
-        if not any(record.record_date.startswith(month) for record in self.store.records):
+        # 必须带上结尾的 "-"：只写月前缀时 2024-01 会把 2024-010 这类脏数据也算进来，
+        # 与 store.export_month_csv 的 LIKE 'YYYY-MM-%'、下面 show_stats 的口径保持一致。
+        if not any(record.record_date.startswith(month + "-") for record in self.store.records):
             messagebox.showinfo("无法导出", "该月没有记录，无法导出")
             return
 

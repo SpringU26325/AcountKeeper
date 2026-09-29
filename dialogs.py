@@ -469,9 +469,11 @@ def confirm_delete(parent: ctk.CTk) -> bool:
 
     content = ctk.CTkFrame(dialog, fg_color="transparent")
     content.pack(fill="both", expand=True, padx=24, pady=20)
+    # 文案逐字对齐需求 §3.5 的问句，不自拟「确定要删除这条记录吗？」这种近似说法，
+    # 避免文档与界面两处措辞各自漂移（#27）。
     ctk.CTkLabel(
         content,
-        text="确定要删除这条记录吗？",
+        text="确认删除该记录吗？",
         font=("Microsoft YaHei UI", 12),
         text_color="#243447",
     ).pack(anchor="w", pady=(8, 18))

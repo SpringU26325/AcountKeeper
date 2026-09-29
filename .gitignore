@@ -30,7 +30,7 @@ issues.txt
 *.spec
 PROJECT_RULES.md
 build.bat
-提示词生成要求.txt
+_提示词生成要求.txt
 _probe/
 
 # ---------- IDE 配置 ----------
