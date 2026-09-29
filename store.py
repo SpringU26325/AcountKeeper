@@ -5,10 +5,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+import shutil
 import sqlite3
 from typing import Iterator
 
 from config import CSV_FIELDS, DB_PATH
+
+# record_tags 关联表的 schema 版本号，存在 SQLite 自带的 PRAGMA user_version 里。
+# 新库默认是 0，本段迁移跑完升到 1，用它保证迁移「只跑一次」。
+# 选它而不是自建标记表 / 往 settings.json 塞字段：SQLite 自带、无需额外文件，
+# 一条 PRAGMA 就能从命令行或探针直接看出库处于哪个版本，以后 1→2 继续往上加即可。
+_SCHEMA_USER_VERSION = 1
 
 
 @dataclass
@@ -32,9 +39,18 @@ class AccountStore:
         self.path = path
         # 内存缓存：UI 的筛选与汇总都读它，避免用户每敲一个字就查一次数据库。
         self.records: list[Account] = []
+        # 「库文件是否早就存在」必须在建表之前问，而且只能问这一次：
+        # _connect() 会顺手 mkdir + sqlite3.connect，一个全新安装的库文件正是被它凭空
+        # 创建出来的，等 _initialize_database() 之后再判断就永远是 True 了。
+        # 这个布尔值只决定「迁移前要不要备份」，用完即弃，所以用局部变量往下传，
+        # 不存成实例属性——否则类的状态里会多出一个只读一次的字段，徒增理解成本。
+        database_existed = self.path.exists()
         # 先建表、再把数据读进内存，这个顺序不能颠倒。
         # 旧 CSV 迁移逻辑已在 #40 中整体删除（项目还没有真实用户从旧版本升级，迁移属于纯负债）。
         self._initialize_database()
+        # 建表之后才迁移：迁移语句要往 record_tags 里写，表必须先存在。
+        # 放在 load() 之前，等 Step 2 让 load() 开始读 record_tags 时就不用再调整顺序。
+        self._migrate_to_multi_tag(database_existed=database_existed)
         self.load()
 
     @contextmanager
@@ -69,6 +85,93 @@ class AccountStore:
                 )
                 """
             )
+            # 多标签改造（#58 Step 1）的关联表：一条记录 × 一个标签 = 一行。
+            # 不给标签单建字典表：候选列表的唯一真源是 tags.json，数据库再存一份标签名
+            # 就变成「两处真源」（否决理由见 requirements §3.14.2 的方案 A）。
+            # (record_id, tag) 复合主键天然去重，同一条记录打两次同名标签只留一行，
+            # 迁移 SQL 也才能靠 INSERT OR IGNORE 做到幂等。
+            # 故意不写 FOREIGN KEY：sqlite3 默认 foreign_keys=OFF，写了也不生效，
+            # 所以删除记录时由 delete() 显式清理关联（§3.14.5 已明确不依赖级联）。
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS record_tags (
+                    record_id INTEGER NOT NULL,
+                    tag       TEXT    NOT NULL,
+                    PRIMARY KEY (record_id, tag)
+                )
+                """
+            )
+            # 没有这个索引，按标签聚合 / 筛选就只能全表扫描。
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_record_tags_tag ON record_tags(tag)"
+            )
+
+    def _backup_database(self) -> Path | None:
+        """迁移前把库原样复制一份到同目录的 account.db.bak，失败返回 None。
+
+        用文件级复制而不是 SQLite 的备份 API：单文件库在连接关闭后直接 copy 最稳，
+        而且留下的是一份「迁移前那一刻」的完整字节快照，出问题直接用 .bak 覆盖回去。
+        备份路径基于 self.path、不是 config.DB_PATH：测试注入临时库时备份也该落在
+        临时目录里，绝不能写到真实数据目录去。每次覆盖同一份、不带时间戳，
+        一份最新备份足够，避免在用户目录里堆文件（§3.14.6 待定项 b 的倾向）。
+        """
+        # 不能用 with_suffix(".bak")：那会把 .db 替换掉、得到 account.bak，
+        # 名字既与 requirements §3.14.2 对不上，.gitignore 的规则也匹配不到它。
+        backup_path = self.path.parent / (self.path.name + ".bak")
+        try:
+            shutil.copy2(self.path, backup_path)
+        except OSError as error:
+            # 备份失败就中止迁移：宁可这次不迁，也不能在没有退路的情况下改用户的库。
+            # 只打控制台警告、不抛异常——启动阶段抛出去会让整个程序起不来。
+            print(f"警告：迁移前备份数据库失败（{backup_path}），本次跳过迁移：{error}")
+            return None
+        return backup_path
+
+    def _migrate_to_multi_tag(self, database_existed: bool) -> None:
+        """把历史 category 值搬进 record_tags（#58 Step 1，只跑一次）。
+
+        整体包一层 try：本函数是在 __init__ 里被调用的，而 AccountStore() 又是在
+        account_keeper.main() 的 try 里构造的，一旦异常逃逸出去，用户看到的就是
+        「启动失败」弹窗、程序根本起不来。迁移失败属于可降级问题（下次启动会重试），
+        所以按「备份失败也中止迁移」的同款处置：打警告、保持 user_version = 0、
+        让程序照常启动。迁移只读 accounts.category，不写 accounts 的任何列，
+        所以整个迁移是可回滚的（§3.14.2 的「老数据不丢三重保证」）。
+        """
+        try:
+            with self._connect() as connection:
+                version_row = connection.execute("PRAGMA user_version").fetchone()
+                # PRAGMA 一定返回一行，这里仍做兜底，避免脏库返回空结果时下标报错。
+                version = version_row[0] if version_row else 0
+                if version >= _SCHEMA_USER_VERSION:
+                    # 已经迁过：直接放行。用 >= 而不是 == 0，将来加 1→2 时不会误跑本段。
+                    return
+            # 备份刻意放在连接关闭之后：文件级复制要读一份「静止」的库文件，
+            # 不跟尚未落盘的 journal 状态纠缠。
+            # 全新安装（库文件是本次才被 _connect() 创建出来的）没有数据可丢，跳过备份，
+            # 免得每次首启都在用户目录里留一个空的 account.db.bak；
+            # 但版本号照样置 1——空库本来就是新的地基形态，留成 0 会让迁移延后到
+            # 用户已经录了数据的第二次启动才触发，迁移时机变得不可预期。
+            if database_existed and self._backup_database() is None:
+                # 备份失败（警告已在上一步打出）：保持 user_version = 0 让下次启动重试，
+                # 绝不带着「没有退路」的状态去写用户的库。
+                return
+            with self._connect() as connection:
+                # TRIM 掉首尾空白，空串 / 纯空白不产生标签，正好对应「允许 0 标签」。
+                # INSERT OR IGNORE + 复合主键 = 重复执行结果完全一致（幂等），
+                # 中途断电导致下次重跑也不会产生重复行。
+                connection.execute(
+                    "INSERT OR IGNORE INTO record_tags(record_id, tag) "
+                    "SELECT id, TRIM(category) FROM accounts "
+                    "WHERE TRIM(category) <> ''"
+                )
+                # 升版本与上面的插入在同一个事务里提交，不可能出现
+                # 「标签已写入、版本号却没升」的半迁移状态。
+                # PRAGMA 的位置参数不走占位符绑定，只能拼进 SQL；值来自模块常量、
+                # 不是外部输入，没有注入面。
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_USER_VERSION}")
+        except sqlite3.Error as error:
+            # 覆盖「读版本」与「备份后写库」两条路径上的数据库错误。
+            print(f"警告：标签迁移失败，本次跳过（下次启动重试）：{error}")
 
     def load(self) -> None:
         """Read all records from SQLite."""

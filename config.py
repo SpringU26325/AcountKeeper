@@ -55,6 +55,13 @@ DEFAULT_EXPORT_DIR = DATA_DIR
 # 与 account.db 同目录，便于用户整体备份/迁移。
 CATEGORY_PREFS_PATH = DATA_DIR / "categories.json"
 
+# 用户常用标签文件（#58 多标签改造）：记录用户主动保存的标签，不再分支出 / 收入两段。
+# Step 1 只落地这个路径常量，本轮还没有模块读写它——真正使用它的 tag_prefs.py、
+# 以及 categories.json → tags.json 的合并迁移都排在 Step 2，所以上面的
+# CATEGORY_PREFS_PATH 必须原样保留：Step 2 的合并迁移要靠它读旧文件。
+# 与 account.db 同目录，同样便于用户整体备份/迁移。
+TAG_PREFS_PATH = DATA_DIR / "tags.json"
+
 # 资源根目录：PyInstaller 打包后资源会被解压到 sys._MEIPASS，
 # 用 getattr 做兼容，未打包时回退到源码目录，保证两种运行方式都能找到图片。
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR))

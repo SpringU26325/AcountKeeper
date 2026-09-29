@@ -18,6 +18,9 @@ dist/
 
 # ---------- 你的真实数据（必须忽略！） ----------
 account.db
+# #58 Step 1 迁移前的整库备份。上面的 account.db 规则匹配不到这个文件名，
+# 必须单独列一行，否则迁移一次就会把用户账本的副本提交进仓库。
+account.db.bak
 # 注：account.csv 已随 #40（删除 legacy CSV 迁移逻辑）作废——现在 CSV 只由用户在
 # 「另存为」对话框里自行决定路径，项目内不再有固定名字的 account.csv，故不再忽略。
 account_export_*.csv
