@@ -49,10 +49,11 @@ def show_chart_window(app: AccountKeeperApp) -> None:
         if not record.amount.is_finite():
             continue
         if record.amount >= 0:
-            category_totals[record.category]["income"] += record.amount
+            # 归类键用「、」拼出的展示串（#58 Step 2c-2）：与主窗口表格、月度统计同口径。
+            category_totals["、".join(record.tags)]["income"] += record.amount
         else:
             # 支出保持负数累加，画图时柱形会向 0 轴下方延伸，便于与收入对比。
-            category_totals[record.category]["expense"] += record.amount
+            category_totals["、".join(record.tags)]["expense"] += record.amount
 
     # 用 defaultdict 是否为空判断该月有没有数据，比额外维护计数变量更简洁。
     if not category_totals:

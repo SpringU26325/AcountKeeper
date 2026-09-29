@@ -90,7 +90,9 @@ def ask_edit_record(
     date_var = tk.StringVar(value=record.record_date)
     # 金额统一显示为两位小数，与表格中的显示格式保持一致。
     amount_var = tk.StringVar(value=f"{record.amount:.2f}")
-    category_var = tk.StringVar(value=record.category)
+    # #58 Step 2c-2：标签已改为多值，编辑框仍只提供一个单行输入框（候选弹窗负责多选），
+    # 预填时把多个标签用「、」拼起来 —— 与表格单元格显示逐字符相同，用户看到什么就改什么。
+    category_var = tk.StringVar(value="、".join(record.tags))
     note_var = tk.StringVar(value=record.note)
 
     content = ctk.CTkFrame(dialog, fg_color="transparent")

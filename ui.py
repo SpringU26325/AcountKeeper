@@ -159,10 +159,12 @@ class AccountKeeperApp(ctk.CTk):
             key=lambda item: (item.record_date, item.record_id),
             reverse=True,
         ):
-            # 统一转小写做不区分大小写的模糊匹配，日期/类别/备注任一命中即可。
+            # 统一转小写做不区分大小写的模糊匹配，日期/标签/备注任一命中即可。
+            # 标签用「、」拼成一个展示串再搜（#58 Step 2c-2）：多标签记录一次就能搜到，
+            # 拼接口径与表格单元格完全一致，用户看到什么就能搜到什么。
             searchable_text = (
                 record.record_date.lower(),
-                record.category.lower(),
+                "、".join(record.tags).lower(),
                 record.note.lower(),
             )
             if keyword and not any(keyword in text for text in searchable_text):
@@ -176,7 +178,9 @@ class AccountKeeperApp(ctk.CTk):
                     record.record_id,
                     record.record_date,
                     f"{record.amount:.2f}",
-                    record.category,
+                    # #58 Step 2c-2：多标签用预定义分隔符「、」连接成一个单元格字符串
+                    # （§3.14.4 的表格口径）；0 标签时 join 天然得到空串。
+                    "、".join(record.tags),
                     record.note,
                 ),
             )
@@ -223,8 +227,11 @@ class AccountKeeperApp(ctk.CTk):
         # store.add 内部还会再校验一次金额（数据层最后防线）。正常流程下这里不会触发，
         # 但万一上层校验被改动绕过，也只会弹出提示而不会让程序崩溃。
         try:
+            # #58 Step 2c-2：add 的形参已改成 tags 元组，而本框仍只收一个字符串，
+            # 所以在这里当场包成 1 元组；绝不能让字符串直接漏进 store ——
+            # 那会被逐字符拆成标签（"餐饮" → "餐"、"饮"）。
             self.store.add(
-                record_date.isoformat(), amount, category, self.note_var.get()
+                record_date.isoformat(), amount, (category,), self.note_var.get()
             )
         except ValueError:
             messagebox.showerror("输入错误", "日期格式应为 YYYY-MM-DD，金额必须是数字。")
@@ -283,7 +290,8 @@ class AccountKeeperApp(ctk.CTk):
             return
         record_date, amount, category, note = edited_values
         # 主键不参与修改，编辑只更新内容字段（需求 3.5.1）。
-        if not self.store.update(record_id, record_date, amount, category, note):
+        # #58 Step 2c-2：与 add 同理，编辑框返回的仍是单个字符串，这里当场包成 1 元组。
+        if not self.store.update(record_id, record_date, amount, (category,), note):
             messagebox.showerror("编辑失败", "找不到该记录或记录更新失败。")
             return
         self.refresh_records()
@@ -371,7 +379,9 @@ class AccountKeeperApp(ctk.CTk):
         for record in month_records:
             # 同样跳过非有限金额：它既无法比较大小，参与减法还会把整个分类合计污染成 NaN。
             if record.amount.is_finite() and record.amount < 0:
-                category_totals[record.category] -= record.amount
+                # 归类键仍用「、」拼出的展示串（#58 Step 2c-2）：与表格、图表三处口径一致，
+                # 保证本次改造不改变聚合口径（多标签如何分摊仍是 Step 4 的事）。
+                category_totals["、".join(record.tags)] -= record.amount
         # 分三种情况给出结论，避免展示一个"只有标题没有内容"的空明细。
         if not month_records:
             details = "该月份没有记账记录"

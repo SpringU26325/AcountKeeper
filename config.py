@@ -18,7 +18,9 @@ except ImportError:
 
 # CSV 表头字段顺序，必须与数据库查询列的顺序保持一致，否则导出后列会错位。
 # 旧 CSV 迁移逻辑已在 #40 中删除，该常量现仅被 store.export_month_csv 用于写表头。
-CSV_FIELDS = ("id", "date", "amount", "category", "note")
+# 第 4 项由 category 改名 tags（#58 Step 2c-2）：导出的是多标签字段，
+# 多个标签用竖线连接（§3.14.4）、0 个标签写空串，具体拼接由 store 负责。
+CSV_FIELDS = ("id", "date", "amount", "tags", "note")
 
 # 预置类别（需求 3.13）：类别下拉列表的「底表」，即使用户一条记录都没有也有可选项。
 # 之所以按支出/收入拆成两套而不是合并成一个大列表：两边的用词几乎不重叠
