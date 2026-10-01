@@ -226,10 +226,12 @@ def ask_edit_record(
                 picked = ask_tags(
                     dialog, target, var.get(),
                     toggle_button=toggle,
+                    selected_tags=tuple(tag_prefs.split_tag_input(var.get())),
                 )
                 # 返回 None 表示用户取消/按 ESC/再点一次 ▼，此时保持输入框原值不变。
-                if picked:
-                    var.set(picked)
+                if picked is not None:
+                    # 过渡适配，编辑器 chips 化后删除：旧单行框暂用顿号显示多选结果。
+                    var.set("、".join(picked))
                 # 这里不用再补 grab_set：编辑弹窗原来握着的 grab 是 tag_picker
                 # 主动借走、关闭时原样还回来的（见 tag_picker._cleanup）。
                 # 自己再抢一次纯属重复，还会掩盖借还逻辑真实是否成对的问题。

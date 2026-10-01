@@ -420,39 +420,41 @@ class InputFrame(ctk.CTkFrame):
         """把输入框里正在编辑的文字冲刷成一到多个 chip，并清空输入框。"""
         # 顿号分隔是「一次输入多个标签」的唯一写法，与表格单元格、CSV 的展示口径同源
         # （§3.14.4），所以打「餐饮、交通」一次就得到两颗 chip。
-        for tag in split_tag_input(self.tag_input_var.get()):
-            self._add_tag(tag)
+        self._add_tags(split_tag_input(self.tag_input_var.get()))
         # 空文本也要清一次：用户可能只敲了个分隔符，留着会让下一次提交重复处理。
         self.tag_input_var.set("")
 
     def _add_tag(self, name: str) -> bool:
         """加一颗 chip；名字为空或已存在时什么都不做（返回 False）。"""
-        tag = (name or "").strip()
-        if not tag or tag in self._tag_buttons:
-            # 重复标签直接忽略而不是报错：用户手输时重复列一个词是常见笔误，
-            # 而 _tags 里出现两个同名项会让写库后的展示顺序变得无法解释。
-            return False
-        # 一颗 chip 就是一颗按钮：整颗都是删除热区（比「文字 + 小 ×」两个控件好点、
-        # 控件数也更少，见 #56 对 CTkButton 构造开销的实测）。文字后面的「×」
-        # 是给用户看的提示——它不是独立控件，点了它和点文字是一样的效果。
-        button = ctk.CTkButton(
-            self.chips_frame,
-            text=f"{tag} ×",
-            # command 用默认参数把 tag 当场绑死：闭包晚绑定会让所有 chip 都去删最后一个标签。
-            command=lambda target=tag: self._remove_tag(target),
-            height=_CHIP_HEIGHT,
-            corner_radius=_CHIP_CORNER_RADIUS,
-            # 配色沿用 ▼ 按钮那一套浅青灰，hover 变深即「点它会删掉」的暗示；
-            # 刻意不做二次确认：chip 还没落库，删错了重敲一次即可。
-            fg_color="#E3EAF2",
-            hover_color="#D2DEE9",
-            text_color="#243447",
-            font=("Microsoft YaHei UI", 11),
-        )
-        self._tag_buttons[tag] = button
-        self._tags.append(tag)
-        self._schedule_relayout()
-        return True
+        return self._add_tags((name,))
+
+    def _add_tags(self, names: tuple[str, ...]) -> bool:
+        """批量加 chip，并在整批完成后只安排一次流式重排。"""
+        added = False
+        for name in names:
+            tag = (name or "").strip()
+            if not tag or tag in self._tag_buttons:
+                # 重复标签直接忽略；多选回填与手输走同一去重口径。
+                continue
+            # 一颗 chip 就是一颗按钮，默认参数绑定标签名，避免回调晚绑定到最后一项。
+            button = ctk.CTkButton(
+                self.chips_frame,
+                text=f"{tag} ×",
+                command=lambda target=tag: self._remove_tag(target),
+                height=_CHIP_HEIGHT,
+                corner_radius=_CHIP_CORNER_RADIUS,
+                fg_color="#E3EAF2",
+                hover_color="#D2DEE9",
+                text_color="#243447",
+                font=("Microsoft YaHei UI", 11),
+            )
+            self._tag_buttons[tag] = button
+            self._tags.append(tag)
+            added = True
+        if added:
+            # 一批标签全部建完再 after_idle，避免逐项回填时多次测量和重排。
+            self._schedule_relayout()
+        return added
 
     def _remove_tag(self, name: str) -> None:
         """删掉一颗 chip —— 只影响当前这条记录，绝不动 tags.json。"""
@@ -542,7 +544,7 @@ class InputFrame(ctk.CTkFrame):
         self._relayout_tags()
 
     def _pick_tags(self) -> None:
-        """打开标签选择器（3a 仍是单选回填：返回一个名字就追加一颗 chip）。"""
+        """打开标签选择器；只有点「完成」才提交本次选择和输入框残留文字。"""
         # 候选在「点击 ▼ 的这一刻」由弹窗现算，不由本层缓存：弹窗里保存/删除完不需要
         # 回头改任何控件状态，也就少一个「忘了刷新」的 bug。
         # 以 tag_entry 为 anchor：弹窗宽度与它等宽、左边缘与它对齐。
@@ -553,10 +555,17 @@ class InputFrame(ctk.CTkFrame):
             self.tag_entry,
             self.tag_input_var.get(),
             toggle_button=self.tag_button,
+            selected_tags=self.get_tags(),
         )
-        # None = 取消 / ESC / 再点一次 ▼，此时 chips 与输入框都保持原样。
-        if picked:
-            self._add_tag(picked)
+        # 取消必须完整回滚：弹窗只拿当前 chips 的快照，输入框与原 chips 都不被改动。
+        if picked is None:
+            return
+        # 完成时才把未按回车的输入合并；先放弹窗选项，再追加输入框新项，稳定保留顺序。
+        typed = split_tag_input(self.tag_input_var.get())
+        final = tuple(dict.fromkeys((*picked, *typed)))
+        # 先清空旧控件状态再整批重建，批量 helper 只安排一次 after_idle 重排。
+        self.clear_tags()
+        self._add_tags(final)
 
 
 class ToolbarFrame(ctk.CTkFrame):

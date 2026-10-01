@@ -278,21 +278,24 @@ def ask_tags(
     anchor: tk.Misc,
     current: str = "",
     toggle_button: tk.Misc | None = None,
-) -> str | None:
-    """在 anchor 控件正下方弹出标签列表；本步仍单选回填一个字符串。
+    *,
+    selected_tags: tuple[str, ...] = (),
+) -> tuple[str, ...] | None:
+    """在 anchor 控件正下方弹出标签列表；完成时回填本次确认的标签元组。
 
     Args:
         parent: 父窗口，弹窗以 transient 方式挂在它上面（主窗口或编辑记录弹窗）。
         anchor: 锚点控件（类别输入框）：弹窗左边缘与它左边缘对齐、宽度与它相同、
             上边缘贴在它下边缘再往下 _GAP_ABOVE 像素。
-        current: 输入框里的当前内容，用于在列表里高亮当前项，并预填 footer 的输入框。
+        current: 尚未提交的输入文本，只用于预填 footer 的输入框。
         toggle_button: 调用方那个 ▼ 按钮。点它属于「再点一次关闭」而不是「点外面」，
             所以全局点击监视器要把它排除掉。弹窗显示期间它的文字会被翻成 ▲，
             关闭时无论走哪条路径都由 _cleanup 翻回 ▼。不传只是少这一个白名单
             和图标切换，功能不受影响。
+        selected_tags: 调用方当前 chips 的快照；每次打开都以此初始化选中态，取消后
+            不会把本次临时选择带到下一次弹窗。
     Returns:
-        选中的标签；用户按 ESC、点右上角关闭、再点同一个 ▼，
-        或者点弹窗外的别处时返回 None。
+        点「完成」时返回选中顺序对应的标签元组；用户取消时返回 None。
     """
     # 【toggle / 防叠加】先处理「已经有一个类别弹窗开着」的情况，必须早于建窗：
     # 弹窗的 wait_window 是嵌套事件循环，上一次调用还停在那一行没返回，
@@ -339,8 +342,11 @@ def ask_tags(
     dialog_font = ("Microsoft YaHei UI", 11)
     # 与 calendar_picker 同一个闭包捕获写法：Tk 的回调没有返回值可用，
     # 结果只能写进一个可变容器，等 wait_window 结束再由函数返回出去。
-    result: list[str | None] = [None]
+    result: list[tuple[str, ...] | None] = [None]
     current_text = (current or "").strip()
+    # 选中状态属于这一次弹窗：先去重但保留调用方 chips 顺序，不复用上次未确认状态。
+    selected_order = list(dict.fromkeys(tag for tag in selected_tags if tag.strip()))
+    selected_set = set(selected_order)
 
     def _candidates() -> list[str]:
         """现算唯一标签池，文件内改完后下一次重画立即可见。
@@ -387,6 +393,8 @@ def ask_tags(
     # 它同时也是 _scroll_list 算式里「一共有几行」的唯一依据。
     # _build_row 每画一行就往里追加一条，_render_list 整表重画时整个清空重填。
     _row_refs: list[tuple[str, tk.Misc, tk.Misc]] = []
+    # 单独保存名称按钮：整表重绘后重建引用，单项 toggle 时只改对应按钮样式。
+    _selection_buttons: dict[str, ctk.CTkButton] = {}
 
     # 两个 after_idle 定时器的 id：setup_idle = 开窗时压后做的非关键绑定，
     # scroll_idle = 挂起的滚动。两者都要在 _cleanup 里取消，原因见那里。
@@ -408,7 +416,7 @@ def ask_tags(
             return
         _cleaned[0] = True
         # 先把唤起本次弹窗的那个 ▼ 还原成关态图标。放在这个统一出口而不是各条关闭
-        # 路径里，是因为关闭路径共六条（点选、ESC、右上角 ×、点外面、再点同一个 ▼、
+        # 路径里，是因为关闭路径共六条（完成、ESC、右上角 ×、点外面、再点同一个 ▼、
         # 父窗口销毁把它连带销毁），分散写必漏；_cleaned 标记又保证这里只跑一次。
         # 时序上也不可能误伤新弹窗：即使本次关闭属于「换一个锚点重开」，这里翻回去的
         # 也是**旧**按钮（toggle_button 取自本函数闭包，与调用方新传进来的那个 ▼ 是
@@ -488,17 +496,41 @@ def ask_tags(
             # 这里只是重复销毁一次，忽略即可。
             pass
 
-    def _choose(value: str) -> None:
-        """选中某一项：记下结果并关闭弹窗，让 wait_window 返回。"""
-        result[0] = value
+    def _apply_selection_style(name: str) -> None:
+        """只更新一行名称按钮的选中视觉，不重绘列表或改变行宽。"""
+        button = _selection_buttons.get(name)
+        if button is None:
+            return
+        is_selected = name in selected_set
+        button.configure(
+            fg_color=_ACCENT_COLOR if is_selected else "transparent",
+            hover_color=_ACCENT_HOVER_COLOR if is_selected else _SUBTLE_HOVER_COLOR,
+            text_color="#FFFFFF" if is_selected else _TEXT_COLOR,
+        )
+
+    def _toggle_selection(name: str) -> None:
+        """点候选只切换临时选中态；保持弹窗打开，允许连续选择多项。"""
+        if name in selected_set:
+            selected_set.remove(name)
+            selected_order.remove(name)
+        else:
+            selected_set.add(name)
+            selected_order.append(name)
+        _apply_selection_style(name)
+
+    def _complete() -> None:
+        """确认整组选中项；先写返回槽，再统一关闭弹窗。"""
+        result[0] = tuple(selected_order)
         _close_dialog()
 
     def _cancel() -> None:
-        """取消：result 保持 None，关闭弹窗。
+        """取消：丢弃本次临时选择，result 保持 None。
 
-        现在只剩 ESC 和右上角 × 两个入口（底部 footer 里没有「取消」按钮），
-        保留它是因为「不改动输入框内容地关掉弹窗」这条路必须还在。
+        ESC、右上角 ×、点外面和再次点同一个 ▼ 都收敛到这里，避免任一路径把
+        未确认选择带回调用方；弹窗关闭后局部集合也随闭包一起回收。
         """
+        selected_order.clear()
+        selected_set.clear()
         _close_dialog()
 
     # ---------- 列表区 ----------
@@ -648,6 +680,11 @@ def ask_tags(
         if not delete_tag(name):
             _set_hint(f"删除失败：{name} 没能写入类别文件", error=True)
             return
+        # 候选从标签池删除后不能再被「完成」回填，即使它之前已在本次临时选择中。
+        if name in selected_set:
+            selected_set.remove(name)
+            selected_order.remove(name)
+        _selection_buttons.pop(name, None)
         # 成功就把上一次失败留下的红字抹掉。原实现走 _render_list()，那里顺带做了
         # 复位；现在走局部更新、不再经过 _render_list，这一步必须自己补上，
         # 否则一条早就过期的报错会一直挂在 footer 上。
@@ -811,9 +848,20 @@ def ask_tags(
     if current_text:
         save_entry.insert(0, current_text)
 
-    # 先 pack 按钮（side="right"）再 pack 输入框（side="left", expand=True）：与调用方
-    # 「输入框 + ▼ 按钮」「日期框 + 📅 按钮」同一套写法，按钮先钉住右端，输入框吃掉
-    # 剩下的宽度，于是这个框能占满「弹窗宽度 − 保存按钮 − 内边距」。
+    # 同侧先 pack 的控件占最外端：先放「完成」就让主操作钉在最右，再放「+ 保存」
+    # 会落在它左侧；输入框最后 pack 到 left，吃掉按钮之外的剩余宽度。
+    ctk.CTkButton(
+        button_row,
+        text="完成",
+        command=_complete,
+        width=64,
+        height=_BUTTON_ROW_HEIGHT,
+        corner_radius=6,
+        fg_color=_ACCENT_COLOR,
+        hover_color=_ACCENT_HOVER_COLOR,
+        text_color="#FFFFFF",
+        font=("Microsoft YaHei UI", 11),
+    ).pack(side="right")
     ctk.CTkButton(
         button_row,
         text=_SAVE_TEXT,
@@ -899,6 +947,7 @@ def ask_tags(
         # 引用表跟着一起清空重建：它和屏幕上的行必须严格一一对应，
         # 局部更新（置顶重排 / 删除单行）与滚动算式（取行数）全靠它。
         _row_refs.clear()
+        _selection_buttons.clear()
 
         if rows:
             # 带上「是不是第一行」这个标记传给 _build_row：第一行的「顶」要置灰禁用
@@ -939,7 +988,7 @@ def ask_tags(
             返回值刻意不含「×」按钮也不含名字按钮：删除整个行都销毁、置顶只需重排 +
             改「顶」的状态，两者都用不到它们。
         """
-        is_current = name == current_text
+        is_selected = name in selected_set
         row = ctk.CTkFrame(list_frame, fg_color="transparent", corner_radius=0)
         row.pack(fill="x", padx=4, pady=1)
 
@@ -986,11 +1035,11 @@ def ask_tags(
         # 已经在第一位就置灰禁用（具体口径与 text_color_disabled 的理由见 _set_pin_state）。
         _set_pin_state(pin_button, disabled=first)
 
-        ctk.CTkButton(
+        name_button = ctk.CTkButton(
             row,
             text=name,
             # 同上：默认参数绑定 name，否则每一项都会变成最后一项。
-            command=lambda picked=name: _choose(picked),
+            command=lambda picked=name: _toggle_selection(picked),
             # 【width=1 修的是既有缺陷，不是置顶带来的新需求】「行内容比视口宽、
             # 右侧按钮被裁」这件事在加「顶」之前就存在了：CTkButton 的 width 默认
             # 140，实际请求宽 175 物理像素，而 pack 请求宽会**把行容器撑大**
@@ -1009,11 +1058,13 @@ def ask_tags(
             height=_ITEM_HEIGHT,
             corner_radius=6,
             anchor="w",
-            fg_color=_ACCENT_COLOR if is_current else "transparent",
-            hover_color=_ACCENT_HOVER_COLOR if is_current else _SUBTLE_HOVER_COLOR,
-            text_color="#FFFFFF" if is_current else _TEXT_COLOR,
+            fg_color=_ACCENT_COLOR if is_selected else "transparent",
+            hover_color=_ACCENT_HOVER_COLOR if is_selected else _SUBTLE_HOVER_COLOR,
+            text_color="#FFFFFF" if is_selected else _TEXT_COLOR,
             font=dialog_font,
-        ).pack(side="left", fill="x", expand=True)
+        )
+        _selection_buttons[name] = name_button
+        name_button.pack(side="left", fill="x", expand=True)
 
         # 把这一行的两个「手柄」交回去：_render_list 拿它们填 _row_refs，
         # 之后的置顶重排 / 删除单行 / 滚动算式都靠这份引用，不再需要整表重画。
@@ -1214,7 +1265,7 @@ def ask_tags(
             dialog=dialog,
             anchor=anchor,
             toggle=toggle_button,
-            close=_close_dialog,
+            close=_cancel,
         )
     )
 

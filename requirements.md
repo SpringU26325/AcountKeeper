@@ -243,14 +243,14 @@
 
 ### 3.13 类别选择器 (Category Picker)
 
-> **【Step 2c 已完成；Step 3 待实现】**：偏好层现已使用 `tag_prefs.py` / `tags.json` 单一列表，picker 入口为 `ask_tags`、无 direction 参数，但仍是单选并回填单个字符串；标签 chips 与弹窗多选切换留 Step 3。收支切换不影响候选。完整目标形态见 §3.14.3。
+> **【Step 2c、Step 3b-a 已完成；Step 3b-b 待实现】**：偏好层使用 `tag_prefs.py` / `tags.json` 单一列表；picker 入口 `ask_tags` 无 direction 参数，支持多选切换，点「完成」返回标签元组，取消返回 `None`。新增区 chips 与弹窗多选已接通；编辑弹窗仍用单行字段，chips 化留 Step 3b-b。收支切换不影响候选。完整目标形态见 §3.14.3。
 
 #### 目标
 - 降低类别输入成本，同时避免同一类开销出现多种写法（比如「餐饮」「吃饭」「午饭」各存一份），让 3.4 统计和 3.10 图表里的类别维度真正能聚合到一起。
 
 #### 实现方式
 - 类别字段改用「**输入框 + ▼ 按钮**」的组合（新增记录输入区与编辑弹窗都改），风格与日期字段的 ▼ 按钮完全一致（36px、圆角 9px、`#E3EAF2`，hover `#D2DEE9`）：输入框始终可编辑，因此**仍然可以直接手输新类别**；点 ▼ 按钮弹出类别选择列表。
-- 弹窗由 `category_picker.py` 提供，入口是 `ask_tags(parent, anchor, current="", toggle_button=None) -> str | None`：当前仍是单选，点中一项回填一个字符串；其余关闭方式返回 `None`。候选由弹窗从 `tag_prefs.build_tag_candidates()` 现算，不由调用方传入，也没有方向参数。`toggle_button` 用于识别再次点击 ▼ 并同步 ▲ / ▼ 图标。多选返回集合留待 Step 3。
+- 弹窗由 `tag_picker.py` 提供，入口是 `ask_tags(parent, anchor, current="", toggle_button=None, *, selected_tags=()) -> tuple[str, ...] | None`：`selected_tags` 是每次打开时从调用方当前 chips 传入的快照；点候选只切换选中态，点「完成」整体回填元组，其他关闭路径返回 `None`。候选由弹窗从 `tag_prefs.build_tag_candidates()` 现算，不由调用方传入，也没有方向参数。`toggle_button` 用于识别再次点击 ▼ 并同步 ▲ / ▼ 图标。
 - 弹窗宽度与位置按锚点（类别输入框）实时对齐，打开期间锚点或窗口移动/缩放会跟着走。
 - 候选列表 = **`tags.json` 中唯一的 `tags` 列表**（由 `tag_prefs.build_tag_candidates() -> list[str]` 现算）。列表里有什么就显示什么：保存后出现、删除后消失；支出与收入共用同一列表。
   - `config.DEFAULT_TAGS` 共 17 项：支出 10 项按原序在前，收入中未出现的 7 项按原序追加；重复的「其他」只保留一次。
