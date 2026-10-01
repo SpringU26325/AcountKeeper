@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import os
@@ -21,6 +20,7 @@ from chart_window import show_chart_window
 from config import DATA_DIR, DEFAULT_EXPORT_DIR
 from snail import SnailManager
 from store import Account, AccountStore
+from tag_aggregation import MULTI_TAG_TOTALS_NOTE, aggregate_records_by_tag
 from widgets import InputFrame, RecordTableFrame, ToolbarFrame
 
 
@@ -154,15 +154,13 @@ class AccountKeeperApp(ctk.CTk):
             key=lambda item: (item.record_date, item.record_id),
             reverse=True,
         ):
-            # 统一转小写做不区分大小写的模糊匹配，日期/标签/备注任一命中即可。
-            # 标签用「、」拼成一个展示串再搜（#58 Step 2c-2）：多标签记录一次就能搜到，
-            # 拼接口径与表格单元格完全一致，用户看到什么就能搜到什么。
-            searchable_text = (
-                record.record_date.lower(),
-                "、".join(record.tags).lower(),
-                record.note.lower(),
+            # 日期、备注或任一标签单独命中即可；逐标签比较避免拼接符两侧被误当成连续文字。
+            matches = (
+                keyword in record.record_date.lower()
+                or keyword in record.note.lower()
+                or any(keyword in tag.lower() for tag in record.tags)
             )
-            if keyword and not any(keyword in text for text in searchable_text):
+            if keyword and not matches:
                 continue
             # iid 直接用 record_id，这样双击/删除时能由选中项反推出数据库主键。
             self.tree.insert(
@@ -359,34 +357,17 @@ class AccountKeeperApp(ctk.CTk):
             for record in self.store.records
             if record.record_date.startswith(month + "-")
         ]
-        total_income = sum(
-            (
-                record.amount
-                for record in month_records
-                if record.amount.is_finite() and record.amount > 0
-            ),
-            Decimal("0"),
-        )
-        total_expense = sum(
-            (
-                -record.amount
-                for record in month_records
-                if record.amount.is_finite() and record.amount < 0
-            ),
-            Decimal("0"),
-        )
+        totals = aggregate_records_by_tag(month_records)
+        total_income = totals.total_income
+        total_expense = totals.total_expense
         # 结余 = 收入 - 支出；支出转成正数后相减，避免出现"负数减负数"的歧义。
         balance = total_income - total_expense
-        # 只统计支出分类，因为收入不分摊分类、用途是"花了多少钱在什么类别上"。
-        category_totals: defaultdict[str, Decimal] = defaultdict(
-            lambda: Decimal("0")
-        )
-        for record in month_records:
-            # 同样跳过非有限金额：它既无法比较大小，参与减法还会把整个分类合计污染成 NaN。
-            if record.amount.is_finite() and record.amount < 0:
-                # 归类键仍用「、」拼出的展示串（#58 Step 2c-2）：与表格、图表三处口径一致，
-                # 保证本次改造不改变聚合口径（多标签如何分摊仍是 Step 4 的事）。
-                category_totals["、".join(record.tags)] -= record.amount
+        # 月度统计只展示支出明细，且忽略金额为零的桶以保持旧有显示语义。
+        expense_totals = {
+            tag: tag_totals.expense
+            for tag, tag_totals in totals.by_tag.items()
+            if tag_totals.expense > 0
+        }
         # 分三种情况给出结论，避免展示一个"只有标题没有内容"的空明细。
         if not month_records:
             details = "该月份没有记账记录"
@@ -394,10 +375,13 @@ class AccountKeeperApp(ctk.CTk):
             details = "该月份只有收入，没有支出"
         else:
             expense_details = "\n".join(
-                f"{category}: {amount:.2f} 元"
-                for category, amount in sorted(category_totals.items())
+                f"{tag}: {amount:.2f} 元"
+                for tag, amount in sorted(expense_totals.items())
             )
-            details = f"支出分类明细：\n{expense_details}"
+            details = (
+                f"支出标签明细：\n{expense_details}\n\n"
+                f"{MULTI_TAG_TOTALS_NOTE}"
+            )
         summary = (
             f"{month} 月度统计\n"
             f"总收入：{total_income:.2f} 元\n"

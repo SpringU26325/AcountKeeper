@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-from decimal import Decimal
 import tkinter as tk
 from typing import TYPE_CHECKING
 from tkinter import messagebox
 
 # config 是叶子模块（不导入任何项目模块），引用它的 RESOURCE_DIR 不会形成循环依赖。
 from config import RESOURCE_DIR
+from tag_aggregation import MULTI_TAG_TOTALS_NOTE, RecordTotals, aggregate_records_by_tag
 
 if TYPE_CHECKING:
     # 仅在类型检查时导入，避免 ui.py 与 chart_window.py 在运行时互相 import 形成循环依赖。
@@ -29,45 +28,32 @@ def _apply_logo_icon(window: tk.Misc) -> None:
 
 
 def show_chart_window(app: AccountKeeperApp) -> None:
-    """按月份汇总各分类收入和支出并显示图表。"""
+    """按月份汇总各标签收入和支出并显示图表。"""
     # 复用主窗口的月份选择器，保持交互方式一致（需求 3.10：图表按月份汇总）。
     # issues #3.2 后月份改为月历点选，弹窗内不再有 prompt 说明文字，故只传标题。
     month = app.ask_month("查看图表")
     if month is None:
         return
 
-    # 每个分类都预置收入/支出两个桶，后面按符号分别累加，省去判断分类是否已存在。
-    category_totals: defaultdict[str, dict[str, Decimal]] = defaultdict(
-        lambda: {"income": Decimal("0"), "expense": Decimal("0")}
-    )
-    for record in app.store.records:
-        # 日期带前导零，所以按月前缀匹配即可精确筛选该月记录。
-        if not record.record_date.startswith(month + "-"):
-            continue
-        # 非有限金额（例如历史脏数据里的 NaN）无法参与大小比较，直接跳过；
-        # 否则下面这行 >= 会抛 InvalidOperation，导致图表窗口根本打不开。
-        if not record.amount.is_finite():
-            continue
-        if record.amount >= 0:
-            # 归类键用「、」拼出的展示串（#58 Step 2c-2）：与主窗口表格、月度统计同口径。
-            category_totals["、".join(record.tags)]["income"] += record.amount
-        else:
-            # 支出保持负数累加，画图时柱形会向 0 轴下方延伸，便于与收入对比。
-            category_totals["、".join(record.tags)]["expense"] += record.amount
-
-    # 用 defaultdict 是否为空判断该月有没有数据，比额外维护计数变量更简洁。
-    if not category_totals:
+    # 日期带前导零，所以按月前缀匹配即可精确筛选该月记录。
+    month_records = [
+        record
+        for record in app.store.records
+        if record.record_date.startswith(month + "-")
+    ]
+    if not month_records:
         messagebox.showinfo("无法生成图表", "该月没有记录，无法生成图表")
         return
-    _render_chart_window(app, month, category_totals)
+    totals = aggregate_records_by_tag(month_records)
+    _render_chart_window(app, month, totals)
 
 
 def _render_chart_window(
     app: AccountKeeperApp,
     month: str,
-    category_totals: defaultdict[str, dict[str, Decimal]],
+    totals: RecordTotals,
 ) -> None:
-    """在独立窗口中绘制月份收入与支出分类柱状图。"""
+    """在独立窗口中绘制月份收入与支出标签柱状图。"""
     # matplotlib 体积较大且只在看图时才需要，因此延迟到函数内部再导入，缩短程序启动时间。
     # 整个导入链都可能因为用户没装 matplotlib 而失败，所以统一包进 try 并给出安装指引，
     # 绝不能让主程序崩溃（需求 3.7 容错）。
@@ -105,14 +91,14 @@ def _render_chart_window(
         position_y = (screen_height - height) // 2
         chart_window.geometry(f"{width}x{height}+{position_x}+{position_y}")
 
-        keys = list(category_totals.keys())
+        keys = list(totals.by_tag)
         # 图表内部只接受 float，这里把 Decimal 转成 float；展示用途下精度损失可以接受。
         income_values = [
-            float(category_totals[key]["income"])
+            float(totals.by_tag[key].income)
             for key in keys
         ]
         expense_values = [
-            float(category_totals[key]["expense"])
+            -float(totals.by_tag[key].expense)
             for key in keys
         ]
         # 用 Figure 对象而不是 plt.show()，这样才能把图表真正嵌进 Tkinter 窗口。
@@ -136,15 +122,24 @@ def _render_chart_window(
             label="支出",
         )
         ax.set_xticks(positions)
-        # 分类名可能较长，右对齐并旋转 30 度可避免文字互相重叠。
+        # 标签名可能较长，右对齐并旋转 30 度可避免文字互相重叠。
         ax.set_xticklabels(keys, rotation=30, ha="right")
+        ax.set_xlabel("标签")
         # 画一条 0 轴基准线，让上下延伸的收入/支出柱有共同参照。
         ax.axhline(0, color="#455A64", linewidth=0.8)
         ax.set_ylabel("金额（元）")
         ax.set_title(f"{month} 收入与支出统计")
         ax.legend()
-        # 自动调整子图边距，防止旋转后的分类名被裁掉。
-        fig.tight_layout()
+        # 为图内说明预留底边；Figure 级文字不由 tight_layout 自动避让。
+        fig.tight_layout(rect=(0.02, 0.14, 0.98, 0.96))
+        fig.text(
+            0.5,
+            0.035,
+            MULTI_TAG_TOTALS_NOTE,
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
 
         # FigureCanvasTkAgg 是 matplotlib 官方提供的 Tkinter 桥接控件。
         canvas = FigureCanvasTkAgg(fig, master=chart_window)

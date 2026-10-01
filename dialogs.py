@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import tkinter as tk
@@ -28,6 +30,25 @@ def _apply_logo_icon(window: tk.Misc) -> None:
     except Exception:
         # 图标只是装饰，Linux/macOS 下 iconbitmap 也可能不可用，失败时静默忽略。
         pass
+
+
+def _edit_dialog_max_height(dialog: ctk.CTkToplevel) -> int:
+    """返回扣除屏幕留白后的编辑弹窗最大逻辑高度。"""
+    try:
+        work_area = wintypes.RECT()
+        # SPI_GETWORKAREA 排除任务栏；Windows API 返回物理像素，需换成 CTk 逻辑尺寸。
+        if not ctypes.windll.user32.SystemParametersInfoW(
+            0x0030, 0, ctypes.byref(work_area), 0
+        ):
+            return 700
+        scaling = ctk.ScalingTracker.get_widget_scaling(dialog)
+        work_height = work_area.bottom - work_area.top
+        if scaling <= 0 or work_height <= 0:
+            return 700
+        return max(360, int(work_height / scaling) - 100)
+    except Exception:
+        # 非 Windows 环境或工作区 API 不可用时使用有界回退，避免创建弹窗失败。
+        return 700
 
 
 def ask_month(
@@ -71,9 +92,10 @@ def ask_edit_record(
     """
     dialog = ctk.CTkToplevel(parent)
     dialog.title("编辑记录")
-    # 编辑框比月份框更高，因为要纵向排列四个字段。
-    dialog.geometry("460x360")
-    dialog.resizable(False, False)
+    dialog.minsize(460, 360)
+    dialog.maxsize(460, _edit_dialog_max_height(dialog))
+    # 直接设 Tk 的可调整状态，避免 CTk 覆写额外安排异步标题栏重绘回调。
+    tk.Wm.resizable(dialog, False, True)
     dialog.transient(parent)
     dialog.configure(fg_color="#F0F4F8")
     _apply_logo_icon(dialog)
@@ -98,35 +120,7 @@ def ask_edit_record(
         text_color="#243447",
     ).pack(anchor="w")
 
-    resize_idle: list[str | None] = [None]
-
-    def _resize_dialog() -> None:
-        """按字段实际需求更新弹窗高度，保留原有 360px 高度作为下限。"""
-        resize_idle[0] = None
-        if not dialog.winfo_exists():
-            return
-        # after_idle 后布局尺寸已稳定；content 外侧上下各有 20px 留白。
-        requested_height = content.winfo_reqheight() + 40
-        height = max(360, requested_height)
-        dialog.geometry(f"460x{height}")
-
-    def _schedule_dialog_resize() -> None:
-        """合并同一轮 chips 行数变化，避免连续配置窗口几何。"""
-        if resize_idle[0] is None:
-            resize_idle[0] = dialog.after_idle(_resize_dialog)
-
-    def _cancel_pending_resize(event: tk.Event) -> None:
-        """弹窗销毁时撤销 idle 回调，避免它访问已销毁的窗口。"""
-        if event.widget is not dialog or resize_idle[0] is None:
-            return
-        try:
-            dialog.after_cancel(resize_idle[0])
-        except tk.TclError:
-            pass
-        resize_idle[0] = None
-
-    dialog.bind("<Destroy>", _cancel_pending_resize, add="+")
-    tag_chips = TagChipsFrame(content, on_layout_change=_schedule_dialog_resize)
+    tag_chips = TagChipsFrame(content, on_layout_change=None)
     tag_chips.set_tags(record.tags)
 
     fields: tuple[tuple[str, tk.StringVar | TagChipsFrame], ...] = (

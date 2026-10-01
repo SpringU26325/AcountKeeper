@@ -584,7 +584,7 @@ class ToolbarFrame(ctk.CTkFrame):
             border_color="#C6D4DF",
             fg_color="#FFFFFF",
             font=font_small,
-            placeholder_text="🔍 搜索日期/类别/备注",
+            placeholder_text="🔍 搜索日期/标签/备注",
         )
         # 用 grid 而不是 pack(side="left")：pack 是「从左往右按各自固定宽度依次占位」，
         # 它不会在窗口变窄时让步，最右边的按钮会被挤出可视区域。
