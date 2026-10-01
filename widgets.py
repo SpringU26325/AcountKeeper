@@ -27,6 +27,191 @@ _CHIP_GAP_X = 6  # 同一行里 chip 之间的水平间距
 _CHIP_GAP_Y = 4  # 换行后上下两行 chip 之间的垂直间距
 
 
+class TagChipsFrame(ctk.CTkFrame):
+    """标签 chips、输入框与多选入口组成的可复用控件。"""
+
+    def __init__(
+        self,
+        master: ctk.CTkBaseClass,
+        on_layout_change: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(master, fg_color="transparent", corner_radius=0)
+        font_regular = ("Microsoft YaHei UI", 12)
+        self.tag_input_var = tk.StringVar()
+        self._tags: list[str] = []
+        self._tag_buttons: dict[str, ctk.CTkButton] = {}
+        self._chips_width = -1
+        # 高度重算只关心实际行数变化；宽度变化但仍排成相同行数时无需通知外层。
+        self._layout_rows = 0
+        self._on_layout_change = on_layout_change
+        self.columnconfigure(0, weight=1)
+
+        self.tag_entry = ctk.CTkEntry(
+            self,
+            height=36,
+            font=font_regular,
+            corner_radius=9,
+            border_width=1,
+            border_color="#C6D4DF",
+            fg_color="#F8FAFC",
+            textvariable=self.tag_input_var,
+        )
+        self.tag_entry.grid(row=0, column=0, sticky="ew")
+        self.tag_entry.bind("<Return>", lambda _event: self._commit_tag_input())
+
+        self.tag_button = ctk.CTkButton(
+            self,
+            text="▼",
+            command=self._pick_tags,
+            width=36,
+            height=36,
+            corner_radius=9,
+            fg_color="#E3EAF2",
+            hover_color="#D2DEE9",
+            text_color="#243447",
+            font=("Microsoft YaHei UI", 11),
+        )
+        self.tag_button.grid(row=0, column=1, padx=(6, 0), sticky="e")
+
+        self.chips_frame = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
+        self.chips_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.chips_frame.grid_remove()
+        self.chips_frame.bind("<Configure>", self._on_chips_configure)
+
+    def _commit_tag_input(self) -> None:
+        """把输入框里的文字冲刷成 chip，并清空输入框。"""
+        self._add_tags(split_tag_input(self.tag_input_var.get()))
+        self.tag_input_var.set("")
+
+    def _add_tag(self, name: str) -> bool:
+        """加一颗 chip；名字为空或已存在时什么都不做。"""
+        return self._add_tags((name,))
+
+    def _add_tags(self, names: tuple[str, ...]) -> bool:
+        """批量加 chip，并在整批完成后只安排一次流式重排。"""
+        added = False
+        for name in names:
+            tag = (name or "").strip()
+            if not tag or tag in self._tag_buttons:
+                continue
+            button = ctk.CTkButton(
+                self.chips_frame,
+                text=f"{tag} ×",
+                command=lambda target=tag: self._remove_tag(target),
+                height=_CHIP_HEIGHT,
+                corner_radius=_CHIP_CORNER_RADIUS,
+                fg_color="#E3EAF2",
+                hover_color="#D2DEE9",
+                text_color="#243447",
+                font=("Microsoft YaHei UI", 11),
+            )
+            self._tag_buttons[tag] = button
+            self._tags.append(tag)
+            added = True
+        if added:
+            self._schedule_relayout()
+        return added
+
+    def _remove_tag(self, name: str) -> None:
+        """删除当前记录的一颗 chip，不触碰常用标签池。"""
+        button = self._tag_buttons.pop(name, None)
+        if button is None:
+            return
+        button.destroy()
+        if name in self._tags:
+            self._tags.remove(name)
+        self._schedule_relayout()
+
+    def _schedule_relayout(self) -> None:
+        """等新 chip 完成几何测量后再重排，避免按未测量的 1px 宽度换行。"""
+        self.chips_frame.grid()
+        self.after_idle(self._relayout_tags)
+
+    def _on_chips_configure(self, event: tk.Event) -> None:
+        """容器宽度改变才重排，掐断高度变化造成的 Configure 自激。"""
+        if event.width == self._chips_width:
+            return
+        self._chips_width = event.width
+        self._relayout_tags()
+
+    def _relayout_tags(self) -> None:
+        """按当前宽度流式换行；仅行数变化时通知外层调整高度。"""
+        if not self._tag_buttons:
+            self.chips_frame.grid_remove()
+            rows = 0
+        else:
+            width = self._chips_available_width()
+            column = 0
+            row = 0
+            used = 0
+            for tag in self._tags:
+                button = self._tag_buttons.get(tag)
+                if button is None:
+                    continue
+                need = button.winfo_reqwidth() + _CHIP_GAP_X
+                if column and width and used + need > width:
+                    row += 1
+                    column = 0
+                    used = 0
+                button.grid(
+                    row=row,
+                    column=column,
+                    padx=(0, _CHIP_GAP_X),
+                    pady=(0, _CHIP_GAP_Y),
+                    sticky="w",
+                )
+                used += need
+                column += 1
+            rows = row + 1
+
+        if rows != self._layout_rows:
+            self._layout_rows = rows
+            if self._on_layout_change is not None:
+                self._on_layout_change()
+
+    def _chips_available_width(self) -> int:
+        """返回 chips 可用宽度；尚未映射时用 0 表示暂不换行。"""
+        for widget in (self.chips_frame, self):
+            width = widget.winfo_width()
+            if width > 1:
+                return width
+        return 0
+
+    def get_tags(self) -> tuple[str, ...]:
+        """返回 chips 中的标签，不含输入框里尚未提交的文字。"""
+        return tuple(self._tags)
+
+    def collect_tags(self) -> tuple[str, ...]:
+        """先冲刷输入框残留，再返回提交用的标签元组。"""
+        self._commit_tag_input()
+        return tuple(self._tags)
+
+    def clear_tags(self) -> None:
+        """清空 chips 与输入框，供新增记录成功后复位。"""
+        for button in self._tag_buttons.values():
+            button.destroy()
+        self._tag_buttons.clear()
+        self._tags.clear()
+        self.tag_input_var.set("")
+        self._relayout_tags()
+
+    def _pick_tags(self) -> None:
+        """仅在 picker 返回完成结果时合并所选标签与输入框残留。"""
+        picked = globals()["ask_tags"](
+            self.winfo_toplevel(),
+            self.tag_entry,
+            self.tag_input_var.get(),
+            toggle_button=self.tag_button,
+            selected_tags=self.get_tags(),
+        )
+        if picked is None:
+            return
+        typed = split_tag_input(self.tag_input_var.get())
+        final = tuple(dict.fromkeys((*picked, *typed)))
+        self.clear_tags()
+        self._add_tags(final)
+
+
 class InputFrame(ctk.CTkFrame):
     """Input controls for adding a record."""
 
@@ -49,25 +234,7 @@ class InputFrame(ctk.CTkFrame):
         self.amount_var = tk.StringVar()
         # 默认选中「支出」，因为日常记账中支出占绝大多数。
         self.amount_type_var = tk.StringVar(value="支出")
-        # 标签输入框里「正在输入、还没变成 chip」的那一段文字。
-        # 它刻意不复用 category_var 的老名字/老语义：那一个是「记录的类别」，而现在
-        # 记录的标签集合是下面的 _tags（多值、有序），这个变量只管输入框这个控件的内容。
-        self.tag_input_var = tk.StringVar()
-        # 标签集合按写入顺序存在 list 里：chips 的先后顺序就是用户敲进来的顺序，
-        # 也是最终写库的顺序（§3.14.2：标签顺序有语义）。
-        self._tags: list[str] = []
-        # 名字 → chip 按钮 的索引表：增删、判重、重排都要按名字找控件，
-        # 有它就无需每轮遍历子控件，也让「同一个标签不会出现两颗 chip」只靠字典键就能保证。
-        self._tag_buttons: dict[str, ctk.CTkButton] = {}
-        # chips 区上一次参与换行计算的宽度，-1 = 「还没量过」。
-        # 用它做闸门：换行会改变容器高度、进而触发 <Configure>，宽度没变就直接返回，
-        # 否则「重排 → Configure → 再重排」会自激成死循环。
-        self._chips_width = -1
         self.note_var = tk.StringVar()
-        # 这里刻意不再缓存任何「历史类别」：候选由 tag_prefs.build_tag_candidates 在
-        # 每次点 ▼ 的那一刻现算。不缓存换来两件事：一是弹窗里保存/删除完界面立刻
-        # 生效，不需要任何跨模块通知；二是调用方不用再记得「新增成功后刷新一下」，
-        # 少一个必守的约定、少一类「忘了刷新」的 bug。
 
         # ---------- 卡片内的整体结构（需求 3.2） ----------
         # 第 0 行 = 标题行（标题 + 支出/收入切换 + 添加按钮），用 title_frame 承载；
@@ -111,9 +278,7 @@ class InputFrame(ctk.CTkFrame):
             title_frame,
             values=["支出", "收入"],
             variable=self.amount_type_var,
-            # 这里没有 command 回调，是刻意的：类别候选不再预先算好塞进控件，
-            # 而是等用户点类别框的 ▼ 时由 _pick_category 按「当时的收支类型」现算
-            # （即 tag_prefs.build_tag_candidates），所以切换收支时不需要同步候选状态。
+            # 候选在用户点标签区 ▼ 时由 tag_picker 现算；收支切换不影响共享标签池。
             # amount_type_var 由 CTkSegmentedButton 自己维护：用户点击走的是内部
             # set(value, from_button_callback=True)，那里会写回 self._variable。
             width=100,
@@ -305,69 +470,15 @@ class InputFrame(ctk.CTkFrame):
             anchor="w",
         ).grid(row=1, column=0, padx=(16, 6), pady=(5, 0), sticky="nw")
 
-        self.tags_frame = ctk.CTkFrame(
-            master_frame,
-            fg_color="transparent",
-            corner_radius=0,
-        )
-        # sticky="ew" + columnspan=3：标签框组与第一行的日期框组、金额框共用同一批竖线，
-        # 右端也落在 master_frame 的右内边距上。
-        self.tags_frame.grid(
+        self.tag_chips = TagChipsFrame(master_frame)
+        # 标签区仍占原来的网格位置；跨列后与日期、金额、备注的右边缘保持对齐。
+        self.tag_chips.grid(
             row=1, column=1, columnspan=3, padx=0, pady=(5, 0), sticky="ew"
         )
-        # 只有第 0 列（输入框那一列）有重量：▼ 按钮所在列的宽度固定，输入框吃掉剩下的。
-        self.tags_frame.columnconfigure(0, weight=1)
-
-        # 输入框刻意不写 placeholder_text：需求 3.14.3 明确「0 chips 时只有输入框，无占位符」；
-        # 另一方面 CTkEntry 在 Python 3.13 下不能同时给 placeholder_text 和 textvariable
-        # （占位符会永久失效），而这个框必须绑 tag_input_var，才能在回车/点「添加」时
-        # 把正在输入的文字冲刷成 chip。
-        self.tag_entry = ctk.CTkEntry(
-            self.tags_frame,
-            height=36,
-            font=font_regular,
-            corner_radius=9,
-            border_width=1,
-            border_color="#C6D4DF",
-            fg_color="#F8FAFC",
-            textvariable=self.tag_input_var,
-        )
-        self.tag_entry.grid(row=0, column=0, sticky="ew")
-        # 回车即提交，与弹窗 footer 里「回车 = + 保存」是同一个习惯。
-        # 用 lambda 吞掉事件对象：Tk 会把 <Return> 的事件对象当第一个位置实参传进来，
-        # 直接写 self._commit_tag_input 会让它收到一个不认识的参数。
-        self.tag_entry.bind("<Return>", lambda _event: self._commit_tag_input())
-
-        # ▼ 按钮与日期字段那个逐项对齐（36x36、圆角 9、浅青灰底、同一字体与文字色），
-        # 所以两行的 ▼ 看起来是同一个控件。
-        # 这里必须留引用：tag_picker 的「点弹窗外面就关」监视器要把本按钮排除掉，
-        # 否则鼠标按下时先关掉列表、紧接着 command 又把它打开，表现出来就是「点 ▼ 关不上」。
-        self.tag_button = ctk.CTkButton(
-            self.tags_frame,
-            text="▼",
-            command=self._pick_tags,
-            width=36,
-            height=36,
-            corner_radius=9,
-            fg_color="#E3EAF2",
-            hover_color="#D2DEE9",
-            text_color="#243447",
-            font=("Microsoft YaHei UI", 11),
-        )
-        self.tag_button.grid(row=0, column=1, padx=(6, 0), sticky="e")
-
-        # chips 容器：跨满 tags_frame 两列（= 输入行的整行宽度），换行时可用宽度最大。
-        # 0 标签时整块 grid_remove()，让卡片仍保持紧凑（见 _relayout_tags）。
-        self.chips_frame = ctk.CTkFrame(
-            self.tags_frame,
-            fg_color="transparent",
-            corner_radius=0,
-        )
-        self.chips_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        self.chips_frame.grid_remove()
-        # <Configure> 只用来感知「可用宽度变了」（窗口缩放）；换行本身归 _relayout_tags 管。
-        # 回调里用宽度做闸门：换行会改变容器高度、又触发一次 <Configure>，不闸住会自激。
-        self.chips_frame.bind("<Configure>", self._on_chips_configure)
+        # 兼容既有调用与探针：变量和控件仍是同一对象，不复制状态。
+        self.tag_input_var = self.tag_chips.tag_input_var
+        self.chips_frame = self.tag_chips.chips_frame
+        self.tag_button = self.tag_chips.tag_button
 
         # ---------- 第三行：备注 ----------
         # 标签区（chips 会换行）占了第二行整行，备注不能再和它并排，因此下移到第三行；
@@ -412,160 +523,17 @@ class InputFrame(ctk.CTkFrame):
         if picked:
             self.date_var.set(picked)
 
-    # ---------- 标签区（需求 3.14.3 形态 1：chips + 输入框 + ▼） ----------
-    # chips 的增删只改「这条记录用哪些标签」，与「标签池」（tags.json）完全无关：
-    # 后者只在弹窗里点「+ 保存」/「×」时才动（见 tag_prefs / tag_picker）。
-
-    def _commit_tag_input(self) -> None:
-        """把输入框里正在编辑的文字冲刷成一到多个 chip，并清空输入框。"""
-        # 顿号分隔是「一次输入多个标签」的唯一写法，与表格单元格、CSV 的展示口径同源
-        # （§3.14.4），所以打「餐饮、交通」一次就得到两颗 chip。
-        self._add_tags(split_tag_input(self.tag_input_var.get()))
-        # 空文本也要清一次：用户可能只敲了个分隔符，留着会让下一次提交重复处理。
-        self.tag_input_var.set("")
-
-    def _add_tag(self, name: str) -> bool:
-        """加一颗 chip；名字为空或已存在时什么都不做（返回 False）。"""
-        return self._add_tags((name,))
-
-    def _add_tags(self, names: tuple[str, ...]) -> bool:
-        """批量加 chip，并在整批完成后只安排一次流式重排。"""
-        added = False
-        for name in names:
-            tag = (name or "").strip()
-            if not tag or tag in self._tag_buttons:
-                # 重复标签直接忽略；多选回填与手输走同一去重口径。
-                continue
-            # 一颗 chip 就是一颗按钮，默认参数绑定标签名，避免回调晚绑定到最后一项。
-            button = ctk.CTkButton(
-                self.chips_frame,
-                text=f"{tag} ×",
-                command=lambda target=tag: self._remove_tag(target),
-                height=_CHIP_HEIGHT,
-                corner_radius=_CHIP_CORNER_RADIUS,
-                fg_color="#E3EAF2",
-                hover_color="#D2DEE9",
-                text_color="#243447",
-                font=("Microsoft YaHei UI", 11),
-            )
-            self._tag_buttons[tag] = button
-            self._tags.append(tag)
-            added = True
-        if added:
-            # 一批标签全部建完再 after_idle，避免逐项回填时多次测量和重排。
-            self._schedule_relayout()
-        return added
-
-    def _remove_tag(self, name: str) -> None:
-        """删掉一颗 chip —— 只影响当前这条记录，绝不动 tags.json。"""
-        button = self._tag_buttons.pop(name, None)
-        if button is None:
-            return
-        button.destroy()
-        # _tags 保留顺序语义，删中间那颗时后面的自动前移，不影响其余相对顺序。
-        if name in self._tags:
-            self._tags.remove(name)
-        self._schedule_relayout()
-
-    def _schedule_relayout(self) -> None:
-        """把重排推到 idle：刚建出来的 chip 还没量过宽度，立刻排会按 1px 算错行数。"""
-        # 有 chip 就必须可见；0 颗时由 _relayout_tags 再 grid_remove 回去（两处成对）。
-        self.chips_frame.grid()
-        self.after_idle(self._relayout_tags)
-
-    def _on_chips_configure(self, event: tk.Event) -> None:
-        """容器宽度变了才重排；宽度闸门用来掐断「重排 → Configure → 再重排」的自激。"""
-        if event.width == self._chips_width:
-            return
-        self._chips_width = event.width
-        self._relayout_tags()
-
-    def _relayout_tags(self) -> None:
-        """按容器当前宽度给 chip 做流式换行（需求 3.14.3：行数变化由卡片高度承接）。"""
-        if not self._tag_buttons:
-            # 0 标签时整行收起：否则输入框下面会挂着一条高度 4px 外加内边距的空行。
-            self.chips_frame.grid_remove()
-            return
-        width = self._chips_available_width()
-        column = 0
-        row = 0
-        used = 0
-        for tag in self._tags:
-            button = self._tag_buttons.get(tag)
-            if button is None:
-                continue
-            need = button.winfo_reqwidth() + _CHIP_GAP_X
-            # 已经放过至少一颗、再放这颗就会超宽时才换行（保证一行永远至少有一颗，
-            # 窗口窄到装不下最长的 chip 时也不会排出空行）。
-            # width=0 表示还没量出可用宽度，此时一律不换行，等 <Configure> 再排。
-            if column and width and used + need > width:
-                row += 1
-                column = 0
-                used = 0
-            button.grid(
-                row=row,
-                column=column,
-                padx=(0, _CHIP_GAP_X),
-                pady=(0, _CHIP_GAP_Y),
-                sticky="w",
-            )
-            used += need
-            column += 1
-
-    def _chips_available_width(self) -> int:
-        """chips 容器的可用宽度（逻辑像素）；量不出来时返回 0，含义是「先别换行」。"""
-        # 先问 chips_frame 自己：控件未映射时 Tk 一律返回 1，所以用 >1 当「已量出」判据。
-        for widget in (self.chips_frame, self.tags_frame):
-            width = widget.winfo_width()
-            if width > 1:
-                return width
-        return 0
-
     def get_tags(self) -> tuple[str, ...]:
-        """当前 chips 表示的标签集合（不含输入框里还没提交的文字）。"""
-        return tuple(self._tags)
+        """转发读取 chips，保留新增区既有调用入口。"""
+        return self.tag_chips.get_tags()
 
     def collect_tags(self) -> tuple[str, ...]:
-        """提交用的标签集合：先把输入框里残留的文字冲刷成 chip，再整体返回。"""
-        # 打完字直接点「添加」是最常见的漏提交路径：不冲刷的话，屏幕上明明看得见那个词、
-        # 存进去却没有它。返回 tuple 而不是 list，与 store.add / update 的形参口径一致。
-        self._commit_tag_input()
-        return tuple(self._tags)
+        """转发收集操作，提交前仍会冲刷输入框残留。"""
+        return self.tag_chips.collect_tags()
 
     def clear_tags(self) -> None:
-        """清空 chips 与输入框（新增成功后复位，避免把上一条的标签带到下一条）。"""
-        for button in self._tag_buttons.values():
-            button.destroy()
-        self._tag_buttons.clear()
-        self._tags.clear()
-        self.tag_input_var.set("")
-        # 直接同步重排（不排进 idle）：这里只是把 chips 收起来，没有「刚建出来还没量宽度」
-        # 的问题，立即 grid_remove 能避免复位后闪一下空行。
-        self._relayout_tags()
-
-    def _pick_tags(self) -> None:
-        """打开标签选择器；只有点「完成」才提交本次选择和输入框残留文字。"""
-        # 候选在「点击 ▼ 的这一刻」由弹窗现算，不由本层缓存：弹窗里保存/删除完不需要
-        # 回头改任何控件状态，也就少一个「忘了刷新」的 bug。
-        # 以 tag_entry 为 anchor：弹窗宽度与它等宽、左边缘与它对齐。
-        # toggle_button 传自己这个 ▼：弹窗开着时再点它一次表示关闭列表（返回 None），
-        # 而不是被「点外面」逻辑抢先关掉。
-        picked = ask_tags(
-            self.winfo_toplevel(),
-            self.tag_entry,
-            self.tag_input_var.get(),
-            toggle_button=self.tag_button,
-            selected_tags=self.get_tags(),
-        )
-        # 取消必须完整回滚：弹窗只拿当前 chips 的快照，输入框与原 chips 都不被改动。
-        if picked is None:
-            return
-        # 完成时才把未按回车的输入合并；先放弹窗选项，再追加输入框新项，稳定保留顺序。
-        typed = split_tag_input(self.tag_input_var.get())
-        final = tuple(dict.fromkeys((*picked, *typed)))
-        # 先清空旧控件状态再整批重建，批量 helper 只安排一次 after_idle 重排。
-        self.clear_tags()
-        self._add_tags(final)
+        """转发清空操作，新增记录成功后复位所有标签状态。"""
+        self.tag_chips.clear_tags()
 
 
 class ToolbarFrame(ctk.CTkFrame):
