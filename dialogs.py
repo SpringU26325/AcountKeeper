@@ -13,11 +13,8 @@ import customtkinter as ctk
 # 同名的 ask_month 包装函数互相覆盖（后者会遮蔽前者的名字）。
 from calendar_picker import ask_date, ask_month as picker_ask_month
 from config import RESOURCE_DIR
-from tag_picker import ask_tags
-# 输入的标签串按顿号拆分、清理的规则与新增区、偏好层共用一份实现
-# （tag_prefs.split_tag_input），本模块不再自己写一遍（#58 Step 3a）。
-import tag_prefs
 from store import Account
+from widgets import TagChipsFrame
 
 
 def _apply_logo_icon(window: tk.Misc) -> None:
@@ -90,9 +87,6 @@ def ask_edit_record(
     date_var = tk.StringVar(value=record.record_date)
     # 金额统一显示为两位小数，与表格中的显示格式保持一致。
     amount_var = tk.StringVar(value=f"{record.amount:.2f}")
-    # #58 Step 2c-2：标签已改为多值，编辑框仍只提供一个单行输入框（候选弹窗负责多选），
-    # 预填时把多个标签用「、」拼起来 —— 与表格单元格显示逐字符相同，用户看到什么就改什么。
-    category_var = tk.StringVar(value="、".join(record.tags))
     note_var = tk.StringVar(value=record.note)
 
     content = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -104,10 +98,41 @@ def ask_edit_record(
         text_color="#243447",
     ).pack(anchor="w")
 
-    fields = (
+    resize_idle: list[str | None] = [None]
+
+    def _resize_dialog() -> None:
+        """按字段实际需求更新弹窗高度，保留原有 360px 高度作为下限。"""
+        resize_idle[0] = None
+        if not dialog.winfo_exists():
+            return
+        # after_idle 后布局尺寸已稳定；content 外侧上下各有 20px 留白。
+        requested_height = content.winfo_reqheight() + 40
+        height = max(360, requested_height)
+        dialog.geometry(f"460x{height}")
+
+    def _schedule_dialog_resize() -> None:
+        """合并同一轮 chips 行数变化，避免连续配置窗口几何。"""
+        if resize_idle[0] is None:
+            resize_idle[0] = dialog.after_idle(_resize_dialog)
+
+    def _cancel_pending_resize(event: tk.Event) -> None:
+        """弹窗销毁时撤销 idle 回调，避免它访问已销毁的窗口。"""
+        if event.widget is not dialog or resize_idle[0] is None:
+            return
+        try:
+            dialog.after_cancel(resize_idle[0])
+        except tk.TclError:
+            pass
+        resize_idle[0] = None
+
+    dialog.bind("<Destroy>", _cancel_pending_resize, add="+")
+    tag_chips = TagChipsFrame(content, on_layout_change=_schedule_dialog_resize)
+    tag_chips.set_tags(record.tags)
+
+    fields: tuple[tuple[str, tk.StringVar | TagChipsFrame], ...] = (
         ("日期", date_var),
         ("金额", amount_var),
-        ("类别", category_var),
+        ("标签", tag_chips),
         ("备注", note_var),
     )
 
@@ -128,16 +153,20 @@ def ask_edit_record(
             date_var.set(picked)
 
     # 按顺序收集输入框，用于最后把焦点落到第一个字段上。
-    # 四个字段现在都是 CTkEntry（类别字段在需求 3.13 的改版里从 CTkComboBox 换回了输入框，
-    # 那个 ▼ 按钮不进这个列表），所以 entries[0].focus_set() 一定落在日期框上。
+    # 只有日期、金额、备注是 CTkEntry；标签 chips 不进列表，首项仍是日期框。
     entries: list[ctk.CTkEntry] = []
-    for label, variable in fields:
+    for label, value in fields:
         ctk.CTkLabel(
             content,
             text=label,
             font=dialog_font,
             text_color="#455A64",
         ).pack(anchor="w", pady=(10, 3))
+
+        # chips 不是 StringVar，也不是单行输入框；按具体控件类型分流后直接占满字段行。
+        if isinstance(value, TagChipsFrame):
+            value.pack(fill="x")
+            continue
 
         # 日期行采用「输入框 + ▼」组合：两者放进同一个横向容器，
         # 这样 ▼ 始终贴在输入框右侧，且行高与其它字段完全一致（分开 pack 会多占一行）。
@@ -146,7 +175,7 @@ def ask_edit_record(
             date_row.pack(fill="x")
             entry = ctk.CTkEntry(
                 date_row,
-                textvariable=variable,
+                textvariable=value,
                 font=dialog_font,
                 height=34,
                 corner_radius=9,
@@ -176,79 +205,10 @@ def ask_edit_record(
             entries.append(entry)
             continue
 
-        # 类别字段（需求 3.13）：与新增记录输入区用同一套「输入框 + ▼」组合，
-        # 既能点 ▼ 从预置/历史候选里挑，也能直接手输改成新写法。
-        # （上一版用的是 CTkComboBox，箭头样式与日期那个 ▼ 不统一，
-        # 且它的原生下拉菜单压不住位置，原因详见 tag_picker.py 的模块注释。）
-        if label == "类别":
-            category_row = ctk.CTkFrame(content, fg_color="transparent")
-            category_row.pack(fill="x")
-            entry = ctk.CTkEntry(
-                category_row,
-                textvariable=variable,
-                font=dialog_font,
-                height=34,
-                corner_radius=9,
-                border_width=1,
-                border_color="#C6D4DF",
-                fg_color="#FFFFFF",
-            )
-
-            # ▼ 按钮改在闭包之前建：闭包要拿到它的引用（见下面 toggle=），
-            # 而 command 得等闭包定义好才能接上，于是先建控件、后 configure。
-            # 留引用是给 tag_picker 用的：它的「点弹窗外面就关」监视器必须把
-            # 本按钮排除掉，否则按下时先关掉列表、紧接着 command 又把它打开，
-            # 表现出来就是「点 ▼ 关不上」。
-            category_button = ctk.CTkButton(
-                category_row,
-                text="▼",
-                width=36,
-                height=34,
-                corner_radius=9,
-                fg_color="#E3EAF2",
-                hover_color="#D2DEE9",
-                text_color="#243447",
-                font=("Microsoft YaHei UI", 11),
-            )
-
-            # 参数必须用「默认参数」把 entry / variable 当场绑死，不能直接引用外层名字：
-            # 这两个名字在同一个 for 循环里会被后一轮（备注字段）重新赋值，
-            # 闭包晚绑定拿到的就是备注框——实测类别列表会锚到备注框上，
-            # 位置整体下移 92px、宽度多出 52px，而且选中项会被写进备注。
-            def _pick_category(
-                target: ctk.CTkEntry = entry,
-                var: ctk.StringVar = variable,
-                toggle: ctk.CTkButton = category_button,
-            ) -> None:
-                """打开类别选择器，把选中的类别回填到输入框（需求 3.13）。"""
-                # 锚点用输入框而不是 category_row：弹窗宽度与输入框等宽、左边缘与输入框对齐。
-                # toggle 传给弹窗：再点一次这个 ▼ 表示关闭列表（返回 None），输入框原值不动。
-                picked = ask_tags(
-                    dialog, target, var.get(),
-                    toggle_button=toggle,
-                    selected_tags=tuple(tag_prefs.split_tag_input(var.get())),
-                )
-                # 返回 None 表示用户取消/按 ESC/再点一次 ▼，此时保持输入框原值不变。
-                if picked is not None:
-                    # 过渡适配，编辑器 chips 化后删除：旧单行框暂用顿号显示多选结果。
-                    var.set("、".join(picked))
-                # 这里不用再补 grab_set：编辑弹窗原来握着的 grab 是 tag_picker
-                # 主动借走、关闭时原样还回来的（见 tag_picker._cleanup）。
-                # 自己再抢一次纯属重复，还会掩盖借还逻辑真实是否成对的问题。
-
-            category_button.configure(command=_pick_category)
-
-            # 与日期行同一套写法：按钮先 pack 且 side="right" 钉在右端（36x34），
-            # 输入框再 pack 且 expand=True 占满剩余宽度，两者高度齐平。
-            category_button.pack(side="right", padx=(6, 0))
-            entry.pack(side="left", fill="x", expand=True)
-            entries.append(entry)
-            continue
-
         # 这里的输入框不需要 placeholder_text，因此可以放心使用 textvariable 双向绑定。
         entry = ctk.CTkEntry(
             content,
-            textvariable=variable,
+            textvariable=value,
             font=dialog_font,
             height=34,
             corner_radius=9,
@@ -292,15 +252,12 @@ def ask_edit_record(
             error_var.set("日期格式应为 YYYY-MM-DD，金额必须是数字。")
             return
         # #58 Step 3a：标签改为多值，而且 0 个标签是合法的（§3.14.4 需答 Q2），
-        # 所以「类别非空」这条校验连同提示里的那半句一起删除；留下的
+        # 所以「标签非空」这条校验连同提示里的那半句一起删除；留下的
         # 「金额不能为 0」是数据层也认的业务约束。
         if parsed_amount == 0:
             error_var.set("金额不能为 0；正数表示收入，负数表示支出。")
             return
-        # 输入框里的一行文字按顿号拆成标签元组：与表格单元格、CSV 的展示口径同源
-        # （§3.14.4），所以「餐饮、交通」这种写法在这里天然就是两个标签；
-        # 拆分含 strip / 去空 / 首次出现去重，规则与偏好层共用一份实现。
-        parsed_tags = tag_prefs.split_tag_input(category_var.get())
+        parsed_tags = tag_chips.collect_tags()
         # 金额保持用户填写的正负号，因此编辑时可直接切换收入/支出属性。
         result[0] = (
             parsed_date.isoformat(),

@@ -195,6 +195,12 @@ class TagChipsFrame(ctk.CTkFrame):
         self.tag_input_var.set("")
         self._relayout_tags()
 
+    def set_tags(self, tags: tuple[str, ...]) -> None:
+        """用给定标签整体替换 chips，供编辑弹窗按记录值初始化。"""
+        self.clear_tags()
+        # 复用批量添加的去重、布局调度，确保初始化与用户输入遵循同一规则。
+        self._add_tags(tags)
+
     def _pick_tags(self) -> None:
         """仅在 picker 返回完成结果时合并所选标签与输入框残留。"""
         picked = globals()["ask_tags"](

@@ -1,8 +1,8 @@
-"""类别选择弹窗（需求 3.13）。
+"""标签选择弹窗（需求 3.13）。
 
 对外只暴露 ask_tags()：给「添加记录」输入区和「编辑记录」弹窗的标签字段
-提供一个可点击的候选列表，降低手打类别的成本，也避免同一个开销被记成
-「餐饮 / 吃饭 / 午饭」多种写法，让 3.4 统计和 3.10 图表里的类别维度能真正聚合。
+提供一个可点击的候选列表，降低手打标签的成本，也避免同一个开销被记成
+「餐饮 / 吃饭 / 午饭」多种写法，让 3.4 统计和 3.10 图表里的标签维度能真正聚合。
 
 实现上刻意不用 CTkComboBox（上一版的做法），原因有两个：
 
@@ -15,7 +15,7 @@
    更麻烦的是 post() 之后窗口尚未映射，此时查询 winfo_rootx()/winfo_width()
    只会拿到 0/1（实测 viewable=0），代码里根本没有可校正的时机。
 
-本模块改用 CTkToplevel 自己画一列类别项：位置、宽度、配色全部由我们控制，
+本模块改用 CTkToplevel 自己画一列标签项：位置、宽度、配色全部由我们控制，
 既不经过 Tk 原生菜单，也就不需要去改 CustomTkinter 的下拉实现。
 布局与提交流程对齐 calendar_picker.py，保证两个弹窗看起来是一家人。
 
@@ -26,13 +26,13 @@
 （点「添加」就真的会添一条记录）。这一点无法两全，只能选 toggle。
 
 弹窗底部是一条操作区（footer，见下方 _FOOTER_* 常量与「底部操作区」那一段）：
-第一行是「新类别输入框 + 「+ 保存」按钮」，第二行是一行提示语；列表里每一项右侧
+第一行是「新标签输入框 + 「+ 保存」按钮」，第二行是一行提示语；列表里每一项右侧
 有「顶」和「×」两个按钮：「顶」把该标签移到候选列表最前（tag_prefs.move_tag_to_top），
 「×」把它从候选里**真删掉**（tag_prefs.delete_tag）。
 这些动作全部交给 tag_prefs 落盘，本模块只负责「改完之后把列表重画一遍」
 （_render_list）。
 
-footer 里那个输入框是**弹窗自己的**，不绑主窗口的 category_var：存什么完全以它
+footer 里那个输入框是**弹窗自己的**，不绑主窗口的 tag_input_var：存什么完全以它
 里面的文字为准，主窗口输入框只在「点选了某一项」时通过返回值回流一次。
 """
 
@@ -58,12 +58,12 @@ _SUBTLE_HOVER_COLOR = "#D2DEE9"
 _SCROLLBAR_COLOR = "#C6D4DF"
 _SCROLLBAR_HOVER_COLOR = "#90A4AE"
 
-# 单个类别项的高度，以及列表最多露出几项（超出的部分靠滚动条看）。
+# 单个标签项的高度，以及列表最多露出几项（超出的部分靠滚动条看）。
 _ITEM_HEIGHT = 32
 _MAX_VISIBLE_ITEMS = 7
 
 # ---------- 底部操作区（footer） ----------
-# 结构：第一行 = 新类别输入框 + 「+ 保存」按钮；第二行 = 一行提示语。
+# 结构：第一行 = 新标签输入框 + 「+ 保存」按钮；第二行 = 一行提示语。
 # 高度拆成常量是为了让「弹窗总高度」能一条式子算出来：
 #   50 = 28（输入框/按钮行）+ 4（行距）+ 18（一行提示语）
 _FOOTER_GAP = 6  # 列表与 footer 之间的竖向缝隙
@@ -76,10 +76,10 @@ _FOOTER_HEIGHT = _BUTTON_ROW_HEIGHT + 4 + _HINT_ROW_HEIGHT
 
 # 提示语只留一句，说明「footer 这个输入框怎么用」。必须点明「要在这里输入」：
 # 弹窗自带输入框之后，在主窗口那个框里打字并不会进候选，沿用旧文案
-# 「可直接输入新类别名」会让人以为自己打的字已经被收下了。
+# 「可直接输入新标签名」会让人以为自己打的字已经被收下了。
 # 「×」不再另做图例：它是各 App 里删掉一项的通用符号，不需要解释；而弹窗最窄时
 # （锚点 180px）一行里也塞不下第二句。
-_HINT_LINE_1 = "输入新类别后点 + 保存"
+_HINT_LINE_1 = "输入新标签后点 + 保存"
 _HINT_COLOR = "#90A4AE"
 _ERROR_COLOR = "#D64545"  # 写盘失败时把提示语染成警示色
 
@@ -92,7 +92,7 @@ _ACTION_REMOVE_TEXT = "×"
 # （实测 glyph 0x0251，不靠字体回退），但箭头太容易读成「上移一位」这个相邻操作，
 # 而「顶」是常用汉字、YaHei UI 必然收录（实测 glyph 0x0bbd），单字宽 20 逻辑像素
 # （字号 12），28px 的按钮装得下，语义也比箭头直白。
-# 用两个字「置顶」则实测要 40px，按钮得加宽到 44px，会挤掉类别名的位置，不用。
+# 用两个字「置顶」则实测要 40px，按钮得加宽到 44px，会挤掉标签名的位置，不用。
 _ACTION_PIN_TEXT = "顶"
 _SAVE_TEXT = "+ 保存"
 
@@ -123,7 +123,7 @@ _POLL_INTERVAL_MS = 50  # 复查锚点位置的轮询间隔（Windows 下窗口�
 
 @dataclass
 class _ActivePicker:
-    """当前打开的类别弹窗（同一时刻只允许一个，见下方 _active_picker）。"""
+    """当前打开的标签弹窗（同一时刻只允许一个，见下方 _active_picker）。"""
 
     dialog: ctk.CTkToplevel
     anchor: tk.Misc  # 锚点输入框：用来判断用户是不是又点了同一个 ▼
@@ -157,7 +157,7 @@ def _apply_logo_icon(window: tk.Misc) -> None:
         if icon_path.exists():
             window.iconbitmap(str(icon_path))
     except Exception:
-        # 图标只是装饰，缺失或平台不支持时静默忽略，绝不能因此让类别列表打不开。
+        # 图标只是装饰，缺失或平台不支持时静默忽略，绝不能因此让标签列表打不开。
         pass
 
 
@@ -194,7 +194,7 @@ def _is_inside(widget: tk.Misc, ancestor: tk.Misc) -> bool:
 
 
 def _register_picker(item: _ActivePicker) -> None:
-    """登记「当前打开的类别弹窗」。"""
+    """登记「当前打开的标签弹窗」。"""
     global _active_picker
     _active_picker = item
 
@@ -285,7 +285,7 @@ def ask_tags(
 
     Args:
         parent: 父窗口，弹窗以 transient 方式挂在它上面（主窗口或编辑记录弹窗）。
-        anchor: 锚点控件（类别输入框）：弹窗左边缘与它左边缘对齐、宽度与它相同、
+        anchor: 锚点控件（标签输入框）：弹窗左边缘与它左边缘对齐、宽度与它相同、
             上边缘贴在它下边缘再往下 _GAP_ABOVE 像素。
         current: 尚未提交的输入文本，只用于预填 footer 的输入框。
         toggle_button: 调用方那个 ▼ 按钮。点它属于「再点一次关闭」而不是「点外面」，
@@ -297,7 +297,7 @@ def ask_tags(
     Returns:
         点「完成」时返回选中顺序对应的标签元组；用户取消时返回 None。
     """
-    # 【toggle / 防叠加】先处理「已经有一个类别弹窗开着」的情况，必须早于建窗：
+    # 【toggle / 防叠加】先处理「已经有一个标签弹窗开着」的情况，必须早于建窗：
     # 弹窗的 wait_window 是嵌套事件循环，上一次调用还停在那一行没返回，
     # 但它的窗口是活的，只能由这新一次调用负责关掉。
     #   - 同一个锚点（用户又点了一次同一个 ▼）：关掉旧的，直接返回 None。
@@ -328,7 +328,7 @@ def ask_tags(
             previous_grab = None
 
     dialog = ctk.CTkToplevel(parent)
-    dialog.title("选择类别")
+    dialog.title("选择标签")
     # 【Step 2.1】改用 tk.Wm.resizable 绕开 CTkToplevel.resizable 的覆写：后者在 Windows 上
     # 会额外安排一次 after(10, _windows_set_titlebar_color)，实测白耗 sync 12.5ms / visible 34.8ms。
     # 代价可忽略：_last_resizable_args 只是被写入、CTk 内部无读取点，而本弹窗尺寸由 _resize_dialog 自算。
@@ -471,7 +471,7 @@ def ask_tags(
         # 撤销「当前弹窗」登记：不清的话下一次 ask_tags 会对一个已销毁的弹窗
         # 调 close()，toggle 判断也跟着错乱。
         _clear_picker(dialog)
-        # 把开头借走的 grab 还回调用方（编辑记录弹窗的模态性不能因为开了个类别列表
+        # 把开头借走的 grab 还回调用方（编辑记录弹窗的模态性不能因为开了个标签列表
         # 就永久丢掉）。调用方可能已被连带销毁，所以要先判断窗口还在不在。
         if previous_grab is not None:
             try:
@@ -639,17 +639,17 @@ def ask_tags(
         """把 footer 输入框里的标签名存进候选列表。
 
         值只从 save_entry 里取，**不再回头看主窗口的输入框**：那一个是「这条记录用
-        什么类别」，这一个才是「要把哪个写法存进候选」。把两件事并到一个框里，用户
+        什么标签」，这一个才是「要把哪个写法存进候选」。把两件事并到一个框里，用户
         就会以为在主窗口打了字等于已经存进候选了——这正是需求要改掉的那点绕。
 
         成功时一声不吭：列表里当场多出一项就是最直接的反馈，再弹一句「保存成功」
         反而要多点一次才能继续。失败必须说清楚——静默失败会让用户以为已经存好了，
-        下次点 ▼ 才发现类别不见了，那时已经无从追查。
+            下次点 ▼ 才发现标签不见了，那时已经无从追查。
         """
         # save_entry 建在这几个函数的下面，这里是「调用时才取值」，所以顺序没问题。
         name = save_entry.get().strip()
         if not name:
-            _set_hint("先在上面的输入框里写下类别名，再点 + 保存", error=True)
+            _set_hint("先在上面的输入框里写下标签名，再点 + 保存", error=True)
             return
         if save_tag(name):
             # 存下之后清空输入框，拿「框空了」当一次「已经收下了」的反馈：
@@ -664,21 +664,21 @@ def ask_tags(
         else:
             # 失败时保留框里的内容：用户多半想照着这个名字重试，或者去手工检查文件，
             # 清空等于逼他重新打一遍。
-            _set_hint(f"保存失败：{name} 没能写入类别文件", error=True)
+            _set_hint(f"保存失败：{name} 没能写入标签文件", error=True)
 
-    def _delete_category(name: str) -> None:
+    def _delete_tag(name: str) -> None:
         """把某一项从候选里真删掉（列表里当场消失，下次不会再出现）。
 
         没有二次确认：弹窗里不能用 messagebox（它是另一个顶层窗口，会被「点弹窗外
         就关闭」的监视器当成外部点击，反而先把列表关掉），而需求要的就是「删掉就是
-        真的没了」这条直白语义；想找回来只能重新用「+ 保存」输入同名类别。
+        真的没了」这条直白语义；想找回来只能重新用「+ 保存」输入同名标签。
 
         列表只做**局部**更新，不再整表重画：删掉一行对其余行没有任何影响，而整表
         重画要销毁并重建全部行控件（实测约 6.2ms/行，20 项时要 137ms），其中绝大
         部分行的内容根本没变，属于白烧。
         """
         if not delete_tag(name):
-            _set_hint(f"删除失败：{name} 没能写入类别文件", error=True)
+            _set_hint(f"删除失败：{name} 没能写入标签文件", error=True)
             return
         # 候选从标签池删除后不能再被「完成」回填，即使它之前已在本次临时选择中。
         if name in selected_set:
@@ -704,7 +704,7 @@ def ask_tags(
             # 行已经被连带销毁（父窗口关掉时整棵控件树一起没），忽略即可。
             pass
         if not _row_refs:
-            # 删到一项不剩：走整表重画，把「暂无类别」那句占位提示画出来。
+            # 删到一项不剩：走整表重画，把「暂无标签」那句占位提示画出来。
             _render_list()
             return
         if was_first:
@@ -719,10 +719,10 @@ def ask_tags(
         # 此时动视口只会让人失去参照。
         _resize_dialog(len(_row_refs))
 
-    def _pin_category(name: str) -> None:
+    def _pin_tag(name: str) -> None:
         """把某一项移到列表最前（用户点该行右侧的「顶」）。
 
-        与 _delete_category 同构：落盘成功就原地更新列表、失败才报告。置顶**不关弹窗、
+        与 _delete_tag 同构：落盘成功就原地更新列表、失败才报告。置顶**不关弹窗、
         也不回填输入框**——用户的意图是「把常用项挪上去」，不是「选中它」。
 
         没有变化时（名字不在列表里、或本来就在第一位）move_tag_to_top 同样返回 True 但
@@ -733,9 +733,9 @@ def ask_tags(
         这一点与删除不同——删除会改变行数，行数一变高度算式与 scrollregion 都得重算。
         """
         if not move_tag_to_top(name):
-            _set_hint(f"置顶失败：{name} 没能写入类别文件", error=True)
+            _set_hint(f"置顶失败：{name} 没能写入标签文件", error=True)
             return
-        # 同 _delete_category：成功要把上一条失败报错抹掉（原靠 _render_list 顺带复位）。
+        # 同 _delete_tag：成功要把上一条失败报错抹掉（原靠 _render_list 顺带复位）。
         _set_hint(_HINT_LINE_1)
         if _row_refs and _row_refs[0][0] == name:
             # 本来就在第一位：数据没变、顺序没变，一个控件都不必动。
@@ -804,7 +804,7 @@ def ask_tags(
         dialog.geometry(f"{logical_width}x{logical_height}")
 
     # ---------- 底部操作区 ----------
-    # 结构：第一行 = 新类别输入框 + 「+ 保存」按钮；第二行 = 一行提示语。
+    # 结构：第一行 = 新标签输入框 + 「+ 保存」按钮；第二行 = 一行提示语。
     #
     # footer 抢先 pack、list_frame 随后 pack，这个顺序是**故意**的，也是本区唯一的
     # 职责：pack 在空间不够时压缩的是「最后 pack 的那个」，而 expand=True 只负责
@@ -906,7 +906,7 @@ def ask_tags(
         只有列表的**第一行**该是灰的（它已经在最上面了）。置顶与删除都会让「谁是
         第一行」换人，所以这个状态必须双向同步：要么「旧首行解禁 + 新首行禁用」，
         要么反过来；只做一半就会出现两个灰按钮或两个可点按钮。
-        两条调用路径：_build_row（首次画行时定初值）、_pin_category / _delete_category
+        两条调用路径：_build_row（首次画行时定初值）、_pin_tag / _delete_tag
         （首行换人时改）。
 
         text_color_disabled 必须显式给值——不传时 CustomTkinter 用的是主题里的
@@ -929,11 +929,11 @@ def ask_tags(
     def _render_list() -> None:
         """按当前候选整表重画列表，并把弹窗高度改到位。
 
-        只有「首次打开」和「保存新类别」还会走到这里：这两件事都会**改变行数**
+        只有「首次打开」和「保存新标签」还会走到这里：这两件事都会**改变行数**
         （保存多一项；打开时列表还是空的），而行数一变，高度算式、scrollregion、
         以及「哪一行是第一行」就全得重算，老老实实重画一遍最省心也不容易错。
 
-        删除与置顶不再走这里——它们各自在 _delete_category / _pin_category 里做局部
+        删除与置顶不再走这里——它们各自在 _delete_tag / _pin_tag 里做局部
         更新。第一版是所有动作都调本函数，实测代价 6.2ms/行（20 项时 137ms），其中
         绝大部分行的内容根本没变，属于白烧。剩下的调用点都是低频动作（保存需要
         用户先打字再点按钮），重画那十几个小控件的代价可以接受。
@@ -960,7 +960,7 @@ def ask_tags(
             # 删到一个不剩时走的就是这一支，怎么再添回来由下面那行提示语负责解释。
             ctk.CTkLabel(
                 list_frame,
-                text="暂无类别",
+                text="暂无标签",
                 font=dialog_font,
                 text_color=_TEXT_COLOR,
             ).pack(pady=12)
@@ -971,7 +971,7 @@ def ask_tags(
         _resize_dialog(len(rows))
 
     def _build_row(name: str, first: bool = False) -> tuple[tk.Misc, tk.Misc]:
-        """画一行类别：透明容器 + 名字按钮（左，撑满）+「顶」+「×」（右）。
+        """画一行标签：透明容器 + 名字按钮（左，撑满）+「顶」+「×」（右）。
 
         高亮只画在名字按钮上、容器保持透明，否则整行（连同右边两个按钮）会一起变蓝，
         看起来像「连删除按钮也一起被选中了」。
@@ -984,7 +984,7 @@ def ask_tags(
 
         Returns:
             (行容器, 「顶」按钮)：_render_list 会把它们连同名字一起记进 _row_refs，
-            供 _pin_category / _delete_category 做局部更新时**找到要动的那个控件**。
+            供 _pin_tag / _delete_tag 做局部更新时**找到要动的那个控件**。
             返回值刻意不含「×」按钮也不含名字按钮：删除整个行都销毁、置顶只需重排 +
             改「顶」的状态，两者都用不到它们。
         """
@@ -1006,7 +1006,7 @@ def ask_tags(
             row,
             text=_ACTION_REMOVE_TEXT,
             # 默认参数绑定 name：闭包直接引用外层变量的话，所有行都会作用到最后一项。
-            command=lambda picked=name: _delete_category(picked),
+            command=lambda picked=name: _delete_tag(picked),
             width=_ACTION_BUTTON_WIDTH,
             height=_ITEM_HEIGHT - 4,
             corner_radius=6,
@@ -1020,7 +1020,7 @@ def ask_tags(
             row,
             text=_ACTION_PIN_TEXT,
             # 同上：默认参数绑定 name，否则每一行都会去置顶最后一项。
-            command=lambda picked=name: _pin_category(picked),
+            command=lambda picked=name: _pin_tag(picked),
             width=_ACTION_BUTTON_WIDTH,
             height=_ITEM_HEIGHT - 4,
             corner_radius=6,
@@ -1047,7 +1047,7 @@ def ask_tags(
             # 行一宽就横向溢出到视口之外、右侧的动作按钮会被整块裁掉。旧口径下这个
             # 临界宽度约 228 逻辑像素，已经高过主窗口的常见布局，所以从没被撞见；
             # 本次加「顶」多占一个按钮，把临界宽度从约 228 压到约 211 逻辑像素，而
-            # 主窗口 minsize(820, 560) 时类别框约 200 → 弹窗约 220，**正好落进这个
+            # 主窗口 minsize(820, 560) 时标签框约 200 → 弹窗约 220，**正好落进这个
             # 区间**，于是真实场景下「×」和「顶」会一起消失。所以这里不是在配合新
             # 功能，是在修一个早就埋好的坑——排查时若发现它「跟着置顶一起出现」，
             # 别误判成置顶引入的回归，也别为了简化把它删掉。
@@ -1089,7 +1089,7 @@ def ask_tags(
             # 下次布局一变动就会回调到这里，不挡掉会直接抛 bad window path name。
             return
         # 光守 dialog 不够，必须连锚点一起守：锚点所在的父窗口被销毁时（典型路径见
-        # _cleanup 注释里那条——编辑记录弹窗开着且类别列表已经弹出，用户直接点它右上角 ×），
+        # _cleanup 注释里那条——编辑记录弹窗开着且标签列表已经弹出，用户直接点它右上角 ×），
         # 作为子控件的锚点会**先于**弹窗被销毁，而本回调同时还挂在锚点所在顶层窗口的
         # <Configure> 上，紧接着的一次布局变动就会带一个死的窗口路径找上来，
         # 在下面的 anchor.winfo_width() 抛 TclError: bad window path name（实测 traceback

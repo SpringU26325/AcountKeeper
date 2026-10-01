@@ -10,7 +10,7 @@
 开窗、摆位、模态、收尾这一整套骨架完全共用（见 _begin_session / _finish_session），
 所以不存在「两份必须长期同步的实现」。
 
-定位方式与「类别」弹窗保持一致：贴着输入框的左下角弹出，下方空间不够时
+定位方式与「标签」弹窗保持一致：贴着输入框的左下角弹出，下方空间不够时
 翻到上方。调用方通过 anchor 把输入框交进来；不传（或输入框已经不存在）时退回
 屏幕居中，见 _anchor_to_input。
 
@@ -40,9 +40,9 @@ _DIALOG_HEIGHT_MONTH = 300
 # 模式 → 逻辑高度。集中成一张表，将来再加模式只需在这里补一项。
 _DIALOG_HEIGHT_BY_MODE = {"date": _DIALOG_HEIGHT_DATE, "month": _DIALOG_HEIGHT_MONTH}
 
-# 贴输入框弹出的两个几何常量。取值与 category_picker 的 _GAP_ABOVE / _SCREEN_MARGIN
+# 贴输入框弹出的两个几何常量。取值与 tag_picker 的 _GAP_ABOVE / _SCREEN_MARGIN
 # 严格一致：两个 ▼ 的弹窗相邻出现时，缝隙与贴边距离看起来才是同一套规则。
-# 刻意不 import category_picker 的同名常量——category_picker 反过来不依赖本模块，
+# 刻意不 import tag_picker 的同名常量——tag_picker 反过来不依赖本模块，
 # 但为两个整数建一条交叉依赖不划算，宁可各自留一份并在这里注明同源。
 _GAP_ABOVE = 6  # 弹窗与输入框之间的竖向缝隙（物理像素）
 _SCREEN_MARGIN = 8  # 贴边保护，避免弹窗压在屏幕边缘上（物理像素）
@@ -134,20 +134,20 @@ def _anchor_to_input(
 ) -> None:
     """把弹窗贴到 anchor（日期输入框）的左下角，下方放不下时翻到它上方。
 
-    算式逐条照抄 category_picker._reanchor（横向钳制、竖向翻转、同一组常量），
+    算式逐条照抄 tag_picker._reanchor（横向钳制、竖向翻转、同一组常量），
     两个 ▼ 的行为才会一致。四处刻意偏离它，都是「日历不是下拉列表」带来的：
 
-    1. **宽度不跟 anchor**。category_picker 是列表、宽度与输入框等宽；日历是 7 列
+    1. **宽度不跟 anchor**。tag_picker 是列表、宽度与输入框等宽；日历是 7 列
        日期网格，宽度是内容决定的（_DIALOG_WIDTH），跟输入框走会被压窄、日期列
        挤成一团。所以这里只借 anchor 的**位置**，不借它的宽度。
-    2. **不挂 anchor 的 <Configure>、也不挂 50ms 轮询**。category_picker 需要它们，
+    2. **不挂 anchor 的 <Configure>、也不挂 50ms 轮询**。tag_picker 需要它们，
        是因为它的列表可能在编辑弹窗**还没完成布局**时就弹出来了（它自己的注释里
        记着实测旧宽偏 52px、旧 y 偏 92px）。日历没有这个问题：用户必须先在屏幕上
        点中 ▼ 按钮，而按钮能被点中就意味着 anchor 早已布局完毕，读数可信。
     3. **恰恰因为不挂 anchor 的事件**，用户把日历拖走后不会有任何回调把它拽回来——
        这是需要的：日历是模态窗（grab_set），用户很可能想把它挪开去看主窗口里的
-       数字。category_picker 是不可拖动的下拉列表，没有这个诉求，两者该有差异。
-    4. **anchor 读不出有效高度时退回屏幕居中**，而不是像 category_picker 那样直接
+    数字。tag_picker 是不可拖动的下拉列表，没有这个诉求，两者该有差异。
+    4. **anchor 读不出有效高度时退回屏幕居中**，而不是像 tag_picker 那样直接
        return 等下一轮；日历没有等待窗口，退回兜底才能保证任何情况下都有位置。
 
     坐标口径：winfo_* 与 wm_geometry 都是物理像素，不经过 CTk 的缩放换算。
@@ -618,7 +618,7 @@ def _ensure_window(parent: tk.Misc, mode: str) -> None:
 
     dialog = ctk.CTkToplevel(parent)
     dialog.title("选择日期")
-    # 【Step 2.1】同 category_picker：tk.Wm.resizable 绕开 CTkToplevel.resizable 的覆写，
+    # 【Step 2.1】同 tag_picker：tk.Wm.resizable 绕开 CTkToplevel.resizable 的覆写，
     # 避免它在 Windows 上额外安排 after(10, _windows_set_titlebar_color)（实测 sync 12.5ms /
     # visible 34.8ms）。代价可忽略：_last_resizable_args 仅被写入、CTk 内部无读取点，且本弹窗尺寸固定。
     tk.Wm.resizable(dialog, False, False)
