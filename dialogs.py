@@ -12,8 +12,11 @@ import customtkinter as ctk
 # ask_month 只做一层薄封装。导入时改别名 picker_ask_month，避免与本模块下面
 # 同名的 ask_month 包装函数互相覆盖（后者会遮蔽前者的名字）。
 from calendar_picker import ask_date, ask_month as picker_ask_month
-from category_picker import ask_tags
 from config import RESOURCE_DIR
+from tag_picker import ask_tags
+# 输入的标签串按顿号拆分、清理的规则与新增区、偏好层共用一份实现
+# （tag_prefs.split_tag_input），本模块不再自己写一遍（#58 Step 3a）。
+import tag_prefs
 from store import Account
 
 
@@ -61,9 +64,11 @@ def ask_month(
 def ask_edit_record(
     parent: ctk.CTk,
     record: Account,
-) -> tuple[str, Decimal, str, str] | None:
+) -> tuple[str, Decimal, tuple[str, ...], str] | None:
     """显示预填记录编辑框，并返回通过校验的字段。
 
+    返回值的第三项是标签元组（不是单个字符串）：0 个标签也是合法结果，
+    由调用方原样交给 store.update。
     标签候选不由调用方传入：点 ▼ 时由 picker 从唯一标签池现算，
     不随编辑中的金额符号变化；Decimal 与 InvalidOperation 仍用于金额解析和校验。
     """
@@ -79,7 +84,8 @@ def ask_edit_record(
     dialog_font = ("Microsoft YaHei UI", 11)
     title_font = ("Microsoft YaHei UI", 13, "bold")
     # 用单元素列表承载返回值，闭包函数 confirm 可以直接写入。
-    result: list[tuple[str, Decimal, str, str] | None] = [None]
+    # #58 Step 3a：第三项由单个字符串改为标签元组，与 ask_edit_record 的返回注记一致。
+    result: list[tuple[str, Decimal, tuple[str, ...], str] | None] = [None]
     # 四个字段都用当前记录值预填，用户只需改动需要修改的部分，减少重复输入。
     date_var = tk.StringVar(value=record.record_date)
     # 金额统一显示为两位小数，与表格中的显示格式保持一致。
@@ -173,7 +179,7 @@ def ask_edit_record(
         # 类别字段（需求 3.13）：与新增记录输入区用同一套「输入框 + ▼」组合，
         # 既能点 ▼ 从预置/历史候选里挑，也能直接手输改成新写法。
         # （上一版用的是 CTkComboBox，箭头样式与日期那个 ▼ 不统一，
-        # 且它的原生下拉菜单压不住位置，原因详见 category_picker.py 的模块注释。）
+        # 且它的原生下拉菜单压不住位置，原因详见 tag_picker.py 的模块注释。）
         if label == "类别":
             category_row = ctk.CTkFrame(content, fg_color="transparent")
             category_row.pack(fill="x")
@@ -190,7 +196,7 @@ def ask_edit_record(
 
             # ▼ 按钮改在闭包之前建：闭包要拿到它的引用（见下面 toggle=），
             # 而 command 得等闭包定义好才能接上，于是先建控件、后 configure。
-            # 留引用是给 category_picker 用的：它的「点弹窗外面就关」监视器必须把
+            # 留引用是给 tag_picker 用的：它的「点弹窗外面就关」监视器必须把
             # 本按钮排除掉，否则按下时先关掉列表、紧接着 command 又把它打开，
             # 表现出来就是「点 ▼ 关不上」。
             category_button = ctk.CTkButton(
@@ -224,8 +230,8 @@ def ask_edit_record(
                 # 返回 None 表示用户取消/按 ESC/再点一次 ▼，此时保持输入框原值不变。
                 if picked:
                     var.set(picked)
-                # 这里不用再补 grab_set：编辑弹窗原来握着的 grab 是 category_picker
-                # 主动借走、关闭时原样还回来的（见 category_picker._cleanup）。
+                # 这里不用再补 grab_set：编辑弹窗原来握着的 grab 是 tag_picker
+                # 主动借走、关闭时原样还回来的（见 tag_picker._cleanup）。
                 # 自己再抢一次纯属重复，还会掩盖借还逻辑真实是否成对的问题。
 
             category_button.configure(command=_pick_category)
@@ -283,18 +289,21 @@ def ask_edit_record(
         except (ValueError, InvalidOperation):
             error_var.set("日期格式应为 YYYY-MM-DD，金额必须是数字。")
             return
-        parsed_category = category_var.get().strip()
-        # 与新增记录保持同样的业务约束：金额不能为 0、类别不能为空。
-        if parsed_amount == 0 or not parsed_category:
-            error_var.set(
-                "金额不能为 0；正数表示收入，负数表示支出，类别不能为空。"
-            )
+        # #58 Step 3a：标签改为多值，而且 0 个标签是合法的（§3.14.4 需答 Q2），
+        # 所以「类别非空」这条校验连同提示里的那半句一起删除；留下的
+        # 「金额不能为 0」是数据层也认的业务约束。
+        if parsed_amount == 0:
+            error_var.set("金额不能为 0；正数表示收入，负数表示支出。")
             return
+        # 输入框里的一行文字按顿号拆成标签元组：与表格单元格、CSV 的展示口径同源
+        # （§3.14.4），所以「餐饮、交通」这种写法在这里天然就是两个标签；
+        # 拆分含 strip / 去空 / 首次出现去重，规则与偏好层共用一份实现。
+        parsed_tags = tag_prefs.split_tag_input(category_var.get())
         # 金额保持用户填写的正负号，因此编辑时可直接切换收入/支出属性。
         result[0] = (
             parsed_date.isoformat(),
             parsed_amount,
-            parsed_category,
+            parsed_tags,
             note_var.get().strip(),
         )
         dialog.destroy()

@@ -39,6 +39,23 @@ def _clean_list(value: object, field: str) -> list[str]:
     return cleaned
 
 
+def split_tag_input(text: str) -> tuple[str, ...]:
+    """把一行手输文本按顿号拆成有序去重的标签元组（#58 Step 3a 新增）。
+
+    「顿号连接」是标签唯一的展示口径（§3.14.4：表格单元格、CSV、图表都用它），
+    所以用户在一个输入框里写多个标签时也用同一个分隔符。清理规则与偏好层的
+    _clean_list 保持一致（strip、丢弃空项、按首次出现顺序去重），但刻意不发警告：
+    用户输入「餐饮、」这类以分隔符结尾的写法是常态，不是数据故障，不该打印警告。
+    放在偏好层是为了让新增区与编辑弹窗共用一份实现，两处口径不会各自漂开。
+    """
+    cleaned: list[str] = []
+    for part in (text or "").split("、"):
+        tag = part.strip()
+        if tag and tag not in cleaned:
+            cleaned.append(tag)
+    return tuple(cleaned)
+
+
 def _read_tags_document() -> dict | None:
     """读取 tags.json；损坏或格式不符时返回 None，写操作可随后恢复标准结构。"""
     if not TAG_PREFS_PATH.exists():

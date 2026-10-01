@@ -94,10 +94,12 @@ class AccountKeeperApp(ctk.CTk):
         )
         self.input_frame.pack(fill="x", padx=24, pady=(0, 8))
         # 把这些控件引用提升到主窗口，方便各回调直接读取/清空；控件本身仍归 InputFrame 所有。
+        # 标签刻意不提升（#58 Step 3a）：它不是一个 StringVar，而是 chips 那个有序集合，
+        # 归 InputFrame 自己管，主窗口只经 collect_tags() / clear_tags() 两个口子打交道。
+        # 不把 _tags 提到主窗口，是为了不让两条路径去改同一份标签集合。
         self.date_var = self.input_frame.date_var
         self.amount_var = self.input_frame.amount_var
         self.amount_entry = self.input_frame.amount_entry
-        self.category_var = self.input_frame.category_var
         self.note_var = self.input_frame.note_var
 
         # 工具栏只负责界面，把具体业务动作（筛选/删除/统计/导出/图表）回调给主窗口实现。
@@ -172,8 +174,12 @@ class AccountKeeperApp(ctk.CTk):
                     record.record_date,
                     f"{record.amount:.2f}",
                     # #58 Step 2c-2：多标签用预定义分隔符「、」连接成一个单元格字符串
-                    # （§3.14.4 的表格口径）；0 标签时 join 天然得到空串。
-                    "、".join(record.tags),
+                    # （§3.14.4 的表格口径）。
+                    # #58 Step 3a：0 标签时显示「—」而不是空串——空格子分不出
+                    # 「这条记录没有标签」和「这一列没渲染出来」。
+                    # 判定只看 record.tags，不看数据库里遗留的 accounts.category 列：
+                    # 那一列自 Step 2c-2 起已不再参与展示。
+                    "、".join(record.tags) if record.tags else "—",
                     record.note,
                 ),
             )
@@ -209,36 +215,41 @@ class AccountKeeperApp(ctk.CTk):
         if amount_type == "支出":
             amount = -amount
 
-        category = self.category_var.get().strip()
-        # 0 元记录在统计中没有意义，类别为空则无法分类，两者都视为非法输入。
-        if amount == 0 or not category:
+        # #58 Step 3a：标签改为多值，而且 0 个标签是合法的（§3.14.4 需答 Q2），
+        # 所以这里只留「金额不能为 0」这一条业务约束。
+        # 0 元记录在统计中没有意义，仍视为非法输入。
+        if amount == 0:
             messagebox.showerror(
                 "输入错误",
-                "金额不能为 0；正数表示收入，负数表示支出，类别不能为空。",
+                "金额不能为 0；正数表示收入，负数表示支出。",
             )
             return
+        # 标签在这里一次取全：collect_tags 会把输入框里残留的文字也冲刷成 chip，
+        # 用户打完字直接点「添加」不会漏掉那个词；0 个标签时返回空元组。
+        # 直接交给 store，绝不能漏传字符串——那会被逐字符拆成标签（"餐饮" → "餐"、"饮"）。
+        tags = self.input_frame.collect_tags()
         # store.add 内部还会再校验一次金额（数据层最后防线）。正常流程下这里不会触发，
         # 但万一上层校验被改动绕过，也只会弹出提示而不会让程序崩溃。
         try:
-            # #58 Step 2c-2：add 的形参已改成 tags 元组，而本框仍只收一个字符串，
-            # 所以在这里当场包成 1 元组；绝不能让字符串直接漏进 store ——
-            # 那会被逐字符拆成标签（"餐饮" → "餐"、"饮"）。
             self.store.add(
-                record_date.isoformat(), amount, (category,), self.note_var.get()
+                record_date.isoformat(), amount, tags, self.note_var.get()
             )
         except ValueError:
             messagebox.showerror("输入错误", "日期格式应为 YYYY-MM-DD，金额必须是数字。")
             return
-        # 清空金额/类别/备注，但保留日期，方便用户连续录入同一天的流水。
+        # 清空金额/标签/备注，但保留日期，方便用户连续录入同一天的流水。
         self.amount_var.set("")
         # 金额框使用的是 placeholder_text 而非 textvariable，控件内容必须单独清空，
         # 否则下一次提交会把上一次的金额重复带进去（上面的 StringVar 只是顺手重置）。
         self.amount_entry.delete(0, "end")
-        self.category_var.set("")
+        # 标签归 InputFrame 管，主窗口只让它自己复位（连带清掉输入框里的残留文字）。
+        # #58 Step 3a 之前这里写的是 self.category_var.set("")——主窗口直接改输入区的
+        # 控件状态；改成调 clear_tags() 之后，主窗口不再持有输入区内部状态。
+        self.input_frame.clear_tags()
         self.note_var.set("")
-        # 需求 3.13：这里不再需要「重新查历史类别 + 刷新候选」。
-        # 候选改由 category_prefs 在每次点 ▼ 时现算，弹窗里点「+ 保存」把类别写进
-        # user 列表之后，弹窗自己会重画列表，这一层什么都不用做；同时少了一个
+        # 需求 3.13：这里不再需要「重新查历史标签 + 刷新候选」。
+        # 候选改由 tag_prefs 在每次点 ▼ 时现算，弹窗里点「+ 保存」把标签写进
+        # tags.json 之后，弹窗自己会重画列表，这一层什么都不用做；同时少了一个
         # 必守的「新增成功后记得刷新」约定，也就少一类「忘了刷新」的 bug。
         self.refresh_records()
 
@@ -281,10 +292,11 @@ class AccountKeeperApp(ctk.CTk):
         edited_values = dialogs.ask_edit_record(self, record)
         if edited_values is None:
             return
-        record_date, amount, category, note = edited_values
+        # #58 Step 3a：编辑框返回的第三项已经是标签元组（它自己按顿号拆好、允许为空），
+        # 所以这里原样透传，不再包 (category,)。
+        record_date, amount, tags, note = edited_values
         # 主键不参与修改，编辑只更新内容字段（需求 3.5.1）。
-        # #58 Step 2c-2：与 add 同理，编辑框返回的仍是单个字符串，这里当场包成 1 元组。
-        if not self.store.update(record_id, record_date, amount, (category,), note):
+        if not self.store.update(record_id, record_date, amount, tags, note):
             messagebox.showerror("编辑失败", "找不到该记录或记录更新失败。")
             return
         self.refresh_records()

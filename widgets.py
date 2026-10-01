@@ -10,10 +10,21 @@ from tkinter import ttk
 import customtkinter as ctk
 
 from calendar_picker import ask_date
-# 类别候选统一由 tag_prefs 算（就是它自己那份标签列表），
-# 不再从数据库 DISTINCT 取历史类别：那条路会让用户临时输入的写法越积越多，
-from category_picker import ask_tags
+# 标签候选统一由 tag_prefs 算（就是它自己那份标签列表），
+# 不再从数据库 DISTINCT 取历史标签：那条路会让用户临时输入的写法越积越多，
 # 候选读取与偏好写入只在 tag_prefs 维护；UI 不缓存标签池，避免多处实现漂移。
+from tag_picker import ask_tags
+# 手输的多标签要按顿号拆开，拆分与清理规则（strip / 去空 / 首次出现去重）
+# 与偏好层共用一份实现：#58 Step 3a 新增，避免这里再抄一遍口径、两处迟早漂开。
+from tag_prefs import split_tag_input
+
+# ---------- 标签 chips 区的几何常量（需求 3.14.3 形态 1） ----------
+# 一颗 chip 的高度与圆角：28 + 圆角 14 刚好是「药丸」形，也比一行输入框（36）矮，
+# 一眼能看出它是可以点掉的小标，而不是输入框。
+_CHIP_HEIGHT = 28
+_CHIP_CORNER_RADIUS = 14
+_CHIP_GAP_X = 6  # 同一行里 chip 之间的水平间距
+_CHIP_GAP_Y = 4  # 换行后上下两行 chip 之间的垂直间距
 
 
 class InputFrame(ctk.CTkFrame):
@@ -38,7 +49,20 @@ class InputFrame(ctk.CTkFrame):
         self.amount_var = tk.StringVar()
         # 默认选中「支出」，因为日常记账中支出占绝大多数。
         self.amount_type_var = tk.StringVar(value="支出")
-        self.category_var = tk.StringVar()
+        # 标签输入框里「正在输入、还没变成 chip」的那一段文字。
+        # 它刻意不复用 category_var 的老名字/老语义：那一个是「记录的类别」，而现在
+        # 记录的标签集合是下面的 _tags（多值、有序），这个变量只管输入框这个控件的内容。
+        self.tag_input_var = tk.StringVar()
+        # 标签集合按写入顺序存在 list 里：chips 的先后顺序就是用户敲进来的顺序，
+        # 也是最终写库的顺序（§3.14.2：标签顺序有语义）。
+        self._tags: list[str] = []
+        # 名字 → chip 按钮 的索引表：增删、判重、重排都要按名字找控件，
+        # 有它就无需每轮遍历子控件，也让「同一个标签不会出现两颗 chip」只靠字典键就能保证。
+        self._tag_buttons: dict[str, ctk.CTkButton] = {}
+        # chips 区上一次参与换行计算的宽度，-1 = 「还没量过」。
+        # 用它做闸门：换行会改变容器高度、进而触发 <Configure>，宽度没变就直接返回，
+        # 否则「重排 → Configure → 再重排」会自激成死循环。
+        self._chips_width = -1
         self.note_var = tk.StringVar()
         # 这里刻意不再缓存任何「历史类别」：候选由 tag_prefs.build_tag_candidates 在
         # 每次点 ▼ 的那一刻现算。不缓存换来两件事：一是弹窗里保存/删除完界面立刻
@@ -127,30 +151,35 @@ class InputFrame(ctk.CTkFrame):
             font=font_small,
         ).grid(row=0, column=3, padx=(0, 16), pady=0, sticky="e")
 
-        # ---------- 字段区：按比例自适应的两行布局（需求 3.2） ----------
+        # ---------- 字段区：按比例自适应的三行布局（需求 3.2；第三行为 #58 Step 3a 新增）----------
         # 【三条设计意图】
-        #   1. 输入框按比例自适应：日期框、类别框、金额框、备注框都不写死 width，
+        #   1. 输入框按比例自适应：日期框、金额框、标签框、备注框都不写死 width，
         #      而是靠 grid 的列权重（weight）分配宽度。窗口拉宽时一起变宽、拉窄时
         #      一起变窄，任何宽度下都填满可用空间，卡片右侧不会留下大片空白。
-        #   2. 只有图标型控件固定宽度：▼ 按钮 36px（日期、类别各一个）。它只有一个
+        #   2. 只有图标型控件固定宽度：▼ 按钮 36px（日期、标签各一个）。它只有一个
         #      字符，跟着伸缩只会变形或拉得很空洞。（支出/收入切换按钮与添加按钮已挪到标题行。）
-        #   3. 两行共用同一套列网格：日期与类别占同一列、金额与备注占同一列，
-        #      所以两行的标签和输入框天然上下对齐，不用再手工凑像素宽度。
-        # 【为什么中间要有一层 master_frame】两行共用的列必须落在同一个容器里才可能
-        #   对齐；master_frame 用 sticky="ew" 撑满 InputFrame，成为两行共享的列网格。
+        #   3. 三行共用同一套列网格：第 0 行（日期 | 金额）分占第 1 / 第 3 列，
+        #      标签区与备注跨满第 1~3 列，所以各行的左右边缘天然落在同一批竖线上。
+        # 【为什么中间要有一层 master_frame】多行共用的列必须落在同一个容器里才可能
+        #   对齐；master_frame 用 sticky="ew" 撑满 InputFrame，成为各行共享的列网格。
         # 【权重分配】第 1 列 : 第 3 列 = 15 : 25，对应「日期约占 15%、金额约占 25%」。
         #   注意权重分配的是「固定部分（两个标签列、一个 ▼ 按钮）之外剩余的空间」，
         #   所以窗口越宽，各输入框的实际占比会比 15/25 略有放大；但两者的比例关系
         #   始终保持不变，这正是「按比例自适应」的预期行为。
+        #   跨列的行（标签、备注）不受权重影响：权重只决定各行内部「列与列」怎么分宽度。
         # 【窄窗口下的安全性】窗口最小尺寸是 820x560（见 ui.py），卡片内部至少 772px，
         #   而本布局各控件的自然宽度合计远小于此，始终留有余量，所以任何被允许的
         #   窗口宽度下字段都完整可见、不会重叠，也不会被压缩到看不全。
-        # 【列结构】两行共用同一套列：
-        #   第 0 列 = 标签（日期 / 类别）—— 权重 0，宽度只由文字决定
-        #   第 1 列 = 日期框组（日期框 + ▼）/ 类别框组（类别框 + ▼）—— weight=15，按比例伸缩
-        #   第 2 列 = 标签（金额 / 备注）—— 权重 0，宽度只由文字决定
-        #   第 3 列 = 金额框 / 备注框 —— weight=25，按比例伸缩
-        # 两行之间留 10px 垂直间距：上行下边距 5px + 下行上边距 5px。
+        # 【列结构】
+        #   第 0 列 = 标签（日期 / 标签 / 备注）—— 权重 0，宽度只由文字决定
+        #   第 1 列 = 日期框组（日期框 + ▼）—— weight=15，按比例伸缩
+        #   第 2 列 = 标签（金额）—— 权重 0，宽度只由文字决定
+        #   第 3 列 = 金额框 —— weight=25，按比例伸缩
+        # 行与行之间留 10px 垂直间距：上行下边距 5px + 下行上边距 5px。
+        # 【卡片高度不用手工算】Tk 的几何传播是默认开启的（全仓唯一的 pack_propagate(False)
+        #   在 ui.py 的 header 上），master_frame 会按各行子控件的需求高度自动长高，
+        #   chips 换成两行卡片就自动多出一行的高度；这里刻意不维护任何「卡片高度常量」，
+        #   以免它与实际布局对不上。
         master_frame = ctk.CTkFrame(
             self,
             fg_color="transparent",
@@ -161,7 +190,7 @@ class InputFrame(ctk.CTkFrame):
         # 留 16px 后，字段区右边缘与标题行添加按钮的右边缘严格对齐。
         master_frame.grid(row=1, column=0, padx=(0, 16), pady=(0, 14), sticky="ew")
         # 只给两个「输入列」权重：它们会吃掉全部剩余宽度，所以卡片右侧不会留白。
-        # 两个标签列的权重保持 0，宽度只由内容决定，两行才能始终左对齐。
+        # 两个标签列的权重保持 0，宽度只由内容决定，各行才能始终左对齐。
         master_frame.columnconfigure(1, weight=15)
         master_frame.columnconfigure(3, weight=25)
 
@@ -258,54 +287,65 @@ class InputFrame(ctk.CTkFrame):
         )
         self.amount_entry.grid(row=0, column=3, padx=(0, 0), pady=(0, 5), sticky="ew")
 
-        # ---------- 第二行：类别 | 备注 ----------
+        # ---------- 第二行：标签区（chips + 输入框 + ▼，需求 3.14.3 形态 1） ----------
+        # 这一行内部再分两小行装在 tags_frame 里：第 0 行 = 输入框 + ▼，第 1 行 = chips。
+        # 【为什么输入行在 chips 之上】chips 会随标签增多而换行。若把它排在输入框上面，
+        #   每加一个标签就把正在输入的那个框往下顶一次、光标跟着跳；放在下面则输入框
+        #   位置恒定，只是卡片在长高。
+        # 【为什么标签区跨满第 1~3 列】chips 是流式换行的，给它最大宽度才能少换行；
+        #   而且「这条记录属于哪些标签」与金额、备注并列整行也更符合阅读顺序。
+        # height=36 + anchor="w" 让「标签」二字与输入框的垂直中心对齐：默认（按整行居中）
+        #   时，标签区一旦因 chips 换行变高，二字就会漂到两行之间、看着像属于 chips 那一行。
         ctk.CTkLabel(
             master_frame,
-            text="类别",
+            text="标签",
             font=font_small,
             text_color="#455A64",
-        ).grid(row=1, column=0, padx=(16, 6), pady=(5, 0), sticky="w")
+            height=36,
+            anchor="w",
+        ).grid(row=1, column=0, padx=(16, 6), pady=(5, 0), sticky="nw")
 
-        # 需求 3.13：类别字段 = 「输入框 + ▼ 按钮」，与上一行的日期字段是同一套组合。
-        # 上一版用的 CTkComboBox 有两个问题：一是它的下拉箭头是从控件内部右上角
-        # 伸出来的小折角，与日期那个独立的 ▼ 按钮并排放在一起风格不统一；
-        # 二是它的下拉是 Tk 原生菜单（原因详见 category_picker.py 的模块注释），
-        # 弹出位置压不住，左边缘会跑到输入框左边。改成这个组合后两个问题一起消失。
-        # 与日期字段一样，输入框和 ▼ 按钮放进透明容器水平排布：若各自 grid 到不同列，
-        # 会把整行高度撑高并让「类别」标签错位。
-        category_frame = ctk.CTkFrame(
+        self.tags_frame = ctk.CTkFrame(
             master_frame,
             fg_color="transparent",
             corner_radius=0,
         )
-        # sticky="ew" + 右 padx=0：类别框组与第一行的日期框组共用第 1 列并填满整列，
-        # 两行在同一列里两端对齐，所以两组的输入框、▼ 按钮左右边缘都落在同一批竖线上。
-        category_frame.grid(row=1, column=1, padx=(0, 0), pady=(5, 0), sticky="ew")
-        # 这里刻意不写 placeholder_text：本项目已确认 CTkEntry 不能同时给
-        # placeholder_text 和 textvariable（Python 3.13 下占位符会永久失效）。
-        # 类别框必须绑定 category_var（ui.py 和编辑弹窗都直接读它），所以只能放弃占位提示。
-        # 手动输入新类别依然可用：这只是个普通输入框，打字即可。
-        self.category_entry = ctk.CTkEntry(
-            category_frame,
+        # sticky="ew" + columnspan=3：标签框组与第一行的日期框组、金额框共用同一批竖线，
+        # 右端也落在 master_frame 的右内边距上。
+        self.tags_frame.grid(
+            row=1, column=1, columnspan=3, padx=0, pady=(5, 0), sticky="ew"
+        )
+        # 只有第 0 列（输入框那一列）有重量：▼ 按钮所在列的宽度固定，输入框吃掉剩下的。
+        self.tags_frame.columnconfigure(0, weight=1)
+
+        # 输入框刻意不写 placeholder_text：需求 3.14.3 明确「0 chips 时只有输入框，无占位符」；
+        # 另一方面 CTkEntry 在 Python 3.13 下不能同时给 placeholder_text 和 textvariable
+        # （占位符会永久失效），而这个框必须绑 tag_input_var，才能在回车/点「添加」时
+        # 把正在输入的文字冲刷成 chip。
+        self.tag_entry = ctk.CTkEntry(
+            self.tags_frame,
             height=36,
             font=font_regular,
             corner_radius=9,
             border_width=1,
             border_color="#C6D4DF",
             fg_color="#F8FAFC",
-            textvariable=self.category_var,
+            textvariable=self.tag_input_var,
         )
-        # ▼ 按钮与日期字段的那个逐项对齐：36x36、圆角 9、浅青灰底、同一字体与文字色，
+        self.tag_entry.grid(row=0, column=0, sticky="ew")
+        # 回车即提交，与弹窗 footer 里「回车 = + 保存」是同一个习惯。
+        # 用 lambda 吞掉事件对象：Tk 会把 <Return> 的事件对象当第一个位置实参传进来，
+        # 直接写 self._commit_tag_input 会让它收到一个不认识的参数。
+        self.tag_entry.bind("<Return>", lambda _event: self._commit_tag_input())
+
+        # ▼ 按钮与日期字段那个逐项对齐（36x36、圆角 9、浅青灰底、同一字体与文字色），
         # 所以两行的 ▼ 看起来是同一个控件。
-        # 先 pack 按钮（side="right"）再 pack 输入框（expand=True），写法与日期字段一致，
-        # 保证「输入框右边缘」和「▼ 按钮右边缘」两行都落在同一条竖线上。
-        # 这里特意留一个引用（日期那个 ▼ 是匿名的）：category_picker 的
-        # 「点弹窗外面就关」监视器必须把本按钮排除掉，否则鼠标按下时先关掉列表、
-        # 紧接着 command 又把列表重新打开，表现出来就是「点 ▼ 关不上」。
-        self.category_button = ctk.CTkButton(
-            category_frame,
+        # 这里必须留引用：tag_picker 的「点弹窗外面就关」监视器要把本按钮排除掉，
+        # 否则鼠标按下时先关掉列表、紧接着 command 又把它打开，表现出来就是「点 ▼ 关不上」。
+        self.tag_button = ctk.CTkButton(
+            self.tags_frame,
             text="▼",
-            command=self._pick_category,
+            command=self._pick_tags,
             width=36,
             height=36,
             corner_radius=9,
@@ -314,20 +354,33 @@ class InputFrame(ctk.CTkFrame):
             text_color="#243447",
             font=("Microsoft YaHei UI", 11),
         )
-        self.category_button.pack(side="right", padx=(6, 0))
-        self.category_entry.pack(side="left", fill="both", expand=True)
+        self.tag_button.grid(row=0, column=1, padx=(6, 0), sticky="e")
 
+        # chips 容器：跨满 tags_frame 两列（= 输入行的整行宽度），换行时可用宽度最大。
+        # 0 标签时整块 grid_remove()，让卡片仍保持紧凑（见 _relayout_tags）。
+        self.chips_frame = ctk.CTkFrame(
+            self.tags_frame,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        self.chips_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.chips_frame.grid_remove()
+        # <Configure> 只用来感知「可用宽度变了」（窗口缩放）；换行本身归 _relayout_tags 管。
+        # 回调里用宽度做闸门：换行会改变容器高度、又触发一次 <Configure>，不闸住会自激。
+        self.chips_frame.bind("<Configure>", self._on_chips_configure)
+
+        # ---------- 第三行：备注 ----------
+        # 标签区（chips 会换行）占了第二行整行，备注不能再和它并排，因此下移到第三行；
+        # 从第 1 列起跨满 3 列（columnspan=3），右端仍落在 master_frame 的右内边距上，
+        # 与金额框、标签框右边缘对齐。
         ctk.CTkLabel(
             master_frame,
             text="备注",
             font=font_small,
             text_color="#455A64",
-        ).grid(row=1, column=2, padx=(12, 6), pady=(5, 0), sticky="w")
+        ).grid(row=2, column=0, padx=(16, 6), pady=(5, 0), sticky="w")
 
-        # 备注框与第一行的金额框共用第 3 列，并用 sticky="ew" 填满整列：
-        # 两者现在都是该列里唯一的控件，所以宽度完全相同、左右边缘都严格对齐
-        # （切换按钮挪到标题行后，金额框不再被占用 100px，两个框终于等宽了）。
-        # 不写 width：宽度完全由列权重决定，窗口拉宽时备注框同步变宽。
+        # 不写 width：宽度完全由列权重（跨列时即整段可用宽度）决定，窗口拉宽时同步变宽。
         note_entry = ctk.CTkEntry(
             master_frame,
             height=36,
@@ -338,10 +391,11 @@ class InputFrame(ctk.CTkFrame):
             fg_color="#F8FAFC",
             textvariable=self.note_var,
         )
-        # 右侧不留 padx：输入列带权重、会吃掉全部剩余宽度，右边缘的留白
-        # 统一由 master_frame 自己的右 padx=(0, 16) 提供，
+        # 右侧不留 padx：右边缘的留白统一由 master_frame 自己的右 padx=(0, 16) 提供，
         # 这样备注框右边缘才能与标题行的添加按钮右边缘对齐。
-        note_entry.grid(row=1, column=3, padx=(0, 0), pady=(5, 0), sticky="ew")
+        note_entry.grid(
+            row=2, column=1, columnspan=3, padx=(0, 0), pady=(5, 0), sticky="ew"
+        )
 
     def _pick_date(self) -> None:
         """打开日历选择器，把选中的日期回填到日期输入框（需求 3.12）。"""
@@ -358,24 +412,152 @@ class InputFrame(ctk.CTkFrame):
         if picked:
             self.date_var.set(picked)
 
-    def _pick_category(self) -> None:
-        """打开类别选择器，把选中的类别回填到类别输入框（需求 3.13）。"""
-        # 候选在「点击 ▼ 的这一刻」现算，而不是提前算好存在控件里：
-        # 这样切换支出/收入后弹出的列表自动就是对应的那一套（需求 3.13），
-        # 弹窗里保存/删除完也不需要再回头去改任何控件的缓存。
-        # 以 category_entry 为 anchor：弹窗宽度与它等宽、左边缘与它对齐。
-        # toggle_button 传自己这个 ▼：弹窗开着时再点它一次表示关闭列表
-        # （ask_category 返回 None），而不是被「点外面」逻辑抢先关掉。
-        # 标签池不分收支，切换金额方向不会改变候选或偏好写入目标。
+    # ---------- 标签区（需求 3.14.3 形态 1：chips + 输入框 + ▼） ----------
+    # chips 的增删只改「这条记录用哪些标签」，与「标签池」（tags.json）完全无关：
+    # 后者只在弹窗里点「+ 保存」/「×」时才动（见 tag_prefs / tag_picker）。
+
+    def _commit_tag_input(self) -> None:
+        """把输入框里正在编辑的文字冲刷成一到多个 chip，并清空输入框。"""
+        # 顿号分隔是「一次输入多个标签」的唯一写法，与表格单元格、CSV 的展示口径同源
+        # （§3.14.4），所以打「餐饮、交通」一次就得到两颗 chip。
+        for tag in split_tag_input(self.tag_input_var.get()):
+            self._add_tag(tag)
+        # 空文本也要清一次：用户可能只敲了个分隔符，留着会让下一次提交重复处理。
+        self.tag_input_var.set("")
+
+    def _add_tag(self, name: str) -> bool:
+        """加一颗 chip；名字为空或已存在时什么都不做（返回 False）。"""
+        tag = (name or "").strip()
+        if not tag or tag in self._tag_buttons:
+            # 重复标签直接忽略而不是报错：用户手输时重复列一个词是常见笔误，
+            # 而 _tags 里出现两个同名项会让写库后的展示顺序变得无法解释。
+            return False
+        # 一颗 chip 就是一颗按钮：整颗都是删除热区（比「文字 + 小 ×」两个控件好点、
+        # 控件数也更少，见 #56 对 CTkButton 构造开销的实测）。文字后面的「×」
+        # 是给用户看的提示——它不是独立控件，点了它和点文字是一样的效果。
+        button = ctk.CTkButton(
+            self.chips_frame,
+            text=f"{tag} ×",
+            # command 用默认参数把 tag 当场绑死：闭包晚绑定会让所有 chip 都去删最后一个标签。
+            command=lambda target=tag: self._remove_tag(target),
+            height=_CHIP_HEIGHT,
+            corner_radius=_CHIP_CORNER_RADIUS,
+            # 配色沿用 ▼ 按钮那一套浅青灰，hover 变深即「点它会删掉」的暗示；
+            # 刻意不做二次确认：chip 还没落库，删错了重敲一次即可。
+            fg_color="#E3EAF2",
+            hover_color="#D2DEE9",
+            text_color="#243447",
+            font=("Microsoft YaHei UI", 11),
+        )
+        self._tag_buttons[tag] = button
+        self._tags.append(tag)
+        self._schedule_relayout()
+        return True
+
+    def _remove_tag(self, name: str) -> None:
+        """删掉一颗 chip —— 只影响当前这条记录，绝不动 tags.json。"""
+        button = self._tag_buttons.pop(name, None)
+        if button is None:
+            return
+        button.destroy()
+        # _tags 保留顺序语义，删中间那颗时后面的自动前移，不影响其余相对顺序。
+        if name in self._tags:
+            self._tags.remove(name)
+        self._schedule_relayout()
+
+    def _schedule_relayout(self) -> None:
+        """把重排推到 idle：刚建出来的 chip 还没量过宽度，立刻排会按 1px 算错行数。"""
+        # 有 chip 就必须可见；0 颗时由 _relayout_tags 再 grid_remove 回去（两处成对）。
+        self.chips_frame.grid()
+        self.after_idle(self._relayout_tags)
+
+    def _on_chips_configure(self, event: tk.Event) -> None:
+        """容器宽度变了才重排；宽度闸门用来掐断「重排 → Configure → 再重排」的自激。"""
+        if event.width == self._chips_width:
+            return
+        self._chips_width = event.width
+        self._relayout_tags()
+
+    def _relayout_tags(self) -> None:
+        """按容器当前宽度给 chip 做流式换行（需求 3.14.3：行数变化由卡片高度承接）。"""
+        if not self._tag_buttons:
+            # 0 标签时整行收起：否则输入框下面会挂着一条高度 4px 外加内边距的空行。
+            self.chips_frame.grid_remove()
+            return
+        width = self._chips_available_width()
+        column = 0
+        row = 0
+        used = 0
+        for tag in self._tags:
+            button = self._tag_buttons.get(tag)
+            if button is None:
+                continue
+            need = button.winfo_reqwidth() + _CHIP_GAP_X
+            # 已经放过至少一颗、再放这颗就会超宽时才换行（保证一行永远至少有一颗，
+            # 窗口窄到装不下最长的 chip 时也不会排出空行）。
+            # width=0 表示还没量出可用宽度，此时一律不换行，等 <Configure> 再排。
+            if column and width and used + need > width:
+                row += 1
+                column = 0
+                used = 0
+            button.grid(
+                row=row,
+                column=column,
+                padx=(0, _CHIP_GAP_X),
+                pady=(0, _CHIP_GAP_Y),
+                sticky="w",
+            )
+            used += need
+            column += 1
+
+    def _chips_available_width(self) -> int:
+        """chips 容器的可用宽度（逻辑像素）；量不出来时返回 0，含义是「先别换行」。"""
+        # 先问 chips_frame 自己：控件未映射时 Tk 一律返回 1，所以用 >1 当「已量出」判据。
+        for widget in (self.chips_frame, self.tags_frame):
+            width = widget.winfo_width()
+            if width > 1:
+                return width
+        return 0
+
+    def get_tags(self) -> tuple[str, ...]:
+        """当前 chips 表示的标签集合（不含输入框里还没提交的文字）。"""
+        return tuple(self._tags)
+
+    def collect_tags(self) -> tuple[str, ...]:
+        """提交用的标签集合：先把输入框里残留的文字冲刷成 chip，再整体返回。"""
+        # 打完字直接点「添加」是最常见的漏提交路径：不冲刷的话，屏幕上明明看得见那个词、
+        # 存进去却没有它。返回 tuple 而不是 list，与 store.add / update 的形参口径一致。
+        self._commit_tag_input()
+        return tuple(self._tags)
+
+    def clear_tags(self) -> None:
+        """清空 chips 与输入框（新增成功后复位，避免把上一条的标签带到下一条）。"""
+        for button in self._tag_buttons.values():
+            button.destroy()
+        self._tag_buttons.clear()
+        self._tags.clear()
+        self.tag_input_var.set("")
+        # 直接同步重排（不排进 idle）：这里只是把 chips 收起来，没有「刚建出来还没量宽度」
+        # 的问题，立即 grid_remove 能避免复位后闪一下空行。
+        self._relayout_tags()
+
+    def _pick_tags(self) -> None:
+        """打开标签选择器（3a 仍是单选回填：返回一个名字就追加一颗 chip）。"""
+        # 候选在「点击 ▼ 的这一刻」由弹窗现算，不由本层缓存：弹窗里保存/删除完不需要
+        # 回头改任何控件状态，也就少一个「忘了刷新」的 bug。
+        # 以 tag_entry 为 anchor：弹窗宽度与它等宽、左边缘与它对齐。
+        # toggle_button 传自己这个 ▼：弹窗开着时再点它一次表示关闭列表（返回 None），
+        # 而不是被「点外面」逻辑抢先关掉。
         picked = ask_tags(
             self.winfo_toplevel(),
-            self.category_entry,
-            self.category_var.get(),
-            toggle_button=self.category_button,
+            self.tag_entry,
+            self.tag_input_var.get(),
+            toggle_button=self.tag_button,
         )
-        # 返回 None 表示用户取消/按 ESC/再点一次 ▼，此时保持输入框原值不变。
+        # None = 取消 / ESC / 再点一次 ▼，此时 chips 与输入框都保持原样。
         if picked:
-            self.category_var.set(picked)
+            self._add_tag(picked)
+
 
 class ToolbarFrame(ctk.CTkFrame):
     """Search box and the responsive action-button bar."""
@@ -519,7 +701,10 @@ class RecordTableFrame(ctk.CTkFrame):
         font_small = ("Microsoft YaHei UI", 11)
         table_inner = ctk.CTkFrame(self, fg_color="transparent")
         table_inner.pack(fill="both", expand=True, padx=10, pady=10)
-        columns = ("id", "date", "amount", "category", "note")
+        # 列 key 用 tags 而不是 category（#62）：这一列现在装的是多值标签串，
+        # key 名与类型对齐后，以后任何人看到 "tags" 都不会再误以为它是单值类别。
+        # 注意 key 与表头文字是两回事，而 values / iid 都是按位置给的，不受改名影响。
+        columns = ("id", "date", "amount", "tags", "note")
         # 自定义 ttk 样式，是为了摆脱 Windows 原生 Treeview 的灰色边框和紧凑行高，
         # 让表格与浅色圆角卡片风格保持一致。
         style = ttk.Style(self)
@@ -553,7 +738,8 @@ class RecordTableFrame(ctk.CTkFrame):
             ("id", "ID", 70),
             ("date", "日期", 120),
             ("amount", "金额", 120),
-            ("category", "类别", 140),
+            # 表头文字仍写「标签」（§3.14.4：表格单元格用「、」连接，0 个时显示「—」）。
+            ("tags", "标签", 140),
             ("note", "备注", 300),
         )
         for column, title, width in headings:
