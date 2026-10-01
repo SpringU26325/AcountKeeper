@@ -1,6 +1,6 @@
 """类别选择弹窗（需求 3.13）。
 
-对外只暴露 ask_category()：给「添加记录」输入区和「编辑记录」弹窗的类别字段
+对外只暴露 ask_tags()：给「添加记录」输入区和「编辑记录」弹窗的标签字段
 提供一个可点击的候选列表，降低手打类别的成本，也避免同一个开销被记成
 「餐饮 / 吃饭 / 午饭」多种写法，让 3.4 统计和 3.10 图表里的类别维度能真正聚合。
 
@@ -27,9 +27,9 @@
 
 弹窗底部是一条操作区（footer，见下方 _FOOTER_* 常量与「底部操作区」那一段）：
 第一行是「新类别输入框 + 「+ 保存」按钮」，第二行是一行提示语；列表里每一项右侧
-有「顶」和「×」两个按钮：「顶」把该类别移到候选列表最前（category_prefs.move_to_top），
-「×」把它从候选里**真删掉**（category_prefs.delete_user）。
-这些动作全部交给 category_prefs 落盘，本模块只负责「改完之后把列表重画一遍」
+有「顶」和「×」两个按钮：「顶」把该标签移到候选列表最前（tag_prefs.move_tag_to_top），
+「×」把它从候选里**真删掉**（tag_prefs.delete_tag）。
+这些动作全部交给 tag_prefs 落盘，本模块只负责「改完之后把列表重画一遍」
 （_render_list）。
 
 footer 里那个输入框是**弹窗自己的**，不绑主窗口的 category_var：存什么完全以它
@@ -44,10 +44,8 @@ from typing import Callable
 
 import customtkinter as ctk
 
-# 候选与增删都交给 category_prefs（user 列表就是唯一真源，那份规则只有一份实现）。
-# 这里只导入函数、不导入 EXPENSE/INCOME：方向由调用方按关键字传进来，
-# 本模块不替调用方决定「没传时算哪一个方向」——猜错方向会静默写错一份列表。
-from category_prefs import build_candidates, delete_user, move_to_top, save_user
+# 候选与增删都交给 tag_prefs（标签列表就是唯一真源，那份规则只有一份实现）。
+from tag_prefs import build_tag_candidates, delete_tag, move_tag_to_top, save_tag
 # config 是叶子模块（不导入任何项目模块），引用它的 RESOURCE_DIR 不会形成循环依赖。
 from config import RESOURCE_DIR
 
@@ -130,7 +128,7 @@ class _ActivePicker:
     dialog: ctk.CTkToplevel
     anchor: tk.Misc  # 锚点输入框：用来判断用户是不是又点了同一个 ▼
     toggle: tk.Misc | None  # 调用方的 ▼ 按钮：点它算 toggle，不算「点了外面」
-    close: Callable[[], None]  # 关闭函数，由 ask_category 内部的闭包提供
+    close: Callable[[], None]  # 关闭函数，由 ask_tags 内部的闭包提供
 
 
 _active_picker: _ActivePicker | None = None
@@ -150,7 +148,7 @@ def _apply_logo_icon(window: tk.Misc) -> None:
     """为弹窗设置项目 logo 图标。
 
     这里没有复用 dialogs._apply_logo_icon：dialogs.py 需要导入本模块调用
-    ask_category，若再反向导入会形成循环导入，所以保留一份极小的私有实现。
+    ask_tags，若再反向导入会形成循环导入，所以保留一份极小的私有实现。
     路径来源则统一走 config.RESOURCE_DIR（issues #17），不再各自用 __file__ 拼。
     """
     try:
@@ -275,15 +273,13 @@ def _ensure_click_monitor(widget: tk.Misc) -> None:
     _click_monitor_installed = True
 
 
-def ask_category(
+def ask_tags(
     parent: tk.Misc,
     anchor: tk.Misc,
     current: str = "",
     toggle_button: tk.Misc | None = None,
-    *,
-    direction: str,
 ) -> str | None:
-    """在 anchor 控件正下方弹出类别列表。
+    """在 anchor 控件正下方弹出标签列表；本步仍单选回填一个字符串。
 
     Args:
         parent: 父窗口，弹窗以 transient 方式挂在它上面（主窗口或编辑记录弹窗）。
@@ -294,12 +290,8 @@ def ask_category(
             所以全局点击监视器要把它排除掉。弹窗显示期间它的文字会被翻成 ▲，
             关闭时无论走哪条路径都由 _cleanup 翻回 ▼。不传只是少这一个白名单
             和图标切换，功能不受影响。
-        direction: 收支方向（category_prefs.EXPENSE / INCOME）。用关键字强制传入，
-            不给默认值：存取哪一份 categories.json 必须由调用方说出来，取错方向
-            会静默写到另一份列表上去，而那种错很难在界面上看出来。
-
     Returns:
-        选中的类别；用户按 ESC、点右上角关闭、再点一次同一个 ▼，
+        选中的标签；用户按 ESC、点右上角关闭、再点同一个 ▼，
         或者点弹窗外的别处时返回 None。
     """
     # 【toggle / 防叠加】先处理「已经有一个类别弹窗开着」的情况，必须早于建窗：
@@ -351,12 +343,12 @@ def ask_category(
     current_text = (current or "").strip()
 
     def _candidates() -> list[str]:
-        """现算候选（就是该方向的 user 列表）。
+        """现算唯一标签池，文件内改完后下一次重画立即可见。
 
         每次调用都重新读文件、不缓存：弹窗自己就能保存和删除，改完必须立刻
         反映到列表上，拿一份打开时的快照就永远是旧的。
         """
-        return build_candidates(direction)
+        return build_tag_candidates()
 
     # 【宽度】与输入框严格等宽，视觉上像从输入框里「掉下来」的一条列表。
     # winfo_width() 是物理像素，交回给 geometry() 前必须先换算成逻辑像素。
@@ -420,7 +412,7 @@ def ask_category(
         # 父窗口销毁把它连带销毁），分散写必漏；_cleaned 标记又保证这里只跑一次。
         # 时序上也不可能误伤新弹窗：即使本次关闭属于「换一个锚点重开」，这里翻回去的
         # 也是**旧**按钮（toggle_button 取自本函数闭包，与调用方新传进来的那个 ▼ 是
-        # 两个不同对象），而新按钮的 ▲ 要等本函数返回、新一次 ask_category 建完窗
+        # 两个不同对象），而新按钮的 ▲ 要等本函数返回、新一次 ask_tags 建完窗
         # 才设置，两者不会互相覆盖。
         _set_toggle_text(toggle_button, _TOGGLE_TEXT_CLOSED)
         # 定时器先停：否则清理完之后还可能再回调一次 _reanchor。
@@ -468,7 +460,7 @@ def ask_category(
                     tk.Misc.unbind(widget, sequence, funcid)
             except tk.TclError:
                 pass
-        # 撤销「当前弹窗」登记：不清的话下一次 ask_category 会对一个已销毁的弹窗
+        # 撤销「当前弹窗」登记：不清的话下一次 ask_tags 会对一个已销毁的弹窗
         # 调 close()，toggle 判断也跟着错乱。
         _clear_picker(dialog)
         # 把开头借走的 grab 还回调用方（编辑记录弹窗的模态性不能因为开了个类别列表
@@ -525,7 +517,7 @@ def ask_category(
     # 先落地才有保障，所以 list_frame 的 pack 挪到了下面「底部操作区」footer 之后。
 
     # ---------- 弹窗内的动作 ----------
-    # 这几个函数只改 category_prefs、然后重画列表，**都不关弹窗**：
+    # 这几个函数只改 tag_prefs、然后重画列表，**都不关弹窗**：
     # 保存完通常紧接着就要点刚出现的那一项，删完可能想接着删下一个，
     # 关掉再让用户点一次 ▼ 是完全多余的往返。
     #
@@ -612,7 +604,7 @@ def ask_category(
         hint_label.configure(text=text, text_color=_ERROR_COLOR if error else _HINT_COLOR)
 
     def _save_current() -> None:
-        """把 footer 输入框里的类别名存进 user 列表。
+        """把 footer 输入框里的标签名存进候选列表。
 
         值只从 save_entry 里取，**不再回头看主窗口的输入框**：那一个是「这条记录用
         什么类别」，这一个才是「要把哪个写法存进候选」。把两件事并到一个框里，用户
@@ -627,13 +619,13 @@ def ask_category(
         if not name:
             _set_hint("先在上面的输入框里写下类别名，再点 + 保存", error=True)
             return
-        if save_user(direction, name):
+        if save_tag(name):
             # 存下之后清空输入框，拿「框空了」当一次「已经收下了」的反馈：
-            # 类别原本就在列表里时 save_user 同样不报错、列表看不出任何变化，
+            # 标签原本就在列表里时 save_tag 同样不报错、列表看不出任何变化，
             # 不清空的话用户分不清刚才那一下到底生效没有，只会忍不住再点一次。
             save_entry.delete(0, "end")
             _render_list()
-            # 新类别按 save_user 的语义追加在 user 列表末尾，所以它多半落在折叠线
+            # 新标签按 save_tag 的语义追加在列表末尾，所以它多半落在折叠线
             # 以下（默认支出就有 10 项、视口只露 _MAX_VISIBLE_ITEMS 项）。滚到底让用户
             # 看见自己刚存的那一项——这是「追加到末尾」这条语义唯一的不良后果。
             _scroll_list(1.0)
@@ -653,7 +645,7 @@ def ask_category(
         重画要销毁并重建全部行控件（实测约 6.2ms/行，20 项时要 137ms），其中绝大
         部分行的内容根本没变，属于白烧。
         """
-        if not delete_user(direction, name):
+        if not delete_tag(name):
             _set_hint(f"删除失败：{name} 没能写入类别文件", error=True)
             return
         # 成功就把上一次失败留下的红字抹掉。原实现走 _render_list()，那里顺带做了
@@ -696,14 +688,14 @@ def ask_category(
         与 _delete_category 同构：落盘成功就原地更新列表、失败才报告。置顶**不关弹窗、
         也不回填输入框**——用户的意图是「把常用项挪上去」，不是「选中它」。
 
-        没有变化时（名字不在列表里、或本来就在第一位）move_to_top 同样返回 True 但
+        没有变化时（名字不在列表里、或本来就在第一位）move_tag_to_top 同样返回 True 但
         没写盘（见其 docstring）：两种情况按下面的分支分别处理，都不给用户报红字。
 
         列表只做**局部**重排：置顶只改变行的先后顺序，行数不变、高度不变、行控件
         本身也不用重建，所以把那一行摘下来再插回最前面就够了，不必重画整张表。
         这一点与删除不同——删除会改变行数，行数一变高度算式与 scrollregion 都得重算。
         """
-        if not move_to_top(direction, name):
+        if not move_tag_to_top(name):
             _set_hint(f"置顶失败：{name} 没能写入类别文件", error=True)
             return
         # 同 _delete_category：成功要把上一条失败报错抹掉（原靠 _render_list 顺带复位）。
@@ -1213,7 +1205,7 @@ def ask_category(
 
     dialog.bind("<Map>", _on_map, add="+")
 
-    # 登记为「当前打开的类别弹窗」：下一次 ask_category 靠它判断是 toggle 关闭
+    # 登记为「当前打开的标签弹窗」：下一次 ask_tags 靠它判断是 toggle 关闭
     # 还是「换一个锚点重开」，见函数开头那一段。
     # 这一句与下面那句图标翻转必须留在同步段、且在 wait_window 之前，因为它决定了
     # 「再点一次同一个 ▼」进来时能不能认出这是旧弹窗（迟一步就会开出第二个窗）。

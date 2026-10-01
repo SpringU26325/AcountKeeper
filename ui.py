@@ -14,7 +14,7 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-import category_prefs
+import tag_prefs
 import dialogs
 import settings
 from chart_window import show_chart_window
@@ -85,16 +85,9 @@ class AccountKeeperApp(ctk.CTk):
             text_color="#607D8B",
         ).pack(anchor="center")
 
-        # 需求 3.13：类别候选就是 category_prefs 里那份 user 列表，数据存在它自己的
-        # 文件里。这里在窗口组装前做一次「一次性初始化」：categories.json 不存在时把
-        # 预置类别 + 数据库里已有的历史类别（store.get_categories）写进去当 user 初值，
-        # 否则升级后自己用过的类别会一夜之间从下拉列表里消失。
-        # 初始化以「文件是否已存在」为判据，重复调用不会覆盖用户后续的增删；
-        # 两个返回值都是可选的，这里不用管结果，失败也只警告不阻断启动。
-        # #47：ensure_migrated 这名字是上一轮「从数据库搬历史类别」的遗留，语义已经
-        # 变成「初始化 user」。改名要连这个调用点（store.get_categories 的唯一使用者）
-        # 一起动，留到清 #47 那一轮，这次只同步注释，免得同一次改动里既改行为又改签名。
-        category_prefs.ensure_migrated(*self.store.get_categories())
+        # 标签池只初始化一次：tag_prefs 先读旧 categories.json；没有可用旧文件时，
+        # 再合并预置标签与数据库历史。tags.json 是否存在是初始化标记，不覆盖用户修改。
+        tag_prefs.ensure_tags_initialized(self.store.get_tags())
         self.input_frame = InputFrame(
             self,
             self.add_record,

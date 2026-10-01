@@ -10,12 +10,10 @@ from tkinter import ttk
 import customtkinter as ctk
 
 from calendar_picker import ask_date
-from category_picker import ask_category
-# 类别候选统一由 category_prefs 算（就是它自己那份 user 列表），
+# 类别候选统一由 tag_prefs 算（就是它自己那份标签列表），
 # 不再从数据库 DISTINCT 取历史类别：那条路会让用户临时输入的写法越积越多，
-# 也正是本轮需求 1 要止住的问题。那份规则只有 category_prefs 一处实现，
-# 所以这里不再自己导出一个 helper，而是把候选留给 category_picker 在弹窗里现算。
-from category_prefs import EXPENSE, INCOME
+from category_picker import ask_tags
+# 候选读取与偏好写入只在 tag_prefs 维护；UI 不缓存标签池，避免多处实现漂移。
 
 
 class InputFrame(ctk.CTkFrame):
@@ -42,7 +40,7 @@ class InputFrame(ctk.CTkFrame):
         self.amount_type_var = tk.StringVar(value="支出")
         self.category_var = tk.StringVar()
         self.note_var = tk.StringVar()
-        # 这里刻意不再缓存任何「历史类别」：候选由 category_prefs.build_candidates 在
+        # 这里刻意不再缓存任何「历史类别」：候选由 tag_prefs.build_tag_candidates 在
         # 每次点 ▼ 的那一刻现算。不缓存换来两件事：一是弹窗里保存/删除完界面立刻
         # 生效，不需要任何跨模块通知；二是调用方不用再记得「新增成功后刷新一下」，
         # 少一个必守的约定、少一类「忘了刷新」的 bug。
@@ -91,8 +89,7 @@ class InputFrame(ctk.CTkFrame):
             variable=self.amount_type_var,
             # 这里没有 command 回调，是刻意的：类别候选不再预先算好塞进控件，
             # 而是等用户点类别框的 ▼ 时由 _pick_category 按「当时的收支类型」现算
-            # （即 _direction() + category_prefs.build_candidates），所以切换收支时
-            # 不需要同步任何控件状态。
+            # （即 tag_prefs.build_tag_candidates），所以切换收支时不需要同步候选状态。
             # amount_type_var 由 CTkSegmentedButton 自己维护：用户点击走的是内部
             # set(value, from_button_callback=True)，那里会写回 self._variable。
             width=100,
@@ -369,28 +366,16 @@ class InputFrame(ctk.CTkFrame):
         # 以 category_entry 为 anchor：弹窗宽度与它等宽、左边缘与它对齐。
         # toggle_button 传自己这个 ▼：弹窗开着时再点它一次表示关闭列表
         # （ask_category 返回 None），而不是被「点外面」逻辑抢先关掉。
-        # direction 把本输入区当前的方向交给弹窗：里面的保存/删除要往
-        # 哪一份 categories.json 写，只能由这里说（ask_category 不给默认值，
-        # 取错方向会静默写到另一份列表上去）。
-        picked = ask_category(
+        # 标签池不分收支，切换金额方向不会改变候选或偏好写入目标。
+        picked = ask_tags(
             self.winfo_toplevel(),
             self.category_entry,
             self.category_var.get(),
             toggle_button=self.category_button,
-            direction=self._direction(),
         )
         # 返回 None 表示用户取消/按 ESC/再点一次 ▼，此时保持输入框原值不变。
         if picked:
             self.category_var.set(picked)
-
-    def _direction(self) -> str:
-        """把界面上的收支类型翻译成 category_prefs 的方向标识。
-
-        只有「收入」走收入那套；其余一律当支出处理（等价于 amount_type_var 的默认值），
-        这样即使日后 amount_type_var 被赋了意外值，也不会退化成空候选列表。
-        """
-        return INCOME if self.amount_type_var.get() == "收入" else EXPENSE
-
 
 class ToolbarFrame(ctk.CTkFrame):
     """Search box and the responsive action-button bar."""

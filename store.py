@@ -294,68 +294,15 @@ class AccountStore:
             )
         self.records = records
 
-    def get_categories(self) -> tuple[list[str], list[str]]:
-        """返回 (支出类别列表, 收入类别列表)，来自数据库中的 DISTINCT category。
-
-        供首次启动时 category_prefs.ensure_migrated 迁移历史类别使用（把这些历史类别当作
-        categories.json 的初始值），这是本方法唯一的生产调用点；日常启动时 categories.json
-        已存在，本方法仍会被调用、但结果被 ensure_migrated 丢弃（它第一行就按「文件是否存在」
-        早退），即「一次性迁移依赖 + 每次启动的无效查询」，见 #47。
-        之所以要读数据库、而不是让界面层自己攒：界面状态一重启就没了，只有数据库才是
-        跨会话的长期记忆，而首启迁移要捞的正是这份「手打过、但离开界面就消失」的历史类别，
-        所以这个查询必须落在库上（候选本身已由 categories.json 承载，日常不再经过这里）。
-
-        按金额正负拆成两组：业务约定「负数 = 支出、非负 = 收入」（见 ui.add_record 的符号转换），
-        所以金额本身就是最可靠的分类依据，不需要再额外加一个「收支类型」字段去维护。
-        DISTINCT 负责去重，ORDER BY 保证同一批数据每次刷新顺序都一样，
-        否则下拉列表会随机重排，用户刚记住的位置下次就变了。
-
-        注意 amount 列是 TEXT（见 _initialize_database），SQLite 的类型亲和规则会让
-        `amount < 0` 退化成字符串比较。这里的结果依然是正确的：
-        store.add / update 一律按 f"{amount:.2f}" 写入，所以负数必定以 '-'（0x2D）开头，
-        非负数必定以数字（'0'~'9'，0x30 起）开头，而 '-' < '0'，
-        字符串比较与数值比较在所有正常数据上完全一致；
-        手工改库产生的 'abc' / 'NaN' 这类脏值只会被判入收入组，不会抛异常。
-
-        【#58 Step 2a 起的现状（只追加说明，实现一个字未改）】
-        - 本方法已被 get_tags() 取代，进入退场倒计时。
-        - 当前唯一生产调用点是 ui.py:97（category_prefs.ensure_migrated 的入参）；
-          Step 2c 改 UI + category_prefs.py → tag_prefs.py 时一并删除，同时结掉 #47。
-        - 保留期内**禁止新增调用点**，否则 Step 2c 删不干净。
-        上面那段 #47 的定性分析（不是死代码、而是一次性迁移依赖 + 每次启动的无效查询）
-        是历史结论，一个字都不删。
-        """
-        with self._connect() as connection:
-            expense_rows = connection.execute(
-                "SELECT DISTINCT category FROM accounts "
-                "WHERE amount < 0 ORDER BY category"
-            ).fetchall()
-            income_rows = connection.execute(
-                "SELECT DISTINCT category FROM accounts "
-                "WHERE amount >= 0 ORDER BY category"
-            ).fetchall()
-        return (
-            [row[0] for row in expense_rows],
-            [row[0] for row in income_rows],
-        )
-
     def get_tags(self) -> list[str]:
         """返回库里所有用过的标签（去重、按字典序）。
 
-        与 get_categories() 的三点差异：
-        1. 数据源是 record_tags（新世界的真源），不读 accounts.category；
-        2. 不再按金额正负拆成 (支出, 收入) 两组——Q1 取消收支方向，标签池只有一份；
-        3. 排序口径固定为 tag 的字典序（顺着 idx_record_tags_tag，结果稳定可复现）。
+        数据源是 record_tags，不读 legacy 的 accounts.category，也不按金额方向拆组。
+        排序口径固定为 tag 的字典序（顺着 idx_record_tags_tag，结果稳定可复现）。
 
         刻意不做并集回退（Step 2a 决策 3）：不把 accounts.category 的非空值并进来。
-        本方法是「新世界」的接口；其生产用途（Step 2b 的首启迁移候选池）届时读同一批数据，
-        而 Step 1 → Step 2b 之间新增记录的标签进不了候选池是可接受的（未发布、无存量用户）。
-
-        已知现状：到 Step 2b 为止它**仍然没有任何生产调用点**——接上它的是 Step 2c 的
-        tag_prefs 首启迁移（本步按约束只动 store.py，不碰 UI 与 category_prefs.py）。
-        请勿因为「没人用」就当死代码删掉——#47 踩过这个坑
-        （get_categories 曾因「看起来没人用」被误判成死代码）。
-        Step 2b 之后本方法才真正有内容可读：add / update 从本步起开始往 record_tags 写标签。
+        UI 启动时把本方法结果作为新标签偏好初始化的历史输入；偏好模块只接收该结果，
+        不直接依赖数据层，保证 store 与 tag_prefs 的职责边界清楚。
         """
         with self._connect() as connection:
             # DISTINCT + ORDER BY 都由 SQLite 做，既能命中 idx_record_tags_tag，
@@ -386,7 +333,7 @@ class AccountStore:
     def _normalize_tags(raw_tags: Iterable[str]) -> tuple[str, ...]:
         """把一批标签名整理成「TRIM + 去空 + 去重」的元组。
 
-        与 category_prefs._clean_list 的口径刻意保持一致（那边管 JSON 候选列表，
+        与 tag_prefs._clean_list 的口径刻意保持一致（那边管 JSON 候选列表，
         这里管真正写库的标签）：两处一旦不同步，就会出现「候选列表接受了、写库却被丢弃」
         或反过来的怪现象。
 

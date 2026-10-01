@@ -22,14 +22,12 @@ except ImportError:
 # 多个标签用竖线连接（§3.14.4）、0 个标签写空串，具体拼接由 store 负责。
 CSV_FIELDS = ("id", "date", "amount", "tags", "note")
 
-# 预置类别（需求 3.13）：类别下拉列表的「底表」，即使用户一条记录都没有也有可选项。
-# 之所以按支出/收入拆成两套而不是合并成一个大列表：两边的用词几乎不重叠
-# （「工资」「奖金」不会出现在支出场景，「餐饮」「水电」也不会出现在收入场景），
-# 混在一起只会让下拉列表变长、选错率变高，所以按业务语义分开维护。
-# 用元组而不是列表：这两组是全局常量，元组是不可变的，能防止调用方
-# 不小心用 append() 原地修改而污染配置（下拉列表需要 list，转换由 UI 层负责）。
-DEFAULT_EXPENSE_CATEGORIES = ("餐饮", "交通", "购物", "居住", "水电", "通讯", "医疗", "娱乐", "人情", "其他")
-DEFAULT_INCOME_CATEGORIES = ("工资", "奖金", "投资", "兼职", "红包", "报销", "退款", "其他")
+# 预置标签合并为单一候选池：先保留支出原序，再追加收入中尚未出现的项。
+# “其他”在两组里重复，只保留首次出现的位置；元组不可变，避免调用方原地污染配置。
+DEFAULT_TAGS = (
+    "餐饮", "交通", "购物", "居住", "水电", "通讯", "医疗", "娱乐", "人情", "其他",
+    "工资", "奖金", "投资", "兼职", "红包", "报销", "退款",
+)
 # 源码所在目录，用于开发环境下定位 image、snail_messages.json 等资源文件。
 BASE_DIR = Path(__file__).resolve().parent
 # 用户数据目录（Windows 下通常是 C:\Users\用户名\AppData\Local\AccountKeeper）。
@@ -51,16 +49,11 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 # settings.json 缺失、损坏、路径非法，或记住的目录已被删除/不可写时，一律回退到它。
 DEFAULT_EXPORT_DIR = DATA_DIR
 
-# 用户类别偏好文件（需求 3.13 第二轮）的路径：记录用户主动保存的类别与被隐藏的类别。
-# 刻意与 settings.json 分开两个文件，因为 settings 的写入是整份覆盖，
-# 两类数据放一起会互相洗掉（原因详见 category_prefs.py 的模块说明）。
-# 与 account.db 同目录，便于用户整体备份/迁移。
+# 旧版类别偏好文件路径：仅供 tag_prefs.py 迁移时只读，不再作为当前偏好的写入目标。
+# 保留独立路径是为了把升级用户已有的两段列表并入 tags.json；迁移不会改写或删除旧文件。
 CATEGORY_PREFS_PATH = DATA_DIR / "categories.json"
 
-# 用户常用标签文件（#58 多标签改造）：记录用户主动保存的标签，不再分支出 / 收入两段。
-# Step 1 只落地这个路径常量，本轮还没有模块读写它——真正使用它的 tag_prefs.py、
-# 以及 categories.json → tags.json 的合并迁移都排在 Step 2，所以上面的
-# CATEGORY_PREFS_PATH 必须原样保留：Step 2 的合并迁移要靠它读旧文件。
+# 用户常用标签文件：新格式的唯一读写目标，不再按支出 / 收入分段。
 # 与 account.db 同目录，同样便于用户整体备份/迁移。
 TAG_PREFS_PATH = DATA_DIR / "tags.json"
 
