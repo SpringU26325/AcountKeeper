@@ -237,7 +237,6 @@ class InputFrame(ctk.CTkFrame):
         font_small = ("Microsoft YaHei UI", 11)
         # 日期默认填今天，减少用户手动输入的次数。
         self.date_var = tk.StringVar(value=date.today().isoformat())
-        self.amount_var = tk.StringVar()
         # 默认选中「支出」，因为日常记账中支出占绝大多数。
         self.amount_type_var = tk.StringVar(value="支出")
         self.note_var = tk.StringVar()
@@ -569,12 +568,6 @@ class ToolbarFrame(ctk.CTkFrame):
             "corner_radius": 9,
             "font": font_small,
         }
-        self.search_var = tk.StringVar()
-        # 需求 3.9 要求保留变量监听：任何对 search_var 的赋值都会立刻刷新列表；
-        # 用户实际输入时则由输入框上的事件直接调用 filter_callback（见下方绑定）。
-        self.search_var.trace_add("write", filter_callback)
-        # 与金额输入框同理：为了使用原生 placeholder_text（需求 3.9）而放弃 textvariable，
-        # 所以不靠 StringVar 回写内容，筛选时统一直接读 search_entry.get()。
         self.search_entry = ctk.CTkEntry(
             self,
             width=200,

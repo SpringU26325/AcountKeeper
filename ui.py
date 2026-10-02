@@ -98,7 +98,6 @@ class AccountKeeperApp(ctk.CTk):
         # 归 InputFrame 自己管，主窗口只经 collect_tags() / clear_tags() 两个口子打交道。
         # 不把 _tags 提到主窗口，是为了不让两条路径去改同一份标签集合。
         self.date_var = self.input_frame.date_var
-        self.amount_var = self.input_frame.amount_var
         self.amount_entry = self.input_frame.amount_entry
         self.note_var = self.input_frame.note_var
 
@@ -115,7 +114,6 @@ class AccountKeeperApp(ctk.CTk):
             open_folder_callback=self.open_data_folder,
         )
         self.toolbar.pack(fill="x", padx=24, pady=(0, 10))
-        self.search_var = self.toolbar.search_var
         self.search_entry = self.toolbar.search_entry
 
         # 表格是唯一始终占据剩余空间的区域，用 expand=True 保证窗口拉大时表格跟着变大。
@@ -236,9 +234,8 @@ class AccountKeeperApp(ctk.CTk):
             messagebox.showerror("输入错误", "日期格式应为 YYYY-MM-DD，金额必须是数字。")
             return
         # 清空金额/标签/备注，但保留日期，方便用户连续录入同一天的流水。
-        self.amount_var.set("")
         # 金额框使用的是 placeholder_text 而非 textvariable，控件内容必须单独清空，
-        # 否则下一次提交会把上一次的金额重复带进去（上面的 StringVar 只是顺手重置）。
+        # 否则下一次提交会把上一次的金额重复带进去。
         self.amount_entry.delete(0, "end")
         # 标签归 InputFrame 管，主窗口只让它自己复位（连带清掉输入框里的残留文字）。
         # #58 Step 3a 之前这里写的是 self.category_var.set("")——主窗口直接改输入区的
