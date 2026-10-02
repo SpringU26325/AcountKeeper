@@ -11,7 +11,6 @@ env/
 ENV/
 
 # ---------- 打包与构建 ----------
-build/
 dist/
 *.egg-info/
 *.egg
