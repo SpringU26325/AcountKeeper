@@ -9,6 +9,7 @@ from config import RESOURCE_DIR
 from settings import get_last_export_dir
 from store import AccountStore
 from ui import AccountKeeperApp
+from window_icon import apply_window_icon_frames
 
 
 def main() -> None:
@@ -44,6 +45,9 @@ def main() -> None:
         # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，打包成 exe 后也能定位到 logo。
         icon_path = RESOURCE_DIR / "image" / "logo.ico"
         app.iconbitmap(str(icon_path))
+        # Tk may inflate the first (16px) ICO frame for both window icon sizes.
+        # Select native DPI-sized frames once its window wrapper is ready.
+        app.after_idle(lambda: apply_window_icon_frames(app, icon_path))
     except Exception as e:
         print(f"设置图标失败：{e}")
     # 新方案取消了「启动回退提示」：读不到上次导出目录只是便利功能失灵，不值得弹窗打扰用户。

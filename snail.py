@@ -6,7 +6,6 @@ import json
 import random
 import tkinter as tk
 import tkinter.font as tkfont
-from typing import cast
 
 import customtkinter as ctk
 from PIL import Image
@@ -14,7 +13,6 @@ from PIL import Image
 from config import (
     DEFAULT_SNAIL_MESSAGE,
     SNAIL_IMAGE_CANDIDATES,
-    SNAIL_IMAGE_PATH,
     SNAIL_MESSAGES_PATH,
 )
 
@@ -91,12 +89,13 @@ class SnailManager:
         """Load the snail image, create its label, and start its animation."""
         try:
             image = self._prepare_snail_image()
-            # 统一缩放到 40x40 再创建 CTkImage，避免原图过大拖慢每次重绘。
-            image.thumbnail((40, 40), Image.Resampling.LANCZOS)
+            # 40 是逻辑显示尺寸，源图保留高分辨率，让 CTk 按 DPI 直接生成清晰图像。
+            scale = 40 / max(image.size)
+            display_size = tuple(max(1, round(length * scale)) for length in image.size)
             self.snail_photo = ctk.CTkImage(
                 light_image=image,
                 dark_image=image,
-                size=image.size,
+                size=display_size,
             )
         except (OSError, ValueError) as error:
             # 装饰性元素加载失败不应该影响记账主功能，打印警告后直接放弃蜗牛。
@@ -110,6 +109,8 @@ class SnailManager:
             cursor="hand2",
             fg_color="transparent",
         )
+        # 蜗牛是标题区的悬浮装饰，显式提升层级以满足独立组件的显示要求。
+        self.snail_label.lift()
         # 先强制刷新几何信息，否则 winfo_width() 可能返回 1（窗口尚未真正布局完成）。
         self.master.update_idletasks()
         window_width = self.master.winfo_width()
@@ -161,29 +162,22 @@ class SnailManager:
             self.snail_label.place(x=self.snail_x, y=15, anchor="nw")
 
     def _prepare_snail_image(self) -> Image.Image:
-        """处理白底、等比缩放，并加深蜗牛线条颜色。"""
-        # 依次尝试候选路径，取第一个真实存在的文件；全都找不到时才退回默认路径，
-        # 这样即便将来替换/改名图片，也不会因为硬编码路径而直接崩溃。
-        image_path = next(
-            (path for path in SNAIL_IMAGE_CANDIDATES if path.exists()),
-            SNAIL_IMAGE_PATH,
-        )
-        image = Image.open(image_path).convert("RGBA")
-        # 先整体缩放到 100x100 以内再做逐像素处理，可大幅减少循环次数（性能考虑）。
-        image.thumbnail((100, 100), Image.Resampling.LANCZOS)
-        for y in range(image.height):
-            for x in range(image.width):
-                red, green, blue, alpha_value = cast(
-                    tuple[int, int, int, int], image.getpixel((x, y))
-                )
-                # 接近纯白的像素判定为背景，直接把 alpha 置 0 做成透明，
-                # 否则浅色主题下会出现一个难看的白色方块。
-                if red > 230 and green > 230 and blue > 230:
-                    image.putpixel((x, y), (red, green, blue, 0))
-                # 偏蓝的线条统一加深成深靛蓝，保证在浅色背景上足够清晰。
-                elif blue > red + 20 and blue > green + 5:
-                    image.putpixel((x, y), (30, 58, 138, alpha_value))
-        return image
+        """读取已清理的透明素材，保留源图像素与抗锯齿 alpha。"""
+        last_error: OSError | ValueError | None = None
+        for image_path in SNAIL_IMAGE_CANDIDATES:
+            try:
+                # convert 返回独立图像，退出上下文后可以关闭文件而继续交给 CTk 使用。
+                with Image.open(image_path) as source:
+                    image = source.convert("RGBA")
+                alpha_min, alpha_max = image.getchannel("A").getextrema()
+                if alpha_min == 255 or alpha_max == 0:
+                    # 旧绘图截图与全透明空图都不能充当 UI 素材，避免回退时重新带入网格。
+                    raise ValueError("蜗牛素材必须具有透明背景和可见线条")
+                return image
+            except (OSError, ValueError) as error:
+                # 候选缺失、损坏或不透明时继续尝试；装饰加载失败由 start 统一降级。
+                last_error = error
+        raise OSError("没有可用的透明蜗牛素材") from last_error
 
     def _animate_snail(self) -> None:
         """让蜗牛从右向左爬行，遇到标题和左边界时传送。"""

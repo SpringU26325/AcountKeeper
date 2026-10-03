@@ -593,12 +593,12 @@ class ToolbarFrame(ctk.CTkFrame):
         # （右键粘贴尤其不会产生按键事件），漏掉它们就会出现"粘了字但列表不刷新"。
         # 虚拟事件的控件级回调先于 Tk 的类绑定执行，此刻文本还没插进输入框，
         # 因此必须 after_idle 延后到插入完成之后再读，否则过滤用的还是旧内容。
-        self.search_entry.bind("<KeyRelease>", filter_callback, add="+")
+        self.search_entry.bind("<KeyRelease>", filter_callback, add="+")  # type: ignore[reportArgumentType] # CTk 覆写 bind 的 add 参数，Pylance 推断为 bool，实际接受 "+"
         for sequence in ("<<Paste>>", "<<PasteSelection>>", "<<Cut>>", "<<Clear>>"):
             self.search_entry.bind(
                 sequence,
                 lambda _event: self.after_idle(filter_callback),
-                add="+",
+                add="+",  # type: ignore[reportArgumentType] # CTk 覆写 bind 的 add 参数，Pylance 推断为 bool，实际接受 "+"
             )
         # 工具按钮按「轻-重」顺序从左到右排列，删除这类破坏性操作用红色以示警示。
         # 六个按钮共用同一套 grid 参数：sticky="ew" 让按钮撑满所在列（列有多宽按钮就多宽）；

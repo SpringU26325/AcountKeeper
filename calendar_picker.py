@@ -63,7 +63,7 @@ _WEEKDAY_HEADERS = ("日", "一", "二", "三", "四", "五", "六")
 _CALENDAR = calendar.Calendar(firstweekday=calendar.SUNDAY)
 
 
-def _apply_logo_icon(window: tk.Misc) -> None:
+def _apply_logo_icon(window: tk.Tk | tk.Toplevel) -> None:
     """为弹窗设置项目 logo 图标。
 
     这里没有复用 dialogs._apply_logo_icon：dialogs.py 需要导入本模块调用 ask_date，
@@ -103,7 +103,7 @@ def _physical_size(window: tk.Misc, mode: str) -> tuple[int, int]:
     return (int(width * scale), int(height * scale))
 
 
-def _center_window(window: tk.Misc, size: tuple[int, int] | None = None) -> None:
+def _center_window(window: tk.Tk | tk.Toplevel, size: tuple[int, int] | None = None) -> None:
     """按窗口的真实尺寸，把它摆到屏幕水平居中、垂直略偏上的位置。
 
     **这是没有 anchor 时的兜底**：正常路径走 _anchor_to_input（贴输入框）。
@@ -128,7 +128,7 @@ def _center_window(window: tk.Misc, size: tuple[int, int] | None = None) -> None
 
 
 def _anchor_to_input(
-    window: tk.Misc,
+    window: tk.Tk | tk.Toplevel,
     anchor: tk.Misc | None,
     size: tuple[int, int] | None = None,
 ) -> None:
@@ -228,12 +228,15 @@ def _render_month() -> None:
 
     月份切换时直接销毁旧按钮重新生成，比逐个改文字更简单，也不会残留上一月的高亮状态。
     """
-    state = _ses.state
+    win = _win
+    ses = _ses
+    assert win is not None and ses is not None  # 固定本次调用的容器引用，供静态检查收窄类型。
+    state = ses.state
     year = int(state["year"])
     month = int(state["month"])
     selected = state["selected"]
-    day_grid = _win.day_grid
-    _win.month_label.configure(text=f"{year} 年 {month} 月")
+    day_grid = win.day_grid
+    win.month_label.configure(text=f"{year} 年 {month} 月")
 
     # 【复用前提】每次重绘都必须把上一批格子**真正销毁**：复用后窗口不重建，
     # 漏掉这一行就会在换月后残留旧按钮。
@@ -272,7 +275,7 @@ def _render_month() -> None:
                 width=36,
                 height=30,
                 corner_radius=8,
-                font=_win.font,
+                font=win.font,
                 # 选中日期用主题蓝底白字，其余用白底深字，一眼可辨。
                 fg_color=_ACCENT_COLOR if is_selected else "#FFFFFF",
                 hover_color=_ACCENT_HOVER_COLOR if is_selected else _SUBTLE_HOVER_COLOR,
@@ -282,7 +285,9 @@ def _render_month() -> None:
 
 def _shift_month(delta: int) -> None:
     """上一月 / 下一月：跨年时自动借位（1 月减一月 → 上一年 12 月）。"""
-    state = _ses.state
+    ses = _ses
+    assert ses is not None  # 固定本次调用的会话引用，供静态检查收窄类型。
+    state = ses.state
     month = int(state["month"]) + delta
     year = int(state["year"])
     if month < 1:
@@ -295,15 +300,19 @@ def _shift_month(delta: int) -> None:
 
 def _choose(day: int) -> None:
     """点击某一天：写回结果并关闭弹窗（关闭 = 收尾 + 隐藏 + 唤醒等待方）。"""
-    state = _ses.state
-    _ses.result[0] = date(int(state["year"]), int(state["month"]), day).isoformat()
+    ses = _ses
+    assert ses is not None  # 固定本次调用的会话引用，供静态检查收窄类型。
+    state = ses.state
+    ses.result[0] = date(int(state["year"]), int(state["month"]), day).isoformat()
     _close()
 
 
 def _goto_today() -> None:
     """「今日」按钮：跳回今天所在月份并高亮今天（不关闭弹窗，仍需点日期确认）。"""
-    today = _ses.today
-    _ses.state["year"], _ses.state["month"], _ses.state["selected"] = (
+    ses = _ses
+    assert ses is not None  # 固定本次调用的会话引用，供静态检查收窄类型。
+    today = ses.today
+    ses.state["year"], ses.state["month"], ses.state["selected"] = (
         today.year,
         today.month,
         today,
@@ -318,12 +327,15 @@ def _update_header_title() -> None:
     _apply_mode_chrome 也必须调一次——render 跑在 deiconify **之后**，不先设的话
     切模式后的第一帧还挂着上一个模式的文字（比如月份弹窗先闪一下「2026 年 9 月」）。
     """
-    if _ses.mode == "month":
-        text = f"{int(_ses.month_state['year'])} 年"
+    win = _win
+    ses = _ses
+    assert win is not None and ses is not None  # 固定本次调用的容器引用，供静态检查收窄类型。
+    if ses.mode == "month":
+        text = f"{int(ses.month_state['year'])} 年"
     else:
-        state = _ses.state
+        state = ses.state
         text = f"{int(state['year'])} 年 {int(state['month'])} 月"
-    _win.month_label.configure(text=text)
+    win.month_label.configure(text=text)
 
 
 def _shift_cursor(delta: int) -> None:
@@ -334,7 +346,9 @@ def _shift_cursor(delta: int) -> None:
     路径上都记得重绑，漏掉一条就会在特定切换顺序下翻错单位，而那种 bug 只在
     用户按特定顺序来回切时才会冒出来。
     """
-    if _ses.mode == "month":
+    ses = _ses
+    assert ses is not None  # 固定本次调用的会话引用，供静态检查收窄类型。
+    if ses.mode == "month":
         _shift_year(delta)
     else:
         _shift_month(delta)
@@ -346,16 +360,21 @@ def _shift_year(delta: int) -> None:
     这里**没有** _shift_month 那套跨年借位（1 月减一个月 → 上一年 12 月）：
     月份模式翻的是整年，12 月/1 月根本不参与计算。
     """
-    _ses.month_state["year"] = int(_ses.month_state["year"]) + delta
+    ses = _ses
+    assert ses is not None  # 固定本次调用的会话引用，供静态检查收窄类型。
+    ses.month_state["year"] = int(ses.month_state["year"]) + delta
     _render_months()
 
 
 def _render_months() -> None:
     """按 _ses.month_state 里的年份重绘 12 个月份格（4 列 × 3 行）。"""
-    month_state = _ses.month_state
+    win = _win
+    ses = _ses
+    assert win is not None and ses is not None  # 固定本次调用的容器引用，供静态检查收窄类型。
+    month_state = ses.month_state
     year = int(month_state["year"])
     selected = month_state["selected"]
-    month_grid = _win.month_grid
+    month_grid = win.month_grid
     _update_header_title()
 
     # 【复用前提】与 _render_month 同理：每次重绘必须把上一批格子**真正销毁**，
@@ -380,7 +399,7 @@ def _render_months() -> None:
             width=36,
             height=30,
             corner_radius=8,
-            font=_win.font,
+            font=win.font,
             # 与日期模式同一套配色：选中项主题蓝底白字，其余白底深字。
             fg_color=_ACCENT_COLOR if is_selected else "#FFFFFF",
             hover_color=_ACCENT_HOVER_COLOR if is_selected else _SUBTLE_HOVER_COLOR,
@@ -392,7 +411,9 @@ def _choose_month(iso: str) -> None:
     """点击某个月份：写回结果并关闭弹窗（关闭 = 收尾 + 隐藏 + 唤醒等待方）。"""
     # 直接写闭包里带进来的完整值，不再从 month_state 现算：格子上显示的年份与
     # 写回的结果因此不可能不一致。返回值仍是严格的 YYYY-MM（补零）。
-    _ses.result[0] = iso
+    ses = _ses
+    assert ses is not None  # 固定本次调用的会话引用，供静态检查收窄类型。
+    ses.result[0] = iso
     _close()
 
 
@@ -402,22 +423,26 @@ def _goto_this_month() -> None:
     刻意**不动** _ses.state：两种模式共用一个窗口实例，顺手改掉日期模式的年月会让
     用户切回日期模式时莫名被跳到今天那一月。月份模式只改自己那份 month_state。
     """
-    today = _ses.today
-    _ses.month_state["year"] = today.year
-    _ses.month_state["selected"] = f"{today.year:04d}-{today.month:02d}"
+    ses = _ses
+    assert ses is not None  # 固定本次调用的会话引用，供静态检查收窄类型。
+    today = ses.today
+    ses.month_state["year"] = today.year
+    ses.month_state["selected"] = f"{today.year:04d}-{today.month:02d}"
     _render_months()
 
 
-def _ensure_month_body() -> tk.Misc:
+def _ensure_month_body() -> ctk.CTkFrame:
     """懒创建月份模式主体（只有 12 格网格；顶部标题与箭头沿用 header 那一份）。
 
     只在第一次切到月份模式时建一次，之后复用。返回容器本身，方便调用方直接
     链式 pack(...)。本函数只建窗口级控件树、不读 _ses，所以不存在「复用后撞上
     上一次打开的状态」这类问题。
     """
-    if _win.month_body is not None:
-        return _win.month_body
-    body = ctk.CTkFrame(_win.dialog, fg_color="transparent")
+    win = _win
+    assert win is not None  # 固定本次调用的窗口引用，供静态检查收窄类型。
+    if win.month_body is not None:
+        return win.month_body
+    body = ctk.CTkFrame(win.dialog, fg_color="transparent")
     month_grid = ctk.CTkFrame(body, fg_color="transparent")
     # 内边距与日期模式的 day_grid 对齐（左右 16、上方 6）：两种模式的网格左右边缘
     # 才会重合，来回切换时不会左右挪一下。
@@ -428,8 +453,8 @@ def _ensure_month_body() -> tk.Misc:
         month_grid.grid_columnconfigure(column, weight=1, uniform="month")
     for row in range(3):
         month_grid.grid_rowconfigure(row, weight=1)
-    _win.month_body = body
-    _win.month_grid = month_grid
+    win.month_body = body
+    win.month_grid = month_grid
     return body
 
 
@@ -445,21 +470,23 @@ def _apply_mode_chrome(mode: str) -> None:
     不在这里（它们在 _begin_session，要和预置坐标的先后顺序放在一起看），
     高亮与网格内容也不在这里（由 _render_month / _render_months 负责）。
     """
+    win = _win
+    assert win is not None  # 固定本次调用的窗口引用，供静态检查收窄类型。
     is_month = mode == "month"
     # 【主体显隐】pack_forget() 会把 packing 选项整个丢掉，所以重新 pack 时必须
     # **写全所有选项**（fill / expand），并且带上 before=_win.footer——否则新主体会
     # 追加到按钮后面去，画面上就是「网格跑到两个按钮下面」。
     if is_month:
-        _win.date_body.pack_forget()
-        _ensure_month_body().pack(fill="both", expand=True, before=_win.footer)
+        win.date_body.pack_forget()
+        _ensure_month_body().pack(fill="both", expand=True, before=win.footer)
     else:
         # 月份主体可能还没建过（用户从没切到过月份模式），所以先判空再 forget。
-        if _win.month_body is not None:
-            _win.month_body.pack_forget()
-        _win.date_body.pack(fill="both", expand=True, before=_win.footer)
+        if win.month_body is not None:
+            win.month_body.pack_forget()
+        win.date_body.pack(fill="both", expand=True, before=win.footer)
     # 【底部左键】按钮是窗口级、只建一次，语义却按模式变（今日 / 本月），
     # 所以每次打开都要重设文字与命令；漏一次就会带着上一个模式的语义开着。
-    _win.footer_left.configure(
+    win.footer_left.configure(
         text="本月" if is_month else "今日",
         command=_goto_this_month if is_month else _goto_today,
     )
@@ -481,7 +508,10 @@ def _recenter(_event: tk.Event | None = None) -> None:
     尺寸变化时也仍然按**锚点**（而不是屏幕）重算，这样换月导致行数从 6 行变 5 行、
     弹窗变矮时，它会自己重新贴回输入框下方，而不是跑到屏幕中央去。
     """
-    dialog = _win.dialog
+    win = _win
+    ses = _ses
+    assert win is not None and ses is not None  # 固定本次调用的容器引用，供静态检查收窄类型。
+    dialog = win.dialog
     width, height = dialog.winfo_width(), dialog.winfo_height()
     # 窗口尚未映射时 winfo_width() 只返回 1，用它算出的坐标毫无意义，
     # 重摆反而会让窗口先闪一下再归位，所以跳过，等真正的尺寸事件。
@@ -490,10 +520,10 @@ def _recenter(_event: tk.Event | None = None) -> None:
     size = (width, height)
     # last_size 存的是元组本身；若存成 [元组] 的列表，下面 `size == last_size`
     # 会变成「元组 == 列表」，恒为 False，守卫就失效了。
-    if size == _ses.last_size:
+    if size == ses.last_size:
         return  # 尺寸没变却收到事件 → 是拖动产生的位移，尊重用户摆的位置
-    _ses.last_size = size
-    _anchor_to_input(dialog, _ses.anchor, size)
+    ses.last_size = size
+    _anchor_to_input(dialog, ses.anchor, size)
 
 
 def _deferred_setup() -> None:
@@ -601,7 +631,7 @@ def _on_destroy(event: tk.Event) -> None:
     _wake()
 
 
-def _ensure_window(parent: tk.Misc, mode: str) -> None:
+def _ensure_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
     """懒创建弹窗：只有第一次打开时才真正建窗，之后一直复用同一个实例。
 
     窗口级的东西（控件树、字体）只在这里建一次；打开级状态一律不进这里，
@@ -772,7 +802,7 @@ def _ensure_window(parent: tk.Misc, mode: str) -> None:
 
 
 def _begin_session(
-    parent: ctk.CTk,
+    parent: tk.Tk | tk.Toplevel,
     mode: str,
     title: str,
     anchor: tk.Misc | None,
@@ -801,7 +831,9 @@ def _begin_session(
     # 那笔回调会把紧随其后的隐藏动作原样撤销（实测隐藏后 viewable 仍为 1），
     # 所以「建完就藏」的复用写法在这里不成立。
     _ensure_window(parent, mode)
-    dialog = _win.dialog
+    win = _win
+    assert win is not None  # 固定本次调用的窗口引用，供静态检查收窄类型。
+    dialog = win.dialog
     # parent 每次可能不同（主窗口 / 编辑记录弹窗），transient 必须每次重设：
     # 认错父窗口会导致弹窗跑到主窗口下面，或跟着父窗口一起最小化消失。
     dialog.transient(parent)
@@ -839,6 +871,8 @@ def _begin_session(
         setup_idle=[None],
         configure_funcid=[None],
     )
+    ses = _ses
+    assert ses is not None  # 固定本次调用的会话引用，供静态检查收窄类型。
 
     # 【每次打开都要重设标题栏】建窗时只设过一次；复用打开若不重设，月份弹窗会顶着
     # 「选择日期」的标题栏（反之亦然）——标题是窗口级的，不会随模式自己变。
@@ -855,15 +889,15 @@ def _begin_session(
     # 【setup 只做一次】protocol / <Escape> / <Destroy> / logo 图标都是窗口级的，
     # 只安排一次即可。若首次打开的 idle 还没跑就被关掉，_cleanup 会取消它，
     # 此时 setup_done 仍为 False，下一次打开会重新安排，不会永久丢失。
-    if not _win.setup_done and _ses.setup_idle[0] is None:
-        _ses.setup_idle[0] = dialog.after_idle(_deferred_setup)
+    if not win.setup_done and ses.setup_idle[0] is None:
+        ses.setup_idle[0] = dialog.after_idle(_deferred_setup)
 
     # 【预置坐标】deiconify 之前先摆好，窗口第一帧就落在正确位置，不会先在
     # 用户上次拖到的位置露一帧再跳回来（实测那段错位帧 29~46ms）。
     # 尺寸优先用「该模式上一次显示量到的真实尺寸」；该模式首次打开时没有可信尺寸，
     # 用逻辑常量换算（不能读 winfo_width()，未映射时它只会谎报 200）。
     # 两条路径都走 _anchor_to_input：anchor 可用就贴输入框，不可用才退回屏幕居中。
-    _anchor_to_input(dialog, anchor, _win.last_size[mode] or _physical_size(dialog, mode))
+    _anchor_to_input(dialog, anchor, win.last_size[mode] or _physical_size(dialog, mode))
 
     # 【先显示】deiconify 必须早于任何依赖 winfo_width()/height() 的计算：
     # 窗口未映射时这些值不可信（首次映射前恒为 1）。
@@ -871,7 +905,7 @@ def _begin_session(
 
     # 每次打开重新登记 <Configure>，拿 funcid 以便关闭时精确解绑。
     # 必须 add="+"：CTkToplevel 内部也用 <Configure> 跟踪窗口尺寸，直接 bind 会顶掉它。
-    _ses.configure_funcid[0] = tk.Misc.bind(dialog, "<Configure>", _recenter, add="+")
+    ses.configure_funcid[0] = tk.Misc.bind(dialog, "<Configure>", _recenter, add="+")
 
     # 【结束信号】到这里窗口已经显示、位置已定、控件已就绪，剩下的收尾工作挪到
     # _finish_session（渲染 → 校位 → 模态阻塞 → 取值）。
@@ -884,7 +918,9 @@ def _finish_session(render: Callable[[], None], what: str) -> str | None:
     render 传的是**函数对象**（_render_month / _render_months）而不是调用结果：它必须
     在 try 里面跑，渲染失败才能走「隐藏 + 返回 None」，而不是留下一个关不掉的空壳。
     """
-    dialog = _win.dialog
+    win = _win
+    assert win is not None  # 固定本次调用的窗口引用，供静态检查收窄类型。
+    dialog = win.dialog
 
     # 首次绘制必须在控件创建之后。这里额外包一层容错，但复用后**不能再 destroy**：
     # 渲染失败与用户取消走同一条路（隐藏 + 返回 None），否则会留下一个关不掉的
@@ -904,12 +940,13 @@ def _finish_session(render: Callable[[], None], what: str) -> str | None:
     # 销毁，wait_window 会一直不返回。改为等一个每次打开都新建的变量，由 _close()
     # （用户选中/取消）与 _on_destroy（主窗口退出）负责唤醒。
     session = _ses
+    assert session is not None  # 保留等待前的取值时机，并收窄已有会话别名。
     dialog.grab_set()
     dialog.wait_variable(session.signal)
     return session.result[0]
 
 
-def ask_date(parent: ctk.CTk, initial_date: str, anchor: tk.Misc | None = None) -> str | None:
+def ask_date(parent: tk.Tk | tk.Toplevel, initial_date: str, anchor: tk.Misc | None = None) -> str | None:
     """弹出日历选择器。
 
     Args:
@@ -927,12 +964,14 @@ def ask_date(parent: ctk.CTk, initial_date: str, anchor: tk.Misc | None = None) 
     _begin_session(parent, "date", "选择日期", anchor, initial.year, initial.month)
     # 日期模式独有的回填：_begin_session 只保证「展示的年月」对得上，具体高亮哪一天
     # 由这里写进去（_render_month 要求年月日全等才高亮，所以必须回填完整日期）。
-    _ses.state["selected"] = initial
+    ses = _ses
+    assert ses is not None  # 固定本次调用的会话引用，供静态检查收窄类型。
+    ses.state["selected"] = initial
     return _finish_session(_render_month, "日历")
 
 
 def ask_month(
-    parent: ctk.CTk,
+    parent: tk.Tk | tk.Toplevel,
     initial_month: str | None = None,
     anchor: tk.Misc | None = None,
     title: str = "选择月份",
@@ -959,6 +998,8 @@ def ask_month(
     _begin_session(parent, "month", title, anchor, year, month)
     # 月份模式独有的回填：与日期模式同一口径（完整值全等才高亮），所以这里写的是
     # "YYYY-MM" 字符串。initial_month 不合法时一格都不亮，但「本月」按钮仍然可用。
+    ses = _ses
+    assert ses is not None  # 固定本次调用的会话引用，供静态检查收窄类型。
     if initial is not None:
-        _ses.month_state["selected"] = f"{year:04d}-{month:02d}"
+        ses.month_state["selected"] = f"{year:04d}-{month:02d}"
     return _finish_session(_render_months, "月份选择器")
