@@ -418,6 +418,6 @@ class AccountKeeperApp(ctk.CTk):
     def ask_edit_record(
         self,
         record: Account,
-    ) -> tuple[str, Decimal, str, str] | None:
+    ) -> tuple[str, Decimal, tuple[str, ...], str] | None:
         """保留旧接口，实际对话框由 dialogs 模块负责。"""
         return dialogs.ask_edit_record(self, record)

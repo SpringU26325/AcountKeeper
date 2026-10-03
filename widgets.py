@@ -480,10 +480,6 @@ class InputFrame(ctk.CTkFrame):
         self.tag_chips.grid(
             row=1, column=1, columnspan=3, padx=0, pady=(5, 0), sticky="ew"
         )
-        # 兼容既有调用与探针：变量和控件仍是同一对象，不复制状态。
-        self.tag_input_var = self.tag_chips.tag_input_var
-        self.chips_frame = self.tag_chips.chips_frame
-        self.tag_button = self.tag_chips.tag_button
 
         # ---------- 第三行：备注 ----------
         # 标签区（chips 会换行）占了第二行整行，备注不能再和它并排，因此下移到第三行；
