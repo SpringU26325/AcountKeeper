@@ -15,6 +15,7 @@ import customtkinter as ctk
 # 同名的 ask_month 包装函数互相覆盖（后者会遮蔽前者的名字）。
 from calendar_picker import ask_date, ask_month as picker_ask_month
 from config import RESOURCE_DIR
+from dialog_lifecycle import ManagedToplevel
 from store import Account
 from widgets import TagChipsFrame
 
@@ -90,7 +91,7 @@ def ask_edit_record(
     标签候选不由调用方传入：点 ▼ 时由 picker 从唯一标签池现算，
     不随编辑中的金额符号变化；Decimal 与 InvalidOperation 仍用于金额解析和校验。
     """
-    dialog = ctk.CTkToplevel(parent)
+    dialog = ManagedToplevel(parent)
     dialog.title("编辑记录")
     dialog.minsize(460, 360)
     dialog.maxsize(460, _edit_dialog_max_height(dialog))
@@ -227,10 +228,14 @@ def ask_edit_record(
     buttons.grid_columnconfigure((0, 1), weight=1)
 
     def cancel() -> None:
+        if dialog.closing:
+            return  # 构建期间已收到关闭请求，不再重复确认或取消。
         # 返回 None 表示取消，调用方据此不做任何更新。
         dialog.destroy()
 
     def confirm() -> None:
+        if dialog.closing:
+            return  # 取消先到时，后续回车不能再改写返回结果。
         try:
             # 日期格式与金额合法性同时校验，任一失败都走统一的错误提示。
             parsed_date = datetime.strptime(
@@ -287,6 +292,9 @@ def ask_edit_record(
     dialog.protocol("WM_DELETE_WINDOW", cancel)
     dialog.bind("<Return>", lambda _event: confirm())
     dialog.bind("<Escape>", lambda _event: cancel())
+    dialog.finish_setup()
+    if dialog.closing:
+        return None  # 初始化期间被关闭，不再给已销毁窗口设置焦点或 grab。
     entries[0].focus_set()
     # 锁住焦点并阻塞等待，确保返回的编辑结果一定已经由用户确认。
     dialog.grab_set()
@@ -298,7 +306,7 @@ def confirm_delete(parent: ctk.CTk) -> bool:
     """显示不带系统快捷键标记的删除确认框。"""
     # 不用 messagebox.askyesno，是因为系统弹窗无法定制文字与配色，
     # 也无法明确哪个按钮是"危险"操作。
-    dialog = ctk.CTkToplevel(parent)
+    dialog = ManagedToplevel(parent)
     dialog.title("确认删除")
     dialog.geometry("360x180")
     dialog.resizable(False, False)
@@ -325,10 +333,14 @@ def confirm_delete(parent: ctk.CTk) -> bool:
     buttons.grid_columnconfigure((0, 1), weight=1)
 
     def cancel() -> None:
+        if dialog.closing:
+            return
         # 保持 result[0] 为 False，调用方据此放弃删除。
         dialog.destroy()
 
     def confirm() -> None:
+        if dialog.closing:
+            return
         result[0] = True
         dialog.destroy()
 
@@ -358,6 +370,9 @@ def confirm_delete(parent: ctk.CTk) -> bool:
     dialog.protocol("WM_DELETE_WINDOW", cancel)
     dialog.bind("<Return>", lambda _event: confirm())
     dialog.bind("<Escape>", lambda _event: cancel())
+    dialog.finish_setup()
+    if dialog.closing:
+        return False  # 关闭请求优先，保持删除确认的取消语义。
     # grab_set 阻止用户在删除确认期间操作主窗口；
     # wait_window 阻塞调用方直到对话框关闭，保证返回值一定是最终决定。
     dialog.grab_set()

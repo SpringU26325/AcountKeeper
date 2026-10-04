@@ -48,6 +48,7 @@ import customtkinter as ctk
 from tag_prefs import build_tag_candidates, delete_tag, move_tag_to_top, save_tag
 # config 是叶子模块（不导入任何项目模块），引用它的 RESOURCE_DIR 不会形成循环依赖。
 from config import RESOURCE_DIR
+from dialog_lifecycle import ManagedToplevel
 
 # 与 calendar_picker.py / dialogs.py 的弹窗保持同一套浅色主题配色。
 _BG_COLOR = "#F0F4F8"
@@ -328,7 +329,7 @@ def ask_tags(
         except tk.TclError:
             previous_grab = None
 
-    dialog = ctk.CTkToplevel(parent)
+    dialog = ManagedToplevel(parent)
     dialog.title("选择标签")
     # 【Step 2.1】改用 tk.Wm.resizable 绕开 CTkToplevel.resizable 的覆写：后者在 Windows 上
     # 会额外安排一次 after(10, _windows_set_titlebar_color)，实测白耗 sync 12.5ms / visible 34.8ms。
@@ -474,7 +475,9 @@ def ask_tags(
         _clear_picker(dialog)
         # 把开头借走的 grab 还回调用方（编辑记录弹窗的模态性不能因为开了个标签列表
         # 就永久丢掉）。调用方可能已被连带销毁，所以要先判断窗口还在不在。
-        if previous_grab is not None:
+        if previous_grab is not None and not (
+            isinstance(parent, ManagedToplevel) and parent.closing
+        ):
             try:
                 if previous_grab.winfo_exists():
                     previous_grab.grab_set()
@@ -482,7 +485,9 @@ def ask_tags(
                 pass
         # 焦点还给锚点：弹窗一销毁焦点就落到一个不存在的窗口上，键盘操作会短暂失灵。
         try:
-            if anchor.winfo_exists():
+            if anchor.winfo_exists() and not (
+                isinstance(parent, ManagedToplevel) and parent.closing
+            ):
                 anchor.focus_set()
         except tk.TclError:
             pass
@@ -1279,7 +1284,10 @@ def ask_tags(
     # 这里刻意不 grab_set（与 calendar_picker 相反）：一旦 grab，弹窗外的一切点击都被
     # Tk 拒绝，「再点一次同一个 ▼ 关闭」和「点外面关闭」这两条需求就永远实现不了。
     # 调用方原本握着的 grab 已在函数开头借走，_cleanup 里会原样还回去。
-    parent.wait_window(dialog)
+    # 所有控件、绑定与清理出口都就绪后，才允许兑现父窗的关闭请求。
+    dialog.finish_setup()
+    if not dialog.closing:
+        parent.wait_window(dialog)
     # 再兜一次：不管弹窗走的是哪条关闭路径，函数返回前保证回调和定时器都已摘掉。
     _cleanup()
     return result[0]

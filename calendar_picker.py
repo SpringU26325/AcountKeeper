@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date, datetime
 from types import SimpleNamespace
 import calendar
@@ -218,16 +219,64 @@ def _parse_iso_month(value: str | None) -> tuple[int, int] | None:
 #   _win —— 窗口级：整个进程只建一次窗，只有主窗口销毁时才真正 destroy。
 #   _ses —— 打开级：每次「打开 → 关闭」是一个完整周期，关闭时收尾、打开时整体重建。
 # 所有回调都从这两个容器「现读」，不靠闭包捕获，因此复用后不会读到上一次的旧状态
-# （日期格子每次重建，_choose 若捕获旧值就会写到上一月去）。
+# 格子本身跨会话复用，但每次渲染更新命令，避免回填上一月或上一年的值。
 _win: SimpleNamespace | None = None
 _ses: SimpleNamespace | None = None
 
 
-def _render_month() -> None:
-    """按 _ses.state 里的年月重绘日期网格。
+@dataclass
+class _GridCell:
+    button: ctk.CTkButton
+    text: str = ""
+    selected: bool = False
+    visible: bool = False
 
-    月份切换时直接销毁旧按钮重新生成，比逐个改文字更简单，也不会残留上一月的高亮状态。
-    """
+
+def _render_grid(
+    grid: ctk.CTkFrame,
+    cells: list[_GridCell],
+    items: list[tuple[str, Callable[[], None] | None, bool]],
+    columns: int,
+    font: tuple[str, int],
+) -> None:
+    """日期与月份共用格子复用逻辑，只重绘有变化的内容。"""
+    for index, (text, command, selected) in enumerate(items):
+        if index == len(cells):
+            # 控件属于外窗，首次使用才创建；翻页及重新打开只更新这份引用。
+            cells.append(_GridCell(ctk.CTkButton(
+                grid, text="", state=tk.DISABLED, width=36, height=30,
+                corner_radius=8, font=font, fg_color="#FFFFFF",
+                hover_color=_SUBTLE_HOVER_COLOR, text_color=_TEXT_COLOR,
+            )))
+        cell = cells[index]
+        visible = command is not None
+        changes: dict[str, object] = {}
+        if cell.text != text:
+            changes["text"] = text  # 同一月份重新打开时保留文字，减少Canvas重绘。
+        if cell.selected != selected:
+            # 取消上一会话高亮与设置新高亮走同一分支，避免复用后残留蓝色。
+            changes.update(
+                fg_color=_ACCENT_COLOR if selected else "#FFFFFF",
+                hover_color=_ACCENT_HOVER_COLOR if selected else _SUBTLE_HOVER_COLOR,
+                text_color="#FFFFFF" if selected else _TEXT_COLOR,
+            )
+        if cell.visible != visible:
+            changes["state"] = tk.NORMAL if visible else tk.DISABLED
+        if visible or changes:
+            # 即使文字未变，月份格子的年份闭包也必须更新；空格同时清空旧命令。
+            cell.button.configure(command=command, **changes)
+        if cell.visible != visible:
+            if visible:
+                row, column = divmod(index, columns)
+                cell.button.grid(row=row, column=column, padx=1, pady=1, sticky="nsew")
+            else:
+                # CTk的grid_forget还清除缩放时重放的布局记录，防止DPI变化把空格重新显示。
+                cell.button.grid_forget()
+        cell.text, cell.selected, cell.visible = text, selected, visible
+
+
+def _render_month() -> None:
+    """按本次年月更新日期格，固定保留最多六周的控件。"""
     win = _win
     ses = _ses
     assert win is not None and ses is not None  # 固定本次调用的容器引用，供静态检查收窄类型。
@@ -235,13 +284,7 @@ def _render_month() -> None:
     year = int(state["year"])
     month = int(state["month"])
     selected = state["selected"]
-    day_grid = win.day_grid
-    win.month_label.configure(text=f"{year} 年 {month} 月")
-
-    # 【复用前提】每次重绘都必须把上一批格子**真正销毁**：复用后窗口不重建，
-    # 漏掉这一行就会在换月后残留旧按钮。
-    for child in day_grid.winfo_children():
-        child.destroy()
+    _update_header_title()
 
     # 注意：monthcalendar 是 calendar 模块的**函数**，Calendar **实例**上并没有它，
     # 实例对应的方法是 monthdayscalendar。若误调 monthcalendar 会直接抛 AttributeError，
@@ -250,37 +293,17 @@ def _render_month() -> None:
     # 全局状态一旦被其他代码改过，下面的星期表头就会和日期列对不上。
     # 返回值为按周分行的二维列表，本月之外的日子用 0 补齐。
     weeks = _CALENDAR.monthdayscalendar(year, month)
-    for row, week in enumerate(weeks):
-        for column, day in enumerate(week):
-            if day == 0:
-                # 非本月日期：需求要求留空，不放任何可点击控件。
-                ctk.CTkLabel(day_grid, text="", height=30).grid(
-                    row=row, column=column, padx=1, pady=1, sticky="nsew"
-                )
-                continue
-
-            # 只有「年月日」全部一致才高亮，避免每月同号的日子被误点亮。
-            is_selected = (
-                isinstance(selected, date)
-                and selected.year == year
-                and selected.month == month
-                and selected.day == day
-            )
-            ctk.CTkButton(
-                day_grid,
-                text=str(day),
-                # 用默认参数把「这一格代表哪天」钉死在闭包里；回调本体再读 _ses.state，
-                # 两者都指向本次打开，复用后不会串到上一月。
-                command=lambda picked=day: _choose(picked),
-                width=36,
-                height=30,
-                corner_radius=8,
-                font=win.font,
-                # 选中日期用主题蓝底白字，其余用白底深字，一眼可辨。
-                fg_color=_ACCENT_COLOR if is_selected else "#FFFFFF",
-                hover_color=_ACCENT_HOVER_COLOR if is_selected else _SUBTLE_HOVER_COLOR,
-                text_color="#FFFFFF" if is_selected else _TEXT_COLOR,
-            ).grid(row=row, column=column, padx=1, pady=1, sticky="nsew")
+    days = [day for week in weeks for day in week]
+    days.extend([0] * (42 - len(days)))  # 四/五周月份也清空隐藏第六周，防止旧日期残留。
+    items: list[tuple[str, Callable[[], None] | None, bool]] = []
+    for day in days:
+        if day == 0:
+            items.append(("", None, False))
+        else:
+            # 钉住格子显示的日号，年月由_choose读取当前会话；高亮仍比较完整日期。
+            items.append((str(day), lambda picked=day: _choose(picked),
+                          selected == date(year, month, day)))
+    _render_grid(win.day_grid, win.day_cells, items, 7, win.font)
 
 
 def _shift_month(delta: int) -> None:
@@ -335,7 +358,8 @@ def _update_header_title() -> None:
     else:
         state = ses.state
         text = f"{int(state['year'])} 年 {int(state['month'])} 月"
-    win.month_label.configure(text=text)
+    if win.month_label.cget("text") != text:
+        win.month_label.configure(text=text)  # 重复打开同一年月时不重画未变的标题。
 
 
 def _shift_cursor(delta: int) -> None:
@@ -374,16 +398,9 @@ def _render_months() -> None:
     month_state = ses.month_state
     year = int(month_state["year"])
     selected = month_state["selected"]
-    month_grid = win.month_grid
     _update_header_title()
-
-    # 【复用前提】与 _render_month 同理：每次重绘必须把上一批格子**真正销毁**，
-    # 复用后窗口不重建，漏掉这一行就会在换年后残留旧按钮。
-    for child in month_grid.winfo_children():
-        child.destroy()
-
+    items: list[tuple[str, Callable[[], None] | None, bool]] = []
     for month in range(1, 13):
-        row, column = divmod(month - 1, 4)
         # 「这一格代表哪个月」连同年份一起用默认参数钉死在闭包里，回调拿到的是
         # 完整 "YYYY-MM"：窗口上显示的年份与写回的结果因此不可能不一致
         # （重绘与点击之间年份被改过的情况也不怕）。
@@ -391,20 +408,8 @@ def _render_months() -> None:
         # 只有「年 + 月」都与选中项一致才高亮。selected 存的是 "YYYY-MM" 字符串
         # 而不是月份数字，正是为了这一句：只比月份的话，翻到 2025 年时 9 月那格
         # 还会亮着，看起来像「2025-09 已被选中」。
-        is_selected = selected == iso
-        ctk.CTkButton(
-            month_grid,
-            text=f"{month} 月",
-            command=lambda picked=iso: _choose_month(picked),
-            width=36,
-            height=30,
-            corner_radius=8,
-            font=win.font,
-            # 与日期模式同一套配色：选中项主题蓝底白字，其余白底深字。
-            fg_color=_ACCENT_COLOR if is_selected else "#FFFFFF",
-            hover_color=_ACCENT_HOVER_COLOR if is_selected else _SUBTLE_HOVER_COLOR,
-            text_color="#FFFFFF" if is_selected else _TEXT_COLOR,
-        ).grid(row=row, column=column, padx=1, pady=1, sticky="nsew")
+        items.append((f"{month} 月", lambda picked=iso: _choose_month(picked), selected == iso))
+    _render_grid(win.month_grid, win.month_cells, items, 4, win.font)
 
 
 def _choose_month(iso: str) -> None:
@@ -625,10 +630,15 @@ def _close() -> None:
 
 
 def _on_destroy(event: tk.Event) -> None:
-    """弹窗被真正销毁时（只有主窗口退出这一条路）兜底唤醒等待方，避免卡死。"""
+    """父窗退出或外部销毁时唤醒等待方，并释放已失效的窗口缓存。"""
+    global _win
     if _win is None or event.widget is not _win.dialog:
         return
+    _cleanup()  # 真正销毁也要摘除本次绑定/idle句柄，不能留下旧会话任务。
+    if _ses is not None:
+        _ses.open = False
     _wake()
+    _win = None  # 编辑父窗销毁后仍可从主窗再打开，避免复用已经失效的格子。
 
 
 def _ensure_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
@@ -781,6 +791,8 @@ def _ensure_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
         font=dialog_font,
         month_label=month_label,
         day_grid=day_grid,
+        day_cells=[],  # 格子与外窗同寿命，会话关闭后保留；选择状态由每次渲染覆盖。
+        month_cells=[],
         # 日期模式的主体容器：切到月份模式时靠它 pack_forget()。
         date_body=date_body,
         # 底部按钮栏的引用：月份主体是后建的，pack 时必须写成 pack(before=footer)
