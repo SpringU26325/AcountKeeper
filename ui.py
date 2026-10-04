@@ -14,10 +14,12 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 import tag_prefs
+import calendar_picker
 import dialogs
 import settings
 from chart_window import show_chart_window
 from config import DATA_DIR, DEFAULT_EXPORT_DIR
+from dialog_lifecycle import _cancel_owned_tasks
 from snail import SnailManager
 from store import Account, AccountStore
 from tag_aggregation import MULTI_TAG_TOTALS_NOTE, aggregate_records_by_tag
@@ -33,6 +35,11 @@ class AccountKeeperApp(ctk.CTk):
         last_export_dir: Path = DEFAULT_EXPORT_DIR,
     ) -> None:
         super().__init__()
+        self._calendar_start_job: str | None = None
+        self._calendar_map_binding: str | None = None
+        self._calendar_building = 0
+        self._calendar_closing = False
+        self._calendar_destroyed = False
         # store 由外部注入，方便测试时替换成临时数据库，避免测试污染真实账本。
         self.store = store
         # last_export_dir 由启动流程注入，带默认值保证单独构造窗口时仍可用：
@@ -50,6 +57,60 @@ class AccountKeeperApp(ctk.CTk):
         # 蜗牛必须等 title_block 建好之后再创建，因为它需要以标题位置作为爬行边界。
         self.snail_manager = SnailManager(self, self.title_block)
         self.snail_manager.start()
+        # 先让主页面完成首次映射/绘制，再准备隐藏日历；启动构造期间不抢首帧预算。
+        self._calendar_map_binding = tk.Misc.bind(self, "<Map>", self._schedule_calendar_prewarm, add="+")
+        if self.winfo_ismapped():
+            self._schedule_calendar_prewarm()
+
+    def _schedule_calendar_prewarm(self, event: tk.Event | None = None) -> None:
+        if self._calendar_closing or (event is not None and event.widget is not self):
+            return  # 子控件Map与退出请求不能重复启动预创建。
+        if self._calendar_map_binding is None:
+            return
+        tk.Misc.unbind(self, "<Map>", self._calendar_map_binding)
+        self._calendar_map_binding = None  # 从最小化恢复也不再重复准备。
+
+        def queue_start() -> None:
+            self._calendar_start_job = None
+            if not self._calendar_closing:
+                self._calendar_start_job = self.after(1, self._run_calendar_prewarm)
+
+        self._calendar_start_job = self.after_idle(queue_start)
+
+    def _run_calendar_prewarm(self) -> None:
+        self._calendar_start_job = None
+        if self._calendar_closing:
+            return
+        calendar_picker.prewarm(self)
+
+    def _begin_calendar_build(self) -> None:
+        self._calendar_building += 1  # 对冷打开与隐藏预创建统一保护，防止CTk的update中销毁解释器。
+
+    def _end_calendar_build(self) -> None:
+        self._calendar_building -= 1
+        if self._calendar_building == 0 and self._calendar_closing:
+            self.destroy()  # 最外层日历建窗完成后兑现退出，不靠定时器猜构建完成。
+
+    def destroy(self) -> None:
+        if self._calendar_destroyed:
+            return
+        self._calendar_closing = True
+        if self._calendar_start_job is not None:
+            self.after_cancel(self._calendar_start_job)
+            self._calendar_start_job = None
+        if self._calendar_map_binding is not None:
+            tk.Misc.unbind(self, "<Map>", self._calendar_map_binding)
+            self._calendar_map_binding = None
+        calendar_picker.shutdown(self)  # 同时取消后台批次并唤醒建窗期间重入的模态选择。
+        if self._calendar_building:
+            for child in tuple(self.children.values()):
+                if isinstance(child, tk.Toplevel):
+                    child.destroy()  # 先唤醒重入的其他模态等待；构建中的ManagedToplevel自行延期销毁。
+            return  # 保留主窗及解释器，让CTk建窗完成后安全兑现关闭。
+        self.snail_manager.stop()
+        _cancel_owned_tasks(self)  # 根窗退出也清理所属CTk/预创建定时器，避免失效脚本留在解释器中。
+        super().destroy()
+        self._calendar_destroyed = True
 
     def _build_widgets(self) -> None:
         """组装标题、输入区、工具栏和记录表格。"""
@@ -395,9 +456,8 @@ class AccountKeeperApp(ctk.CTk):
     ) -> str | None:
         """保留旧接口，实际对话框由 dialogs 模块负责。
 
-        分层刻意保持 ui -> dialogs -> calendar_picker：本方法不直接 import
-        calendar_picker，月份弹窗的实现细节一律经 dialogs 转发，避免多出一条
-        横向依赖。
+        月份选择仍经dialogs转发；本层直接引用calendar_picker仅用于启动预创建及退出清理，
+        不在业务回调中另写一套选择逻辑。
 
         Args:
             title: 窗口标题栏文字，带语境（如「查看图表」）。

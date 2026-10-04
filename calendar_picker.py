@@ -23,7 +23,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
+from time import perf_counter
 from types import SimpleNamespace
+from typing import TypedDict
 import calendar
 import tkinter as tk
 
@@ -31,6 +33,7 @@ import customtkinter as ctk
 
 # config 是叶子模块（不导入任何项目模块），引用它的 RESOURCE_DIR 不会形成循环依赖。
 from config import RESOURCE_DIR
+from dialog_lifecycle import ManagedToplevel
 
 # 弹窗尺寸：宽度两种模式共用（同一个窗口实例在模式间切换时不改宽度，才不会左右抖动）。
 # 高度按模式区分——日期模式 380 刚好容纳星期表头 + 最多 6 行日期格 + 底部按钮；
@@ -222,6 +225,43 @@ def _parse_iso_month(value: str | None) -> tuple[int, int] | None:
 # 格子本身跨会话复用，但每次渲染更新命令，避免回填上一月或上一年的值。
 _win: SimpleNamespace | None = None
 _ses: SimpleNamespace | None = None
+_prewarm: SimpleNamespace | None = None
+
+
+class _CalendarWindow(ManagedToplevel):
+    """先建立可接管的缓存，再允许CTk标题栏处理进入事件循环。"""
+
+    def __init__(self, parent: tk.Tk | tk.Toplevel) -> None:
+        self._calendar_built = False
+        self._calendar_hidden_titlebar = False
+        super().__init__(parent)
+
+    def _windows_set_titlebar_color(self, color_mode: str) -> None:
+        if self._calendar_built:
+            self._calendar_hidden_titlebar = not self.winfo_ismapped()
+            try:
+                super()._windows_set_titlebar_color(color_mode)
+            finally:
+                self._calendar_hidden_titlebar = False
+        # CTk构造期间的update会让点击重入尚未完成的建窗，留到外壳/缓存建立后再做。
+
+    def after(self, ms, func=None, *args):
+        if self._calendar_hidden_titlebar and getattr(func, "__name__", "") in ("focus", "focus_set"):
+            return None  # 隐藏建窗未占用焦点，不安排CTk的父控件焦点恢复，避免覆盖新的用户焦点。
+        return super().after(ms, func, *args)  # type: ignore[reportArgumentType] # Tk运行时支持func=None，保留父类转发语义。
+
+    def finish_calendar_setup(self) -> None:
+        self._calendar_built = True
+        try:
+            self._windows_set_titlebar_color(self._get_appearance_mode())
+            self.withdraw()  # 标题栏的延迟恢复须保留隐藏意图，不能显示预创建外窗。
+        finally:
+            self.finish_setup()  # 兑现构建期间的关闭请求，复用已有ManagedToplevel保护。
+
+    def destroy(self) -> None:
+        if _win is not None and _win.dialog is self and _ses is not None and _ses.open:
+            _close()  # 构建中的销毁会被延期；先唤醒重入的选择，外层构建才能继续收尾。
+        super().destroy()
 
 
 @dataclass
@@ -230,6 +270,52 @@ class _GridCell:
     text: str = ""
     selected: bool = False
     visible: bool = False
+
+
+class _GridChanges(TypedDict, total=False):
+    # 明确配置键和值类型，避免宽泛的**dict类型把bool参数require_redraw也视作object。
+    text: str
+    fg_color: str
+    hover_color: str
+    text_color: str
+    state: str
+
+
+def _append_grid_cell(grid: ctk.CTkFrame, cells: list[_GridCell], font: tuple[str, int]) -> None:
+    # 预创建与正常渲染共用同一构造入口，提前点击可以直接补齐已创建的控件池。
+    cells.append(_GridCell(ctk.CTkButton(
+        grid, text="", state=tk.DISABLED, width=36, height=30,
+        corner_radius=8, font=font, fg_color="#FFFFFF",
+        hover_color=_SUBTLE_HOVER_COLOR, text_color=_TEXT_COLOR,
+    )))
+
+
+def _update_grid_cell(
+    cell: _GridCell, index: int, text: str, command: Callable[[], None] | None,
+    selected: bool, columns: int,
+) -> None:
+    # 隐藏预创建与正式翻页共用更新逻辑，避免预创建布局和实际显示的控件状态漂移。
+    visible = command is not None
+    changes: _GridChanges = {}
+    if cell.text != text:
+        changes["text"] = text  # 复用已有文字，首次点击也不必重新建立同一格子的Label。
+    if cell.selected != selected:
+        changes.update(
+            fg_color=_ACCENT_COLOR if selected else "#FFFFFF",
+            hover_color=_ACCENT_HOVER_COLOR if selected else _SUBTLE_HOVER_COLOR,
+            text_color="#FFFFFF" if selected else _TEXT_COLOR,
+        )
+    if cell.visible != visible:
+        changes["state"] = tk.NORMAL if visible else tk.DISABLED
+    if visible or changes:
+        cell.button.configure(command=command, **changes)  # 每次更新本次命令，清空隐藏格子的旧命令。
+    if cell.visible != visible:
+        if visible:
+            row, column = divmod(index, columns)
+            cell.button.grid(row=row, column=column, padx=1, pady=1, sticky="nsew")
+        else:
+            cell.button.grid_forget()  # 清除CTk缩放的布局记录，空格不会随缩放重新出现。
+    cell.text, cell.selected, cell.visible = text, selected, visible
 
 
 def _render_grid(
@@ -243,36 +329,8 @@ def _render_grid(
     for index, (text, command, selected) in enumerate(items):
         if index == len(cells):
             # 控件属于外窗，首次使用才创建；翻页及重新打开只更新这份引用。
-            cells.append(_GridCell(ctk.CTkButton(
-                grid, text="", state=tk.DISABLED, width=36, height=30,
-                corner_radius=8, font=font, fg_color="#FFFFFF",
-                hover_color=_SUBTLE_HOVER_COLOR, text_color=_TEXT_COLOR,
-            )))
-        cell = cells[index]
-        visible = command is not None
-        changes: dict[str, object] = {}
-        if cell.text != text:
-            changes["text"] = text  # 同一月份重新打开时保留文字，减少Canvas重绘。
-        if cell.selected != selected:
-            # 取消上一会话高亮与设置新高亮走同一分支，避免复用后残留蓝色。
-            changes.update(
-                fg_color=_ACCENT_COLOR if selected else "#FFFFFF",
-                hover_color=_ACCENT_HOVER_COLOR if selected else _SUBTLE_HOVER_COLOR,
-                text_color="#FFFFFF" if selected else _TEXT_COLOR,
-            )
-        if cell.visible != visible:
-            changes["state"] = tk.NORMAL if visible else tk.DISABLED
-        if visible or changes:
-            # 即使文字未变，月份格子的年份闭包也必须更新；空格同时清空旧命令。
-            cell.button.configure(command=command, **changes)
-        if cell.visible != visible:
-            if visible:
-                row, column = divmod(index, columns)
-                cell.button.grid(row=row, column=column, padx=1, pady=1, sticky="nsew")
-            else:
-                # CTk的grid_forget还清除缩放时重放的布局记录，防止DPI变化把空格重新显示。
-                cell.button.grid_forget()
-        cell.text, cell.selected, cell.visible = text, selected, visible
+            _append_grid_cell(grid, cells, font)
+        _update_grid_cell(cells[index], index, text, command, selected, columns)
 
 
 def _render_month() -> None:
@@ -347,8 +405,8 @@ def _update_header_title() -> None:
     """按当前模式刷新顶部标题文字（日期模式「2026 年 9 月」/ 月份模式「2026 年」）。
 
     header 两种模式共用，所以文字必须跟着模式走。两个 render 各调一次是主路径；
-    _apply_mode_chrome 也必须调一次——render 跑在 deiconify **之后**，不先设的话
-    切模式后的第一帧还挂着上一个模式的文字（比如月份弹窗先闪一下「2026 年 9 月」）。
+    _apply_mode_chrome 和 render 共用它；隐藏准备与后续翻页均更新本次年月，
+    显现时不会挂着上一个模式的文字。
     """
     win = _win
     ses = _ses
@@ -439,7 +497,7 @@ def _goto_this_month() -> None:
 def _ensure_month_body() -> ctk.CTkFrame:
     """懒创建月份模式主体（只有 12 格网格；顶部标题与箭头沿用 header 那一份）。
 
-    只在第一次切到月份模式时建一次，之后复用。返回容器本身，方便调用方直接
+    首次预创建或切到月份模式时建一次，之后复用。返回容器本身，方便调用方直接
     链式 pack(...)。本函数只建窗口级控件树、不读 _ses，所以不存在「复用后撞上
     上一次打开的状态」这类问题。
     """
@@ -482,20 +540,24 @@ def _apply_mode_chrome(mode: str) -> None:
     # **写全所有选项**（fill / expand），并且带上 before=_win.footer——否则新主体会
     # 追加到按钮后面去，画面上就是「网格跑到两个按钮下面」。
     if is_month:
-        win.date_body.pack_forget()
-        _ensure_month_body().pack(fill="both", expand=True, before=win.footer)
+        if win.date_body.winfo_manager():
+            win.date_body.pack_forget()
+        body = _ensure_month_body()
+        if body.winfo_manager() != "pack":
+            body.pack(fill="both", expand=True, before=win.footer)
     else:
         # 月份主体可能还没建过（用户从没切到过月份模式），所以先判空再 forget。
-        if win.month_body is not None:
+        if win.month_body is not None and win.month_body.winfo_manager():
             win.month_body.pack_forget()
-        win.date_body.pack(fill="both", expand=True, before=win.footer)
+        if win.date_body.winfo_manager() != "pack":
+            win.date_body.pack(fill="both", expand=True, before=win.footer)
     # 【底部左键】按钮是窗口级、只建一次，语义却按模式变（今日 / 本月），
     # 所以每次打开都要重设文字与命令；漏一次就会带着上一个模式的语义开着。
-    win.footer_left.configure(
-        text="本月" if is_month else "今日",
-        command=_goto_this_month if is_month else _goto_today,
-    )
-    # 【顶部标题】render 跑在 deiconify 之后，这里先设一次，避免第一帧露出上一个模式的文字。
+    text = "本月" if is_month else "今日"
+    if win.footer_left.cget("text") != text:
+        # 同模式复用保留现有命令与布局，避免重绘底部并触发无效Configure。
+        win.footer_left.configure(text=text, command=_goto_this_month if is_month else _goto_today)
+    # 标题和网格都在隐藏期间更新，显现时只露出本次模式的内容。
     _update_header_title()
 
 
@@ -525,27 +587,14 @@ def _recenter(_event: tk.Event | None = None) -> None:
     size = (width, height)
     # last_size 存的是元组本身；若存成 [元组] 的列表，下面 `size == last_size`
     # 会变成「元组 == 列表」，恒为 False，守卫就失效了。
-    if size == ses.last_size:
+    if size == ses.last_size and ses.ready:
         return  # 尺寸没变却收到事件 → 是拖动产生的位移，尊重用户摆的位置
     ses.last_size = size
     _anchor_to_input(dialog, ses.anchor, size)
 
 
 def _deferred_setup() -> None:
-    """窗口级的一次性 setup，压到首个 after_idle 执行，且整个进程只做一次。
-
-    【方案 1 的延续】protocol / <Escape> 绑定与应用图标都属于「窗口第一眼显示
-    出来时不必须已经在位」的工作：iconbitmap 要读 .ico 文件，bind 要往解释器里
-    装脚本，而它们晚 10ms 到位对用户没有任何差别。
-
-    刻意**留在同步段**的三样东西，都不可挪：
-      - _render_month()：它是弹窗的主体内容。挪到 after_idle 就会先弹出一个
-        空白日历再填进去，属于观感倒退，不是优化。
-      - _recenter()：窗口先按内容撑大、再被贴到输入框下方，靠的就是它；
-        延后会让窗口先在默认位置露一帧。
-      - grab_set()：它是模态性本身，不是性能开关（实测只要 0.01ms，
-        既跑得快又不可省）。
-    """
+    """首次空闲时设置图标；关闭与销毁绑定已在建窗时安装。"""
     # 守卫：after_idle 的回调**不随窗口隐藏/销毁自动失效**（它是解释器空闲队列里
     # 的一张便条）。复用后窗口一直存在，这里要防的是「主窗口已经退出」这一种。
     if _win is None:
@@ -557,13 +606,61 @@ def _deferred_setup() -> None:
         return
     _win.setup_done = True
     _apply_app_icon(_win.dialog)
-    # 右上角关闭按钮等同「取消」，避免出现状态不明确的弹窗。
-    _win.dialog.protocol("WM_DELETE_WINDOW", _cancel)
-    # ESC 取消，与 ask_month / ask_edit_record 的操作习惯保持一致。
-    _win.dialog.bind("<Escape>", lambda _event: _cancel())
-    # <Destroy> 兜底：主窗口退出会连带销毁本弹窗，而那条路径上没人会调 _close()，
-    # 挂在 wait_variable 上的调用方就会永远等不到信号，这里补一次唤醒。
-    _win.dialog.bind("<Destroy>", _on_destroy, add="+")
+
+
+def _schedule_reveal(win: SimpleNamespace, session: SimpleNamespace) -> None:
+    """映射后等布局与绘制空闲，再一次显现；新的几何事件会重新排队。"""
+    if _win is not win or _ses is not session or not session.open or session.ready:
+        return
+    dialog = win.dialog
+    if session.reveal_idle[0] is not None:
+        dialog.after_cancel(session.reveal_idle[0])
+
+    def geometry() -> tuple[int, int, int, int]:
+        return dialog.winfo_width(), dialog.winfo_height(), dialog.winfo_x(), dialog.winfo_y()
+
+    def alive() -> bool:
+        # 旧会话的便条即使已出队，也不能显现复用窗口中的新会话。
+        return _win is win and _ses is session and session.open and not session.ready
+
+    def grid_mapped() -> bool:
+        # Windows会分批映射子窗口：外窗尺寸稳定并不代表格子/文字已能显示。
+        # 等待当前有效格子的绘图Canvas；空格/另一模式及布局裁掉的文字不应阻挡就绪。
+        cells = win.month_cells if session.mode == "month" else win.day_cells
+        return all(
+            cell.button.winfo_ismapped() and all(
+                child.winfo_ismapped() for child in cell.button.winfo_children()
+                if isinstance(child, tk.Canvas)
+            )
+            for cell in cells if cell.visible
+        )
+
+    def settle() -> None:
+        if not alive():
+            return
+        session.reveal_idle[0] = None
+        if not dialog.winfo_ismapped() or not grid_mapped():
+            return  # 等本窗/子控件的Map事件，不能对未完成的映射猜就绪。
+        _recenter()
+        settled = geometry()
+
+        def reveal() -> None:
+            if not alive():
+                return
+            session.reveal_idle[0] = None
+            if not dialog.winfo_ismapped() or not grid_mapped():
+                return
+            if geometry() != settled:
+                _schedule_reveal(win, session)
+                return  # 定位/尺寸仍在改变，继续保持透明，等下一轮布局完成。
+            # 第二轮idle让定位产生的Configure及子控件绘制先完成，不使用固定延时或update重入。
+            dialog.grab_set()
+            session.ready = True
+            dialog.attributes("-alpha", 1.0)
+
+        session.reveal_idle[0] = dialog.after_idle(reveal)
+
+    session.reveal_idle[0] = dialog.after_idle(settle)
 
 
 def _wake() -> None:
@@ -583,21 +680,27 @@ def _cleanup() -> None:
         return
     dialog = _win.dialog
     # ① 取消 after_idle 句柄：它是解释器空闲队列里的便条，窗口隐藏并不会让它失效。
-    if _ses.setup_idle[0] is not None:
-        try:
-            dialog.after_cancel(_ses.setup_idle[0])
-        except (tk.TclError, ValueError):
-            pass
-        _ses.setup_idle[0] = None
+    for slot in (_ses.setup_idle, _ses.reveal_idle):
+        if slot[0] is not None:
+            try:
+                dialog.after_cancel(slot[0])
+            except (tk.TclError, ValueError):
+                pass  # 销毁期间任务可能已被Tk取消，仍需清空本次句柄。
+            slot[0] = None
     # ② 解绑 <Configure>：当初用 tk.Misc.bind 就是为了拿到 funcid，这里按 funcid 精确摘除。
     #    不能用 dialog.unbind(...)：CTk 的覆写收到非 None 的 funcid 会抛 ValueError，
     #    而 CTkEntry/CTkFrame 的 bind 又根本不返回 funcid。
-    if _ses.configure_funcid[0] is not None:
-        try:
-            tk.Misc.unbind(dialog, "<Configure>", _ses.configure_funcid[0])
-        except (tk.TclError, ValueError):
-            pass
-        _ses.configure_funcid[0] = None
+    for widget, event, slot in (
+        (dialog, "<Configure>", _ses.configure_funcid),
+        (dialog, "<Map>", _ses.map_funcid),
+        (_ses.parent, "<Destroy>", _ses.parent_funcid),
+    ):
+        if slot[0] is not None:
+            try:
+                tk.Misc.unbind(widget, event, slot[0])
+            except (tk.TclError, ValueError):
+                pass  # 父窗销毁时绑定可能已消失，不妨碍释放grab和唤醒等待。
+            slot[0] = None
     # ③ 释放 grab：实测 withdraw() 不会代劳（隐藏后 grab_current 仍指向本窗），
     #    不显式释放会把后续点击全部吸到一个看不见的窗口上。
     try:
@@ -614,15 +717,14 @@ def _close() -> None:
     # 记下本次真正显示时的尺寸，供下一次复用打开预置坐标（此刻窗口可见，值是可信的）。
     # 按模式分别记录：日期弹窗记 320x380、月份弹窗记 320x300，各记各的，
     # 否则下一次打开会拿到另一个模式的高度，第一帧就错位（#3.1 修掉的 A1 同类病）。
-    if _win.dialog.winfo_width() > 1:
+    if _ses.ready and _win.dialog.winfo_width() > 1:
         _win.last_size[_ses.mode] = (
             _win.dialog.winfo_width(),
             _win.dialog.winfo_height(),
         )
     try:
-        # 用 tk.Wm.withdraw 绕开 CTkToplevel.withdraw 的覆写：后者会在 CTk 自己正在
-        # 操作标题栏时置位 _withdraw_called_after_...，干扰它的状态机。
-        tk.Wm.withdraw(_win.dialog)
+        # 保留CTk的隐藏意图标记，防止标题栏after(5)恢复把已取消窗口再次显示。
+        _win.dialog.withdraw()
     except tk.TclError:
         pass
     _ses.open = False
@@ -634,6 +736,7 @@ def _on_destroy(event: tk.Event) -> None:
     global _win
     if _win is None or event.widget is not _win.dialog:
         return
+    _cancel_prewarm()  # 外部销毁预创建窗后不能继续往失效控件池追加格子。
     _cleanup()  # 真正销毁也要摘除本次绑定/idle句柄，不能留下旧会话任务。
     if _ses is not None:
         _ses.open = False
@@ -642,7 +745,29 @@ def _on_destroy(event: tk.Event) -> None:
 
 
 def _ensure_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
-    """懒创建弹窗：只有第一次打开时才真正建窗，之后一直复用同一个实例。
+    if _win is not None:
+        return
+    root = parent._root()  # type: ignore[reportAttributeAccessIssue] # Tk运行时提供_root，类型声明遗漏；保留取得真正根窗的行为。
+    begin_build = getattr(root, "_begin_calendar_build", None)
+    end_build = getattr(root, "_end_calendar_build", None)
+    if begin_build is not None:
+        begin_build()  # 主窗退出保护也覆盖预创建尚未启动时的直接点击，不只覆盖后台入口。
+    try:
+        _build_window(parent, mode)
+    except Exception:
+        # 外壳构造失败时尚未写入_win，也须释放半成品及ManagedToplevel的构建保护。
+        for widget in tuple(parent.children.values()):
+            if isinstance(widget, _CalendarWindow):
+                widget.finish_setup()
+                widget.destroy()
+        raise
+    finally:
+        if end_build is not None:
+            end_build()  # 经UI的成对回调兑现退出，避免calendar_picker反向import主窗模块。
+
+
+def _build_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
+    """首次预创建或打开时建立外壳，之后一直复用同一个实例。
 
     窗口级的东西（控件树、字体）只在这里建一次；打开级状态一律不进这里，
     全部由 ask_date / ask_month 每次打开时重建。回调都是模块级函数、一律现读
@@ -650,13 +775,14 @@ def _ensure_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
 
     mode 只影响**建窗那一刻**的尺寸提示：建窗可能由日期模式（ask_date）触发，
     也可能由月份模式（ask_month）触发，两种模式高度不同（见 _logical_size）。
-    复用打开时本函数直接返回，那时的尺寸由每次打开的公共入口另行设置。
+    复用打开由_ensure_window直接返回，尺寸由每次打开的公共入口另行设置。
     """
     global _win
-    if _win is not None:
-        return
-
-    dialog = ctk.CTkToplevel(parent)
+    dialog = _CalendarWindow(parent)
+    # 构造期间暂缓标题栏update；先明确保持隐藏，后续标题栏延迟恢复也不得自动显示。
+    # 透明度覆盖后续为取得真实尺寸而进行的映射，用户只看见准备完的最终布局。
+    dialog.attributes("-alpha", 0.0)
+    dialog.withdraw()
     dialog.title("选择日期")
     # 【Step 2.1】同 tag_picker：tk.Wm.resizable 绕开 CTkToplevel.resizable 的覆写，
     # 避免它在 Windows 上额外安排 after(10, _windows_set_titlebar_color)（实测 sync 12.5ms /
@@ -664,9 +790,7 @@ def _ensure_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
     tk.Wm.resizable(dialog, False, False)
     dialog.transient(parent)
     dialog.configure(fg_color=_BG_COLOR)
-    # 应用图标（iconbitmap）刻意不在这里设：它要读一次 image/app_icon.ico，属于
-    # 「晚一帧再设也看不出来」的工作，与 protocol / <Escape> 一起挪到下面的
-    # _deferred_setup 里做。
+    # 图标读盘留到隐藏准备阶段的idle，生命周期绑定则必须在等待前安装。
     # 先给一个尺寸提示：CTk 会把逻辑像素按 DPI 放大；随后 Tk 还可能按内容再撑大，
     # 所以最终位置交给下面的 <Configure> 回调按真实尺寸校正。
     dialog_width, dialog_height = _logical_size(mode)
@@ -811,6 +935,117 @@ def _ensure_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
         # 日期模式的 380 去预置月份模式的 300，窗口第一帧就会错位。
         last_size={"date": None, "month": None},
     )
+    # 未显现时也允许取消/父窗销毁；不能把这些兜底绑定推迟到首次显示之后。
+    dialog.protocol("WM_DELETE_WINDOW", _cancel)
+    dialog.bind("<Escape>", lambda _event: _cancel())
+    dialog.bind("<Destroy>", _on_destroy, add="+")
+    dialog.finish_calendar_setup()  # 此时重入的点击已有完整外壳可接管，不会重复创建外窗。
+
+
+def _cancel_prewarm() -> None:
+    """取消后台准备的便条；已经创建的格子留给正常打开复用。"""
+    global _prewarm
+    warm, _prewarm = _prewarm, None
+    if warm is None:
+        return
+    for slot in (warm.idle, warm.timer):
+        if slot[0] is not None:
+            try:
+                warm.parent.after_cancel(slot[0])
+            except (tk.TclError, ValueError):
+                pass  # 父窗销毁时任务可能已被取消，仍要清空状态。
+            slot[0] = None
+    if warm.destroy_binding is not None:
+        try:
+            tk.Misc.unbind(warm.parent, "<Destroy>", warm.destroy_binding)
+        except (tk.TclError, ValueError):
+            pass  # 销毁路径中父窗绑定可能已失效。
+
+
+def shutdown(parent: tk.Tk | tk.Toplevel) -> None:
+    """父窗退出时取消准备并关闭其拥有的缓存，亦可唤醒建窗期间重入的选择。"""
+    if _prewarm is not None and _prewarm.parent is parent:
+        _cancel_prewarm()
+    win = _win
+    if win is None:
+        return
+    owner = win.dialog.master
+    while owner is not None and owner is not parent:
+        owner = owner.master
+    if owner is parent:
+        win.dialog.destroy()  # ManagedToplevel在标题栏处理完成前仅记关闭意图。
+
+
+def prewarm(parent: tk.Tk | tk.Toplevel) -> None:
+    """主窗显示后调用：隐藏建立外壳，再在主线程分批准备日期/月控件。"""
+    global _prewarm
+    if _win is not None or _prewarm is not None:
+        return  # 用户已先打开或已有准备任务，不能重建缓存/改写当前选择。
+    warm = SimpleNamespace(parent=parent, idle=[None], timer=[None], destroy_binding=None)
+    _prewarm = warm
+
+    def on_destroy(event: tk.Event) -> None:
+        if event.widget is parent and _prewarm is warm:
+            _cancel_prewarm()
+
+    warm.destroy_binding = tk.Misc.bind(parent, "<Destroy>", on_destroy, add="+")
+    try:
+        _ensure_window(parent, "date")
+    except Exception as exc:
+        # 预创建失败不能中断主界面；回收半成品，正常点击仍可走原来的懒创建路径。
+        shutdown(parent)
+        _cancel_prewarm()
+        print(f"警告：日历预创建失败，将在点击时重新创建（{exc}）。")
+        return
+    win = _win
+    if _prewarm is not warm or win is None:
+        return  # CTk标题栏update期间可能已被点击接管或收到退出请求。
+    _deferred_setup()  # 图标也在隐藏阶段准备，避免首次点击重复读盘。
+    today = date.today()
+    days = [day for week in _CALENDAR.monthdayscalendar(today.year, today.month) for day in week]
+    days.extend([0] * (42 - len(days)))  # 只准备当前月外观，不建立_ses或持有用户选择。
+
+    def placeholder() -> None:
+        pass  # 预创建窗口始终隐藏；正常打开时渲染必须替换所有有效格子的选择命令。
+
+    def queue_batch() -> None:
+        if _prewarm is not warm:
+            return
+        warm.idle[0] = None
+        # idle后再排一个短timer，让输入与这一轮绘制有机会完成，不连续占用空闲队列。
+        warm.timer[0] = parent.after(1, batch)
+
+    def batch() -> None:
+        if _prewarm is not warm or _win is not win:
+            return
+        warm.timer[0] = None
+        try:
+            deadline = perf_counter() + 0.004
+            for _ in range(6):
+                if len(win.day_cells) < 42:
+                    grid, cells = win.day_grid, win.day_cells
+                    day = days[len(cells)]
+                    text, command, selected, columns = (
+                        str(day) if day else "", placeholder if day else None, day == today.day, 7,
+                    )
+                elif len(win.month_cells) < 12:
+                    _ensure_month_body()
+                    grid, cells = win.month_grid, win.month_cells
+                    month = len(cells) + 1
+                    text, command, selected, columns = f"{month} 月", placeholder, month == today.month, 4
+                else:
+                    _cancel_prewarm()
+                    return
+                _append_grid_cell(grid, cells, win.font)
+                _update_grid_cell(cells[-1], len(cells) - 1, text, command, selected, columns)
+                if perf_counter() >= deadline:
+                    break  # 至少创建一个，单个控件/外壳构造不可拆分，预算是让出循环的阈值。
+            warm.idle[0] = parent.after_idle(queue_batch)
+        except Exception as exc:
+            _cancel_prewarm()  # 部分已创建控件可由正常渲染补齐，不影响用户继续操作。
+            print(f"警告：日历分批预创建已停止，剩余控件将在点击时创建（{exc}）。")
+
+    warm.idle[0] = parent.after_idle(queue_batch)
 
 
 def _begin_session(
@@ -820,8 +1055,8 @@ def _begin_session(
     anchor: tk.Misc | None,
     year: int,
     month: int,
-) -> None:
-    """打开一次会话：收尾上一次 → 建窗 → 按模式铺好外壳 → 摆位 → 显示。
+) -> bool:
+    """打开一次会话：收尾上一次 → 隐藏建窗 → 按模式铺好外壳 → 预置位置。
 
     日期模式与月份模式的开窗流程逐字相同，只有「模式 / 标题 / 初始年月」不同，
     所以整段抽到这里，两个对外入口各自只留「自己独有的那一两行」（高亮的是哪一天、
@@ -833,22 +1068,29 @@ def _begin_session(
     """
     global _ses
 
+    _cancel_prewarm()  # 点击优先：取消剩余批次，并在同一缓存上补齐本次需要的控件。
+    if getattr(parent, "_calendar_closing", False) or (
+        isinstance(parent, ManagedToplevel) and parent.closing
+    ):
+        return False  # 退出期间不再接受重入的点击请求。
+
     # 【打开前】先把上一次遗留的会话收干净：单例复用要求任何时刻最多只有一个日历在等，
     # 否则会出现「两个弹窗同时可见」和「两次 wait_variable 同时挂起」。
     if _ses is not None and _ses.open:
         _close()
 
-    # 【懒创建】首次打开才真正建窗，而且**构造即显示**：刻意不在建窗后立刻藏起来。
-    # 因为 CTkToplevel 构造时会安排 after(5, _revert_withdraw_after_windows_set_titlebar_color)，
-    # 那笔回调会把紧随其后的隐藏动作原样撤销（实测隐藏后 viewable 仍为 1），
-    # 所以「建完就藏」的复用写法在这里不成立。
+    # 首次创建及复用都先隐藏更新；真实尺寸必须映射后量，显现留给_finish_session。
     _ensure_window(parent, mode)
     win = _win
-    assert win is not None  # 固定本次调用的窗口引用，供静态检查收窄类型。
+    if win is None or win.dialog.closing:
+        return False  # 建窗期间退出已兑现，调用方直接返回取消而非等待失效窗口。
     dialog = win.dialog
+    dialog.attributes("-alpha", 0.0)
+    dialog.withdraw()
     # parent 每次可能不同（主窗口 / 编辑记录弹窗），transient 必须每次重设：
     # 认错父窗口会导致弹窗跑到主窗口下面，或跟着父窗口一起最小化消失。
-    dialog.transient(parent)
+    if str(dialog.transient()) != str(parent):
+        dialog.transient(parent)  # 仅父窗变化时重设，重复wm transient也会触发显示/布局。
 
     today = date.today()
     # 【打开级状态】每次打开整体重建，所有字段都是「本次打开」的新值。用模块级 _ses
@@ -856,6 +1098,7 @@ def _begin_session(
     # 指向本次」的那一份，日期/月份格子的闭包不会串到上一次打开。
     _ses = SimpleNamespace(
         open=True,
+        ready=False,
         # 必须清 None：不清的话上一次的选择会变成这一次的返回值。
         result=[None],
         # 每次新建：wait_variable 等的是「这一次」的信号。
@@ -879,27 +1122,34 @@ def _begin_session(
         # 本次打开的锚点（日期输入框）。_recenter 在尺寸变化时要靠它重算位置，
         # 所以必须跟着「本次打开」每回重建，不能留在窗口级的 _win 里。
         anchor=anchor,
-        # 两个单元素列表当句柄槽，回调内部可原地改写（省掉一遍 nonlocal）。
+        # 单元素列表当句柄槽，回调内部可原地改写，关闭时统一取消/解绑。
         setup_idle=[None],
+        reveal_idle=[None],
         configure_funcid=[None],
+        map_funcid=[None],
+        parent_funcid=[None],
+        parent=parent,
     )
     ses = _ses
     assert ses is not None  # 固定本次调用的会话引用，供静态检查收窄类型。
 
     # 【每次打开都要重设标题栏】建窗时只设过一次；复用打开若不重设，月份弹窗会顶着
     # 「选择日期」的标题栏（反之亦然）——标题是窗口级的，不会随模式自己变。
-    dialog.title(title)
+    if dialog.title() != title:
+        dialog.title(title)  # 复用同一模式时省去未变化的原生标题更新。
     # 【每次打开都要重设尺寸】同理：复用后窗口还留着上一个模式的高度（380 / 300）。
     # 逻辑尺寸由 _logical_size 统一给出，CTk 的 geometry() 会按 DPI 把宽高放大。
     dialog_width, dialog_height = _logical_size(mode)
-    dialog.geometry(f"{dialog_width}x{dialog_height}")
+    size = f"{dialog_width}x{dialog_height}"
+    current_size = dialog.geometry().split("+", 1)[0].split("-", 1)[0]
+    if current_size != size:
+        dialog.geometry(size)  # 保留跨模式/缩放尺寸校正，跳过同尺寸重布局。
 
     # 【模式外壳】必须早于下面的 deiconify：主体显隐与底部左键语义要在窗口显示前就位，
     # 否则会先按上一个模式的样子闪一帧（比如月份模式下先闪出一片日期网格 + 「今日」）。
     _apply_mode_chrome(mode)
 
-    # 【setup 只做一次】protocol / <Escape> / <Destroy> / 应用图标都是窗口级的，
-    # 只安排一次即可。若首次打开的 idle 还没跑就被关掉，_cleanup 会取消它，
+    # 应用图标只设置一次。若首次打开的idle还没跑就被关掉，_cleanup会取消它，
     # 此时 setup_done 仍为 False，下一次打开会重新安排，不会永久丢失。
     if not win.setup_done and ses.setup_idle[0] is None:
         ses.setup_idle[0] = dialog.after_idle(_deferred_setup)
@@ -911,20 +1161,28 @@ def _begin_session(
     # 两条路径都走 _anchor_to_input：anchor 可用就贴输入框，不可用才退回屏幕居中。
     _anchor_to_input(dialog, anchor, win.last_size[mode] or _physical_size(dialog, mode))
 
-    # 【先显示】deiconify 必须早于任何依赖 winfo_width()/height() 的计算：
-    # 窗口未映射时这些值不可信（首次映射前恒为 1）。
-    tk.Wm.deiconify(dialog)
+    def on_geometry(event: tk.Event) -> None:
+        if _ses is not ses or not ses.open:
+            return  # 旧会话事件不参与本次就绪判断。
+        if event.widget is dialog:
+            _recenter()
+        elif ses.ready:
+            return  # 显现后子控件布局不再触发外窗定位/显现任务。
+        _schedule_reveal(win, ses)
 
-    # 每次打开重新登记 <Configure>，拿 funcid 以便关闭时精确解绑。
-    # 必须 add="+"：CTkToplevel 内部也用 <Configure> 跟踪窗口尺寸，直接 bind 会顶掉它。
-    ses.configure_funcid[0] = tk.Misc.bind(dialog, "<Configure>", _recenter, add="+")
+    def on_parent_destroy(event: tk.Event) -> None:
+        if event.widget is parent and _ses is ses and ses.open:
+            _close()  # 缓存窗的创建父窗可能不同于本次transient父窗，后者退出也必须取消。
 
-    # 【结束信号】到这里窗口已经显示、位置已定、控件已就绪，剩下的收尾工作挪到
-    # _finish_session（渲染 → 校位 → 模态阻塞 → 取值）。
+    # add保留CTk自身的尺寸跟踪；关闭时按funcid解绑，避免重复打开叠加回调。
+    ses.configure_funcid[0] = tk.Misc.bind(dialog, "<Configure>", on_geometry, add="+")
+    ses.map_funcid[0] = tk.Misc.bind(dialog, "<Map>", on_geometry, add="+")
+    ses.parent_funcid[0] = tk.Misc.bind(parent, "<Destroy>", on_parent_destroy, add="+")
+    return True
 
 
 def _finish_session(render: Callable[[], None], what: str) -> str | None:
-    """渲染 → 校正位置 → 模态阻塞 → 返回本次选择（用户取消时为 None）。
+    """隐藏渲染 → 透明映射/校位 → 就绪显现 → 等待本次选择。
 
     两种模式的后半段逐字相同，只有「渲染什么」和告警里的名词不同，所以也抽到这里。
     render 传的是**函数对象**（_render_month / _render_months）而不是调用结果：它必须
@@ -944,17 +1202,15 @@ def _finish_session(render: Callable[[], None], what: str) -> str | None:
         _close()
         return None
 
-    # 渲染完成后再按「真实尺寸」校正一次位置：复用打开时窗口不会重新映射、尺寸也可能
-    # 没变，光靠 <Configure> 可能一次都不触发，这里显式补一次。
-    _recenter()
-
     # 锁住焦点并阻塞等待。这里不能用 wait_window：复用后关闭只是 withdraw，窗口永不
     # 销毁，wait_window 会一直不返回。改为等一个每次打开都新建的变量，由 _close()
     # （用户选中/取消）与 _on_destroy（主窗口退出）负责唤醒。
     session = _ses
     assert session is not None  # 保留等待前的取值时机，并收窄已有会话别名。
-    dialog.grab_set()
-    dialog.wait_variable(session.signal)
+    if session.open:
+        tk.Wm.deiconify(dialog)  # alpha仍为0，映射事件取得真实尺寸后再显现。
+        _schedule_reveal(win, session)
+        dialog.wait_variable(session.signal)
     return session.result[0]
 
 
@@ -973,7 +1229,8 @@ def ask_date(parent: tk.Tk | tk.Toplevel, initial_date: str, anchor: tk.Misc | N
     """
     # 初始选中的日期跟随 initial_date；传入非法/空字符串时退回今天，保证弹窗始终可用。
     initial = _parse_iso_date(initial_date) or date.today()
-    _begin_session(parent, "date", "选择日期", anchor, initial.year, initial.month)
+    if not _begin_session(parent, "date", "选择日期", anchor, initial.year, initial.month):
+        return None
     # 日期模式独有的回填：_begin_session 只保证「展示的年月」对得上，具体高亮哪一天
     # 由这里写进去（_render_month 要求年月日全等才高亮，所以必须回填完整日期）。
     ses = _ses
@@ -1007,7 +1264,8 @@ def ask_month(
     initial = _parse_iso_month(initial_month)
     today = date.today()
     year, month = initial if initial is not None else (today.year, today.month)
-    _begin_session(parent, "month", title, anchor, year, month)
+    if not _begin_session(parent, "month", title, anchor, year, month):
+        return None
     # 月份模式独有的回填：与日期模式同一口径（完整值全等才高亮），所以这里写的是
     # "YYYY-MM" 字符串。initial_month 不合法时一格都不亮，但「本月」按钮仍然可用。
     ses = _ses
