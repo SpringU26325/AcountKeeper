@@ -85,6 +85,11 @@ class SnailManager:
         # 当前活动气泡的 Canvas 与自动关闭定时器，任一时刻最多只有一个气泡。
         self._bubble_canvas: tk.Canvas | None = None
         self._bubble_after_id: str | None = None
+        # 保留原文才能在窗口变窄时重新折行，不能把上一次的自动折行当成显式换行。
+        self._bubble_message: str | None = None
+        self._bubble_view: tk.Canvas | None = None
+        self._geometry_after_id: str | None = None
+        self._geometry_signature: tuple[int, ...] | None = None
         self.snail_label: ctk.CTkLabel | None = None
         self.snail_photo: ctk.CTkImage | None = None
 
@@ -132,7 +137,49 @@ class SnailManager:
         # 用焦点事件而不是键盘事件判断，才不会把 Alt 这类系统按键误当成"离开窗口"。
         self.master.bind("<FocusOut>", self._on_focus_out)
         self.master.bind("<FocusIn>", self._on_focus_in)
+        # 原生 bind + add 保留 CTk 自己的尺寸监听；只处理相关控件，不被气泡重绘自激。
+        for widget in (self.master, self.title_block, self.snail_label):
+            tk.Misc.bind(widget, "<Configure>", self._on_geometry_changed, add="+")
         self._animate_snail()
+
+    def _on_geometry_changed(self, event: tk.Event) -> None:
+        """将一轮窗口、标题和图片尺寸变化合并到布局完成之后处理。"""
+        if event.widget not in (self.master, self.title_block, self.snail_label):
+            return
+        if self._geometry_after_id is None:
+            # 等 CTk 的 DPI 尺寸与标题布局一起落定，避免按这一轮中间尺寸反复移动。
+            self._geometry_after_id = self.master.after_idle(self._reflow_geometry)
+
+    def _reflow_geometry(self) -> None:
+        """仅在实际几何变化时收拢暂停位置并重排现有气泡。"""
+        self._geometry_after_id = None
+        if (
+            self.snail_label is None or not self.snail_label.winfo_exists()
+            or not self.title_block.winfo_exists()
+        ):
+            return
+        window_width, snail_width, text_left, text_right = self._snail_bounds()
+        window_height = self.master.winfo_height()
+        if window_width <= 1 or window_height <= 1:
+            return  # 未布局的 1px 不是有效边界，等待下一次尺寸事件。
+        signature = (
+            window_width, window_height, snail_width, self.snail_label.winfo_height(),
+            text_left, text_right,
+        )
+        if signature == self._geometry_signature:
+            return  # 单纯拖动窗口或蜗牛位移不能重置气泡和计时。
+        self._geometry_signature = signature
+        if self.snail_paused and self.snail_started:
+            # 取最近的合法路线落点，既保持可见，也避免缩窗后收拢到标题上。
+            candidates = [
+                min(max(self.snail_x, left), right)
+                for left, right in self._snail_route_segments()
+            ]
+            self.snail_x = min(candidates, key=lambda x: abs(x - self.snail_x))
+            self._place_snail()
+        if self._bubble_canvas is not None:
+            # 原 Canvas 和关闭定时器保持不变，只重绘；缩放不会续期或解除暂停。
+            self._layout_speech_bubble()
 
     def _on_focus_out(self, _event: tk.Event) -> None:
         """窗口失去焦点时暂停动画，避免在后台空转重绘。"""
@@ -253,6 +300,9 @@ class SnailManager:
             except tk.TclError:
                 pass
             self._bubble_canvas = None
+        # 子视口随外层 Canvas 一起销毁，清掉引用，下一条消息从顶部开始阅读。
+        self._bubble_view = None
+        self._bubble_message = None
         if restore_pause and self._window_focused:
             # 气泡关闭后让蜗牛继续爬行；连点蜗牛时传 False 可保持暂停，避免动画闪跳。
             # 窗口已失焦时也不恢复：否则用户切走后气泡到点自动关闭，蜗牛又会在后台爬。
@@ -265,49 +315,83 @@ class SnailManager:
         if self.snail_label is None or not self.snail_label.winfo_exists():
             return
 
+        # Canvas 保持同一个实例，尺寸变化只改布局，避免闪烁及误重置自动关闭时间。
+        self._bubble_canvas = tk.Canvas(
+            self.master, bg="#F0F4F8", highlightthickness=0, borderwidth=0,
+        )
+        self._bubble_message = message
+        self._bubble_canvas.bind("<Button-1>", lambda _event: self._destroy_active_bubble())
+        self._layout_speech_bubble()
+        self._restart_bubble_timeout()
+
+    def _restart_bubble_timeout(self) -> None:
+        """新消息或主动滚动后重新计时，普通重排不调用此函数。"""
+        if self._bubble_after_id is not None:
+            self.master.after_cancel(self._bubble_after_id)
+        # 滚动也算正在阅读，最后一次滚动后的3秒才关闭，不让长文读到一半消失。
+        self._bubble_after_id = self.master.after(3000, self._destroy_active_bubble)
+
+    def _layout_speech_bubble(self) -> None:
+        """共用首次显示和窗口重排的测量、绘制与可滚动正文布局。"""
+        canvas = self._bubble_canvas
+        if canvas is None or self._bubble_message is None or self.snail_label is None:
+            return
+        # 先保存滚动进度再重建视口，缩窗后仍停在大致相同的正文位置。
+        scroll_fraction = self._bubble_view.yview()[0] if self._bubble_view is not None else 0.0
+        for child in canvas.winfo_children():
+            child.destroy()
+        self._bubble_view = None
+        canvas.delete("all")
+
         bubble_font = ("Microsoft YaHei UI", 11)
         # 用临时字体对象量出文字宽度，据此决定气泡尺寸，实现"气泡大小跟着文字走"。
         # 这里直接用 bubble_font 这个字体描述来构造：保证"量出来的宽度"和"画出来的文字"
         # 使用完全相同的字体，否则两者解析结果一旦不同，换行宽度就会与实际渲染对不上。
-        temp_font = tkfont.Font(font=bubble_font)
+        temp_font = tkfont.Font(root=self.master, font=bubble_font)
         padding_x = 18
         padding_y = 12
         window_width = self.master.winfo_width()
+        window_height = self.master.winfo_height()
+        margin = 12
         # 气泡宽度必须有上限，否则一句长提示语会横向顶出窗口、两端文字被裁掉；
-        # 下限 120 保证窗口很窄时单字提示仍然是完整的小气泡。
-        max_bubble_width = max(120, int(window_width * BUBBLE_WIDTH_RATIO))
+        # 优先保留120像素的小气泡，但窗口边距是硬上限，不能为下限牺牲可见性。
+        max_bubble_width = max(
+            1, min(max(120, int(window_width * BUBBLE_WIDTH_RATIO)), window_width - margin * 2),
+        )
         # 一行文字最多能占的宽度 = 气泡上限减去左右内边距。
         max_text_width = max(1, max_bubble_width - padding_x * 2)
         # 所有消息都先解析显式换行，再自动折行，避免 Canvas 画多行而这里只预算一行。
-        wrapped_lines = _wrap_message_by_width(temp_font, message, max_text_width)
+        wrapped_lines = _wrap_message_by_width(temp_font, self._bubble_message, max_text_width)
         # 宽度取换行后最宽的一行，既不超出上限也不会留下大片空白。
         longest_line = max(temp_font.measure(line) for line in wrapped_lines)
         bubble_width = min(max(120, longest_line + padding_x * 2), max_bubble_width)
         # 高度按实际行数计算：linespace 是单行文字高度，行数变多气泡就相应变高。
-        bubble_height = max(
-            40,
-            temp_font.metrics("linespace") * len(wrapped_lines) + padding_y * 2,
-        )
-        # 多出的 12 像素高度留给指向蜗牛的小尾巴。
-        canvas_height = bubble_height + 12
+        line_height = temp_font.metrics("linespace")
+        natural_height = max(40, line_height * len(wrapped_lines) + padding_y * 2)
 
         # 只使用主窗口内的相对坐标，Canvas 会随主窗口一起移动和缩放。
-        snail_center_x = self.snail_label.winfo_x() + self.snail_label.winfo_width() / 2
-        snail_center_y = self.snail_label.winfo_y() + self.snail_label.winfo_height() / 2
-        # 气泡水平居中对齐蜗牛，垂直方向整体放在蜗牛上方。
-        bubble_x = int(snail_center_x - bubble_width / 2)
-        bubble_y = int(snail_center_y - 10 - canvas_height)
-        # window_width 在计算气泡宽度上限时已经取过，这里直接复用，避免同一次绘制重复查询。
-        margin = 12
-        tail_above = False
-        if bubble_y < margin:
-            # 蜗牛位于窗口顶部时，上方没有足够空间，改放到蜗牛下方。
-            bubble_y = (
-                self.snail_label.winfo_y()
-                + self.snail_label.winfo_height()
-                + 10
+        # place 更新 winfo_x 有一轮延迟，使用同口径的实际目标坐标，避免收拢后气泡落在旧位置。
+        snail_center_x = self.snail_x + self.snail_label.winfo_width() / 2
+        below_y = 15 + self.snail_label.winfo_height() + 10
+        # 蜗牛固定在顶部15px，上方不够放正文；下方可用高度必须同时扣掉尾巴和底部边距。
+        bubble_height = max(1, min(natural_height, window_height - margin - below_y - 12))
+        overflow = natural_height > bubble_height
+        scrollbar_width = 16 if overflow else 0
+        if overflow:
+            # 滚动条占正文宽度，必须先扣掉再折行，保证最后一列不被滚动条遮住。
+            # Canvas 文字 bbox 比 measure 略宽，另留4像素免得视口裁掉首尾笔画。
+            max_text_width = max(1, max_bubble_width - padding_x * 2 - scrollbar_width - 4)
+            wrapped_lines = _wrap_message_by_width(temp_font, self._bubble_message, max_text_width)
+            longest_line = max(temp_font.measure(line) for line in wrapped_lines)
+            bubble_width = min(
+                max(120, longest_line + padding_x * 2 + scrollbar_width + 4), max_bubble_width,
             )
-            tail_above = True
+        canvas_height = bubble_height + 12
+        # 水平优先居中，正文固定在蜗牛下方，再按窗口边距收拢。
+        bubble_x = int(snail_center_x - bubble_width / 2)
+        bubble_y = below_y
+        # window_width 在计算气泡宽度上限时已经取过，这里直接复用，避免同一次绘制重复查询。
+        bubble_y = max(margin, min(bubble_y, window_height - margin - canvas_height))
         # 水平方向做边界收拢，防止气泡被窗口边缘裁掉一半。
         if bubble_x < margin:
             bubble_x = margin
@@ -316,17 +400,12 @@ class SnailManager:
 
         # Canvas 直接挂在主窗口上（不是 Toplevel），这样拖动窗口时气泡会跟着一起移动，
         # 不会出现 Toplevel 那种"窗口动了气泡还停在原处"的滞后感，这是刻意的设计约束。
-        canvas = tk.Canvas(
-            self.master,
-            width=bubble_width,
-            height=canvas_height,
-            bg="#F0F4F8",
-            highlightthickness=0,
-        )
+        canvas.configure(width=bubble_width, height=canvas_height)
         canvas.place(x=bubble_x, y=bubble_y)
+        tk.Misc.lift(canvas)  # Canvas.lift 是图元提升；这里需要提升整个气泡控件。
 
         # 用 8 个控制点 + smooth=True，让 create_polygon 渲染成圆角矩形。
-        body_top = 12 if tail_above else 0
+        body_top = 12  # 顶部12px留给向上指向蜗牛的尾巴，正文从其下方开始。
         # 圆角半径不能超过宽高的一半，否则形状会崩坏。
         radius = min(14, bubble_width // 4, bubble_height // 2)
         rounded_body = [
@@ -347,19 +426,17 @@ class SnailManager:
         )
 
         # 小尾巴要指向蜗牛中心：换算成相对 Canvas 的 x 坐标，避免气泡贴边时指错方向。
-        tail_x = int(snail_center_x - bubble_x)
-        if tail_above:
-            tail_points = [
-                (tail_x - 8, body_top + 1),
-                (tail_x + 8, body_top + 1),
-                (tail_x, 0),
-            ]
-        else:
-            tail_points = [
-                (tail_x - 8, bubble_height - 1),
-                (tail_x + 8, bubble_height - 1),
-                (tail_x, canvas_height),
-            ]
+        # 主体贴边时尾巴中心收进圆角之间，三角形两侧也不能伸出 Canvas。
+        tail_half = min(8, max(0, (bubble_width - radius * 2) // 2))
+        tail_x = max(
+            radius + tail_half,
+            min(int(snail_center_x - bubble_x), bubble_width - radius - tail_half),
+        )
+        tail_points = [
+            (tail_x - tail_half, body_top + 1),
+            (tail_x + tail_half, body_top + 1),
+            (tail_x, 0),
+        ]
         canvas.create_polygon(
             tail_points,
             fill="#FFF7D8",
@@ -367,9 +444,36 @@ class SnailManager:
             smooth=True,
         )
 
+        if overflow:
+            view_width = max(1, bubble_width - padding_x * 2 - scrollbar_width)
+            view_height = max(1, bubble_height - padding_y * 2)
+            # 独立 Canvas 只裁视口，不裁原文；字号与短消息保持一致，可滚到所有行。
+            view = tk.Canvas(canvas, bg="#FFF7D8", highlightthickness=0, borderwidth=0)
+            view.place(x=padding_x, y=body_top + padding_y, width=view_width, height=view_height)
+            text_id = view.create_text(
+                view_width / 2, 0, anchor="n", text="\n".join(wrapped_lines),
+                fill="#3E4A5A", font=bubble_font, justify="center",
+            )
+            text_box = view.bbox(text_id)
+            content_height = max(line_height * len(wrapped_lines), text_box[3] if text_box else 0)
+            view.configure(scrollregion=(0, 0, view_width, content_height), yscrollincrement=line_height)
+            scrollbar = tk.Scrollbar(
+                canvas, orient="vertical", width=scrollbar_width, command=self._scroll_bubble,
+            )
+            scrollbar.place(
+                x=padding_x + view_width, y=body_top + padding_y,
+                width=scrollbar_width, height=view_height,
+            )
+            view.configure(yscrollcommand=scrollbar.set)
+            view.yview_moveto(scroll_fraction)
+            view.bind("<MouseWheel>", self._wheel_bubble)
+            scrollbar.bind("<MouseWheel>", self._wheel_bubble)
+            view.bind("<Button-1>", lambda _event: self._destroy_active_bubble())
+            self._bubble_view = view
+            return
         canvas.create_text(
             bubble_width / 2,
-            # 文字垂直居中：位置随尾巴在上方与否平移，防止文字压到尾巴上。
+            # 文字在正文区域垂直居中，不能把尾巴高度当成正文高度的一部分。
             body_top + bubble_height / 2,
             # 传入已经手工折好行的文本，Tk 不再需要自己换行，行宽与气泡宽度严格对应。
             text="\n".join(wrapped_lines),
@@ -377,14 +481,21 @@ class SnailManager:
             font=bubble_font,
             justify="center",
         )
-        # 点击气泡立即关闭它（并恢复蜗牛动画），比干等 3 秒更符合直觉。
-        canvas.bind("<Button-1>", lambda _event: self._destroy_active_bubble())
-        self._bubble_canvas = canvas
-        # 记下定时器句柄，便于用户提前点击关闭时取消它，避免定时器泄漏。
-        self._bubble_after_id = self.master.after(
-            3000,
-            self._destroy_active_bubble,
-        )
+
+    def _scroll_bubble(self, *args: str) -> None:
+        """滚动条操作只移动长文视口，保持蜗牛暂停并续期阅读时间。"""
+        if self._bubble_view is not None:
+            self._bubble_view.yview(*args)
+            self._restart_bubble_timeout()
+
+    def _wheel_bubble(self, event: tk.Event) -> str:
+        if event.delta:
+            # Windows 普通滚轮以120为一格，高精度滚轮小于120时仍至少移动一行。
+            units = max(1, abs(event.delta) // 120)
+            if event.delta > 0:
+                units = -units
+            self._scroll_bubble("scroll", str(units), "units")
+        return "break"  # 气泡内滚轮由正文消费，不再滚动下面的记账列表。
 
     def _snail_clicked(self, _event: tk.Event) -> None:
         """点击蜗牛时随机显示一条 JSON 消息气泡，并暂停蜗牛动画。"""
