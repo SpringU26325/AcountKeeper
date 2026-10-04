@@ -15,11 +15,11 @@ if TYPE_CHECKING:
     from ui import AccountKeeperApp
 
 
-def _apply_logo_icon(window: tk.Misc) -> None:
-    """为图表窗口设置项目 logo 图标。"""
+def _apply_app_icon(window: tk.Tk | tk.Toplevel) -> None:
+    """为图表窗口设置应用图标。"""
     try:
-        # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，打包成 exe 后也能定位到 logo。
-        icon_path = RESOURCE_DIR / "image" / "logo.ico"
+        # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，打包成 exe 后也能定位到应用图标。
+        icon_path = RESOURCE_DIR / "image" / "app_icon.ico"
         if icon_path.exists():
             window.iconbitmap(str(icon_path))
     except Exception:
@@ -80,7 +80,7 @@ def _render_chart_window(
         # 图标要在窗口刚建出来、还没显示时设，晚了会看到图标先闪一下再变；
         # 而且必须自带 try/except——外层那个 except 会 destroy 窗口并弹「图表渲染失败」，
         # 装饰性失败绝不能升级成功能性失败。
-        _apply_logo_icon(chart_window)
+        _apply_app_icon(chart_window)
         # 图表同时画收入和支出两组柱子，标题必须体现"收入与支出"，与图内标题保持一致。
         chart_window.title(f"{month} 收入与支出统计")
         width, height = 700, 550

@@ -144,16 +144,16 @@ _active_picker: _ActivePicker | None = None
 _click_monitor_installed = False
 
 
-def _apply_logo_icon(window: tk.Tk | tk.Toplevel) -> None:
-    """为弹窗设置项目 logo 图标。
+def _apply_app_icon(window: tk.Tk | tk.Toplevel) -> None:
+    """为弹窗设置应用图标。
 
-    这里没有复用 dialogs._apply_logo_icon：dialogs.py 需要导入本模块调用
+    这里没有复用 dialogs._apply_app_icon：dialogs.py 需要导入本模块调用
     ask_tags，若再反向导入会形成循环导入，所以保留一份极小的私有实现。
     路径来源则统一走 config.RESOURCE_DIR（issues #17），不再各自用 __file__ 拼。
     """
     try:
-        # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，打包后也能定位到 logo。
-        icon_path = RESOURCE_DIR / "image" / "logo.ico"
+        # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，打包后也能定位到应用图标。
+        icon_path = RESOURCE_DIR / "image" / "app_icon.ico"
         if icon_path.exists():
             window.iconbitmap(str(icon_path))
     except Exception:
@@ -336,7 +336,7 @@ def ask_tags(
     tk.Wm.resizable(dialog, False, False)
     dialog.transient(parent)
     dialog.configure(fg_color=_BG_COLOR)
-    # logo 图标（iconbitmap）刻意不在这里设：它要读一次 image/logo.ico，属于
+    # 应用图标（iconbitmap）刻意不在这里设：它要读一次 image/app_icon.ico，属于
     # 「晚一帧再设也看不出来」的工作，和 protocol / <Escape> 一起挪到下面的
     # _deferred_setup 里做。判断标准见那里那段注释。
 
@@ -1195,7 +1195,7 @@ def ask_tags(
 
     # ESC 与右上角关闭都等同于「取消」，返回 None 时调用方保持输入框原值不动。
     #
-    # 【方案 4】这两条绑定、上面的 logo 图标、以及全局点击监视器，都属于「窗口第一眼
+    # 【方案 4】这两条绑定、上面的应用图标、以及全局点击监视器，都属于「窗口第一眼
     # 显示出来时不必须已经在位」的工作，统一压到首次 after_idle 再做。
     # 判断标准是「花不花得起」：iconbitmap 要读 .ico 文件，bind_all 要往解释器里装
     # 一段脚本，都不便宜；而 protocol / <Escape> 只是顺手一起挪，省得留下「一半同步
@@ -1213,7 +1213,7 @@ def ask_tags(
         # 同 _scroll_list 里的守卫：after_idle 的回调不随控件销毁而失效。
         if not dialog.winfo_exists():
             return
-        _apply_logo_icon(dialog)
+        _apply_app_icon(dialog)
         dialog.protocol("WM_DELETE_WINDOW", _cancel)
         dialog.bind("<Escape>", lambda _event: _cancel())
         # 「点弹窗外面就关」的全局监视器：装一次，之后一直留着（原因见

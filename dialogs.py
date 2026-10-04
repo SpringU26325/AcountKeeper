@@ -19,12 +19,12 @@ from store import Account
 from widgets import TagChipsFrame
 
 
-def _apply_logo_icon(window: tk.Misc) -> None:
-    """为窗口设置项目 logo 图标。"""
+def _apply_app_icon(window: tk.Tk | tk.Toplevel) -> None:
+    """为窗口设置应用图标。"""
     try:
         # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，
-        # 打包成 exe 后资源被解压到临时目录，也能正确定位到 logo。
-        icon_path = RESOURCE_DIR / "image" / "logo.ico"
+        # 打包成 exe 后资源被解压到临时目录，也能正确定位到应用图标。
+        icon_path = RESOURCE_DIR / "image" / "app_icon.ico"
         if icon_path.exists():
             window.iconbitmap(str(icon_path))
     except Exception:
@@ -98,7 +98,7 @@ def ask_edit_record(
     tk.Wm.resizable(dialog, False, True)
     dialog.transient(parent)
     dialog.configure(fg_color="#F0F4F8")
-    _apply_logo_icon(dialog)
+    _apply_app_icon(dialog)
 
     dialog_font = ("Microsoft YaHei UI", 11)
     title_font = ("Microsoft YaHei UI", 13, "bold")
@@ -304,7 +304,7 @@ def confirm_delete(parent: ctk.CTk) -> bool:
     dialog.resizable(False, False)
     dialog.transient(parent)
     dialog.configure(fg_color="#F0F4F8")
-    _apply_logo_icon(dialog)
+    _apply_app_icon(dialog)
     # 默认返回 False（未确认），只有点「确认」才会置为 True。
     result = [False]
 

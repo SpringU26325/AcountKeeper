@@ -42,8 +42,8 @@ def main() -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
             "AccountKeeper.App"
         )
-        # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，打包成 exe 后也能定位到 logo。
-        icon_path = RESOURCE_DIR / "image" / "logo.ico"
+        # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，打包成 exe 后也能定位到应用图标。
+        icon_path = RESOURCE_DIR / "image" / "app_icon.ico"
         app.iconbitmap(str(icon_path))
         # Tk may inflate the first (16px) ICO frame for both window icon sizes.
         # Select native DPI-sized frames once its window wrapper is ready.

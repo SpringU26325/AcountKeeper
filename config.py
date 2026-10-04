@@ -10,7 +10,7 @@ try:
 except ImportError:
     print("警告：无法导入 platformdirs，将使用用户主目录作为数据目录。")
 
-    def user_data_dir(_appname: str, _appauthor: str) -> str:
+    def user_data_dir(appname: str, appauthor: str) -> str:  # 参数名与第三方函数一致，避免同名绑定的关键字签名冲突。
         # 降级方案：把数据写到用户主目录下的 AccountKeeper 文件夹，
         # 保证即使缺少依赖，记账数据也能落盘而不是丢失。
         return str(Path.home() / "AccountKeeper")

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 import json
+import math
 import random
 import tkinter as tk
 import tkinter.font as tkfont
@@ -23,6 +26,62 @@ BUBBLE_WIDTH_RATIO = 0.8
 # 右键彩蛋的固定文案：刻意不放进 snail_messages.json，
 # 否则左键随机抽文案时也会抽到这句，彩蛋就不再是"彩蛋"了。
 SNAIL_EASTER_EGG_MESSAGE = "诶~我躲（恭喜你找到了作者的彩蛋）"
+
+
+# Windows 句柄在64位进程中不能按默认c_int返回，否则裁剪与释放都会使用截断的地址。
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+_user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HRGN, wintypes.BOOL]
+_user32.SetWindowRgn.restype = ctypes.c_int
+_gdi32.CreatePolygonRgn.argtypes = [ctypes.POINTER(wintypes.POINT), ctypes.c_int, ctypes.c_int]
+_gdi32.CreatePolygonRgn.restype = wintypes.HRGN
+_gdi32.CombineRgn.argtypes = [wintypes.HRGN, wintypes.HRGN, wintypes.HRGN, ctypes.c_int]
+_gdi32.CombineRgn.restype = ctypes.c_int
+_gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+_gdi32.DeleteObject.restype = wintypes.BOOL
+
+
+def _rounded_bubble_points(width: int, height: int, top: int, radius: int) -> list[tuple[int, int]]:
+    """生成圆角主体的物理像素轮廓，绘制和窗口裁剪共同使用。"""
+    points: list[tuple[int, int]] = []
+    for cx, cy, start in (
+        (radius, top + radius, 180), (width - radius, top + radius, 270),
+        (width - radius, top + height - radius, 0), (radius, top + height - radius, 90),
+    ):
+        # 每个圆角采样8段后直接画折线，避免Tk平滑曲线与原生裁剪采用不同的边界。
+        for step in range(9):
+            angle = math.radians(start + step * 90 / 8)
+            point = (round(cx + radius * math.cos(angle)), round(cy + radius * math.sin(angle)))
+            if not points or points[-1] != point:
+                points.append(point)  # 极小圆角会取整到同一点，去掉重复顶点。
+    return points
+
+
+def _clip_bubble_canvas(canvas: tk.Canvas, contours: tuple[list[tuple[int, int]], ...]) -> bool:
+    """仅保留主体与尾巴，让控件矩形四角露出其下真实界面。"""
+    regions: list[int] = []
+    try:
+        for contour in contours:
+            vertices = (wintypes.POINT * len(contour))(*(wintypes.POINT(x, y) for x, y in contour))
+            region = _gdi32.CreatePolygonRgn(vertices, len(contour), 1)  # ALTERNATE：单个闭合轮廓。
+            if not region:
+                raise ctypes.WinError()
+            regions.append(region)
+        # 主体与尾巴取并集，重叠处不会因轮廓方向不同而形成透明孔洞。
+        for region in regions[1:]:
+            if not _gdi32.CombineRgn(regions[0], regions[0], region, 2):  # RGN_OR。
+                raise ctypes.WinError()
+        if not _user32.SetWindowRgn(canvas.winfo_id(), regions[0], True):
+            raise ctypes.WinError()
+        regions.pop(0)  # 成功后区域归系统所有；替换区域或销毁窗口时由系统释放。
+        return True
+    except (OSError, tk.TclError) as error:
+        # 装饰性裁剪失败不影响记账；调用方关闭本次气泡，避免留下不透明矩形。
+        print(f"警告：无法裁剪蜗牛气泡：{error}")
+        return False
+    finally:
+        for region in regions:
+            _gdi32.DeleteObject(region)  # 临时尾巴区域和失败时未移交的区域必须自己释放。
 
 
 def _wrap_message_by_width(
@@ -402,7 +461,8 @@ class SnailManager:
 
         # Canvas 保持同一个实例，尺寸变化只改布局，避免闪烁及误重置自动关闭时间。
         self._bubble_canvas = tk.Canvas(
-            self.master, bg="#F0F4F8", highlightthickness=0, borderwidth=0,
+            # 裁剪后的窗口仅剩气泡形状，底色与主体一致，避免边界栅格取整露出蓝色细线。
+            self.master, bg="#FFF7D8", highlightthickness=0, borderwidth=0,
         )
         self._bubble_message = message
         self._bubble_canvas.bind("<Button-1>", lambda _event: self._destroy_active_bubble())
@@ -490,25 +550,16 @@ class SnailManager:
         canvas.place(x=bubble_x, y=bubble_y)
         tk.Misc.lift(canvas)  # Canvas.lift 是图元提升；这里需要提升整个气泡控件。
 
-        # 用 8 个控制点 + smooth=True，让 create_polygon 渲染成圆角矩形。
+        # 绘制与Windows区域裁剪共用物理像素轮廓，不再让Tk额外平滑改变边界。
         body_top = 12  # 顶部12px留给向上指向蜗牛的尾巴，正文从其下方开始。
         # 圆角半径不能超过宽高的一半，否则形状会崩坏。
         radius = min(14, bubble_width // 4, bubble_height // 2)
-        rounded_body = [
-            (radius, body_top),
-            (bubble_width - radius, body_top),
-            (bubble_width, body_top + radius),
-            (bubble_width, body_top + bubble_height - radius),
-            (bubble_width - radius, body_top + bubble_height),
-            (radius, body_top + bubble_height),
-            (0, body_top + bubble_height - radius),
-            (0, body_top + radius),
-        ]
+        rounded_body = _rounded_bubble_points(bubble_width, bubble_height, body_top, radius)
         canvas.create_polygon(
             rounded_body,
             fill="#FFF7D8",
-            outline="#FFF7D8",
-            smooth=True,
+            outline="",
+            smooth=False,
         )
 
         # 小尾巴要指向蜗牛中心：换算成相对 Canvas 的 x 坐标，避免气泡贴边时指错方向。
@@ -526,9 +577,14 @@ class SnailManager:
         canvas.create_polygon(
             tail_points,
             fill="#FFF7D8",
-            outline="#FFF7D8",
-            smooth=True,
+            outline="",
+            smooth=False,
         )
+
+        # 在短文和长文分支前统一裁剪，尺寸或尾巴位置变化时同步更新同一个Canvas。
+        if not _clip_bubble_canvas(canvas, (rounded_body, tail_points)):
+            self._destroy_active_bubble()
+            return
 
         if overflow:
             view_width = max(1, bubble_width - padding_x * 2 - scrollbar_width)

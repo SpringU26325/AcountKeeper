@@ -63,16 +63,16 @@ _WEEKDAY_HEADERS = ("日", "一", "二", "三", "四", "五", "六")
 _CALENDAR = calendar.Calendar(firstweekday=calendar.SUNDAY)
 
 
-def _apply_logo_icon(window: tk.Tk | tk.Toplevel) -> None:
-    """为弹窗设置项目 logo 图标。
+def _apply_app_icon(window: tk.Tk | tk.Toplevel) -> None:
+    """为弹窗设置应用图标。
 
-    这里没有复用 dialogs._apply_logo_icon：dialogs.py 需要导入本模块调用 ask_date，
+    这里没有复用 dialogs._apply_app_icon：dialogs.py 需要导入本模块调用 ask_date，
     若再反向导入会形成循环导入，所以保留一份极小的私有实现。
     路径来源则统一走 config.RESOURCE_DIR（issues #17），不再各自用 __file__ 拼。
     """
     try:
-        # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，打包后也能定位到 logo。
-        icon_path = RESOURCE_DIR / "image" / "logo.ico"
+        # 路径统一由 config.RESOURCE_DIR 提供：它带 sys._MEIPASS 兜底，打包后也能定位到应用图标。
+        icon_path = RESOURCE_DIR / "image" / "app_icon.ico"
         if icon_path.exists():
             window.iconbitmap(str(icon_path))
     except Exception:
@@ -529,7 +529,7 @@ def _recenter(_event: tk.Event | None = None) -> None:
 def _deferred_setup() -> None:
     """窗口级的一次性 setup，压到首个 after_idle 执行，且整个进程只做一次。
 
-    【方案 1 的延续】protocol / <Escape> 绑定与 logo 图标都属于「窗口第一眼显示
+    【方案 1 的延续】protocol / <Escape> 绑定与应用图标都属于「窗口第一眼显示
     出来时不必须已经在位」的工作：iconbitmap 要读 .ico 文件，bind 要往解释器里
     装脚本，而它们晚 10ms 到位对用户没有任何差别。
 
@@ -551,7 +551,7 @@ def _deferred_setup() -> None:
     except tk.TclError:
         return
     _win.setup_done = True
-    _apply_logo_icon(_win.dialog)
+    _apply_app_icon(_win.dialog)
     # 右上角关闭按钮等同「取消」，避免出现状态不明确的弹窗。
     _win.dialog.protocol("WM_DELETE_WINDOW", _cancel)
     # ESC 取消，与 ask_month / ask_edit_record 的操作习惯保持一致。
@@ -654,7 +654,7 @@ def _ensure_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
     tk.Wm.resizable(dialog, False, False)
     dialog.transient(parent)
     dialog.configure(fg_color=_BG_COLOR)
-    # logo 图标（iconbitmap）刻意不在这里设：它要读一次 image/logo.ico，属于
+    # 应用图标（iconbitmap）刻意不在这里设：它要读一次 image/app_icon.ico，属于
     # 「晚一帧再设也看不出来」的工作，与 protocol / <Escape> 一起挪到下面的
     # _deferred_setup 里做。
     # 先给一个尺寸提示：CTk 会把逻辑像素按 DPI 放大；随后 Tk 还可能按内容再撑大，
@@ -886,7 +886,7 @@ def _begin_session(
     # 否则会先按上一个模式的样子闪一帧（比如月份模式下先闪出一片日期网格 + 「今日」）。
     _apply_mode_chrome(mode)
 
-    # 【setup 只做一次】protocol / <Escape> / <Destroy> / logo 图标都是窗口级的，
+    # 【setup 只做一次】protocol / <Escape> / <Destroy> / 应用图标都是窗口级的，
     # 只安排一次即可。若首次打开的 idle 还没跑就被关掉，_cleanup 会取消它，
     # 此时 setup_done 仍为 False，下一次打开会重新安排，不会永久丢失。
     if not win.setup_done and ses.setup_idle[0] is None:
