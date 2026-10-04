@@ -252,19 +252,18 @@ class InputFrame(ctk.CTkFrame):
         # 外面这一列必须是 weight=1，两个容器才能撑满卡片宽度。
         self.columnconfigure(0, weight=1)
 
-        # ---------- 标题行（需求 3.2）：标题 | 支出/收入切换 | ⋯ | 添加 ----------
-        # 列结构：0=标题（宽度由文字决定）｜1=切换按钮｜2=弹性空白｜3=添加按钮
-        # 第 2 列是唯一的弹性列：它吃掉全部剩余宽度，把添加按钮顶到卡片最右侧，
-        # 同时保证切换按钮始终紧跟在标题后面，不会跟着窗口一起往右漂。
+        # ---------- 标题行（需求 3.2）：标题 ⋯ | 支出/收入切换 | 添加 ----------
+        # 列结构：0=标题（宽度由文字决定）｜1=弹性空白｜2=切换按钮｜3=添加按钮
+        # 第 1 列是唯一的弹性列：它吃掉全部剩余宽度，把右侧的「切换 + 添加」整体顶到
+        # 卡片最右端并保持成组。窗口拉宽时，多出来的宽度只落在标题与按钮组之间，
+        # 按钮组始终贴着右内边距，两者间距恒定 12px。
         title_frame = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
         title_frame.grid(row=0, column=0, padx=0, pady=(12, 8), sticky="ew")
         title_frame.columnconfigure(0, weight=0)
-        title_frame.columnconfigure(1, weight=0)
-        title_frame.columnconfigure(2, weight=1)
+        title_frame.columnconfigure(1, weight=1)
+        title_frame.columnconfigure(2, weight=0)
         title_frame.columnconfigure(3, weight=0)
 
-        # 标题右侧 padx=0、切换按钮左侧 padx=16，两者之间正好 16px；
-        # 若两边都写 16 会变成 32px，与「间距约 16px」的要求不符。
         ctk.CTkLabel(
             title_frame,
             text="添加记录",
@@ -273,12 +272,15 @@ class InputFrame(ctk.CTkFrame):
         ).grid(row=0, column=0, padx=(16, 0), pady=0, sticky="w")
 
         # 支出/收入切换按钮（需求 3.2）：只决定金额的正负号，不直接改写输入框里的数字。
-        # 它只是从金额框旁边挪到了标题行。
-        # width=100 必须配合 dynamic_resizing=False 才会生效：
+        # 它从金额框旁边挪到标题行后，与「添加」一起构成右侧紧凑操作区。
+        # width=120 必须配合 dynamic_resizing=False 才会生效：
         # CTkSegmentedButton 内部的每个分段按钮都是以 width=0 创建的，
         # 默认（dynamic_resizing=True）会让外层容器自动收缩到「文字宽度」，
         # 无论把 width 写成多少，实测都恒为 74px 左右；
-        # 关掉自动收缩后，width=100 才会被完整尊重。
+        # 关掉自动收缩后，width=120 才会被完整尊重。
+        # 视觉层级：改用浅灰底 + 浅蓝选中态 + 深色文字，并关掉默认 3px 灰边框
+        # （border_width=0）与 theme 灰底（fg_color="transparent"），
+        # 让它读起来是「状态指示」而非另一套重组件；「添加」才是主操作。
         self.amount_type_button = ctk.CTkSegmentedButton(
             title_frame,
             values=["支出", "收入"],
@@ -286,26 +288,31 @@ class InputFrame(ctk.CTkFrame):
             # 候选在用户点标签区 ▼ 时由 tag_picker 现算；收支切换不影响共享标签池。
             # amount_type_var 由 CTkSegmentedButton 自己维护：用户点击走的是内部
             # set(value, from_button_callback=True)，那里会写回 self._variable。
-            width=100,
-            height=32,
+            width=120,
+            height=36,
             dynamic_resizing=False,
-            corner_radius=8,
-            font=("Microsoft YaHei UI", 10),
-            selected_color="#2F80ED",
-            selected_hover_color="#256AC4",
+            corner_radius=9,
+            border_width=0,
+            # 用与卡片一致的白色填充外框角落，避免 theme 默认灰底形成一圈「重外框」，
+            # 同时比 "transparent" 更稳：分段按钮的 background_corner_colors 需要真实色值。
+            fg_color="#FFFFFF",
+            font=font_small,
+            selected_color="#CFE0F8",
+            selected_hover_color="#BFD6F5",
             # 浅色主题下必须显式指定未选中态的底色与文字色，否则「收入」二字会看不见。
-            unselected_color="#C6D4DF",
-            unselected_hover_color="#B7C7D4",
-            text_color="#455A64",
+            unselected_color="#F0F3F7",
+            unselected_hover_color="#E2E8F0",
+            text_color="#243447",
         )
-        # sticky="w"：按钮贴着自己那一列的左边缘，不随第 2 列变宽而漂移。
+        # sticky="e"：按钮贴着自己那一列的右边缘，靠弹性列把它整体推到卡片右侧。
+        # 右 padx=12 是「切换」与「添加」之间的间距（见下），两者成组。
         self.amount_type_button.grid(
-            row=0, column=1, padx=(16, 0), pady=0, sticky="w"
+            row=0, column=2, padx=(0, 12), pady=0, sticky="e"
         )
 
-        # 添加按钮（原来在第二行最右侧）：文字由「添加记录」缩为「添加」，
-        # 因为标题已经占了「添加记录」四个字，按钮再重复一遍会显得啰嗦。
-        # 宽度随之从 110px 缩到 88px，仍是「固定宽度」控件（所在列权重为 0）。
+        # 添加按钮：标题已经占了「添加记录」四个字，按钮用「添加」即可。
+        # width=96、height=36、corner_radius=9、font 11 —— 与切换按钮同一套尺寸基线，
+        # 保证右侧两枚控件等高、同圆角、同字号，垂直居中对齐。
         # 右 padx=16 是卡片内边距，与字段区（master_frame 的右 padx）保持一致，
         # 所以按钮右边缘与备注框右边缘落在同一条竖线上。
         # command=add_callback 与原来完全一致。
@@ -313,9 +320,9 @@ class InputFrame(ctk.CTkFrame):
             title_frame,
             text="添加",
             command=add_callback,
-            width=88,
+            width=96,
             height=36,
-            corner_radius=10,
+            corner_radius=9,
             fg_color="#2F80ED",
             hover_color="#256AC4",
             font=font_small,
@@ -718,9 +725,9 @@ class RecordTableFrame(ctk.CTkFrame):
             self.tree.heading(column, text=title)
             self.tree.column(
                 column,
-                # 备注列内容较长，左对齐更易读；其余列都是短内容，居中对齐更整齐。
+                # 各列内容统一居中，与表头保持一致。
                 width=width,
-                anchor="center" if column != "note" else "w",
+                anchor="center",
             )
         scrollbar = ttk.Scrollbar(
             table_inner,

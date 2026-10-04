@@ -168,7 +168,11 @@ class SnailManager:
             image = self._prepare_snail_image()
             # 40 是逻辑显示尺寸，源图保留高分辨率，让 CTk 按 DPI 直接生成清晰图像。
             scale = 40 / max(image.size)
-            display_size = tuple(max(1, round(length * scale)) for length in image.size)
+            # 显式构造宽高二元组，让类型检查器确认 CTkImage 所需的固定长度。
+            display_size = (
+                max(1, round(image.width * scale)),
+                max(1, round(image.height * scale)),
+            )
             self.snail_photo = ctk.CTkImage(
                 light_image=image,
                 dark_image=image,
@@ -257,7 +261,7 @@ class SnailManager:
                 pass  # 外部销毁的控件可能已清掉 Tcl 命令；不影响其他控件继续收尾。
         self._destroy_active_bubble(restore_pause=False)
         label, self.snail_label = self.snail_label, None
-        if self._widget_exists(label):
+        if label is not None and self._widget_exists(label):
             label.destroy()
         self.snail_photo = None
         self.snail_x = 0
@@ -285,14 +289,16 @@ class SnailManager:
     def _reflow_geometry(self) -> None:
         """仅在实际几何变化时收拢暂停位置并重排现有气泡。"""
         self._geometry_after_id = None
-        if not self._is_active():
+        # 普通 bool 辅助检查不收窄可空类型；保存并显式判空后再读取控件尺寸。
+        label = self.snail_label
+        if label is None or not self._is_active():
             return
         window_width, snail_width, text_left, text_right = self._snail_bounds()
         window_height = self.master.winfo_height()
         if window_width <= 1 or window_height <= 1:
             return  # 未布局的 1px 不是有效边界，等待下一次尺寸事件。
         signature = (
-            window_width, window_height, snail_width, self.snail_label.winfo_height(),
+            window_width, window_height, snail_width, label.winfo_height(),
             text_left, text_right,
         )
         if signature == self._geometry_signature:
@@ -465,7 +471,7 @@ class SnailManager:
             self.master, bg="#FFF7D8", highlightthickness=0, borderwidth=0,
         )
         self._bubble_message = message
-        self._bubble_canvas.bind("<Button-1>", lambda _event: self._destroy_active_bubble())
+        self._bubble_canvas.bind("<ButtonRelease-1>", lambda _event: self._destroy_active_bubble())
         self._layout_speech_bubble()
         self._restart_bubble_timeout()
 
@@ -610,7 +616,7 @@ class SnailManager:
             view.yview_moveto(scroll_fraction)
             view.bind("<MouseWheel>", self._wheel_bubble)
             scrollbar.bind("<MouseWheel>", self._wheel_bubble)
-            view.bind("<Button-1>", lambda _event: self._destroy_active_bubble())
+            view.bind("<ButtonRelease-1>", lambda _event: self._destroy_active_bubble())
             self._bubble_view = view
             return
         canvas.create_text(
