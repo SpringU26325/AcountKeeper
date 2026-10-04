@@ -30,34 +30,37 @@ def _wrap_message_by_width(
     message: str,
     max_text_width: int,
 ) -> list[str]:
-    """按像素宽度把提示语折成多行，让长文本"变高"而不是"变宽"。"""
+    """保留显式换行与空行，再按像素宽度折行，统一文字和尺寸模型。"""
     lines: list[str] = []
-    current = ""
-    for char in message:
-        # 逐字累加并实时测量，一旦超过可用宽度就先收下当前这行。
-        if current and font.measure(current + char) > max_text_width:
-            # 只有在"空格之前的部分已经占满大半行"时才在空格处断行。
-            # 否则为了迁就一个靠前的空格（例如"欢迎使用 AccountKeeper..."），
-            # 会把整行剩下的内容全部推到下一行，出现第一行只有几个字、第二行爆满的难看效果。
-            head, separator, tail = current.rpartition(" ")
-            if (
-                head
-                and separator
-                and char != " "
-                and font.measure(head) >= max_text_width * 0.5
-            ):
-                # 按单词边界断行，避免把英文单词从中间劈成两半（中文没有空格，走下面的硬断）。
-                lines.append(head)
-                current = tail + char
-                continue
-            # 硬断：直接把当前内容作为一行，断点处的空格丢弃，避免新行以空格开头而偏移。
-            lines.append(current.rstrip())
-            current = "" if char == " " else char
-        else:
-            current += char
-    # 收尾时同样要追加一次：即便 message 为空串也要返回一个元素，
-    # 否则调用方对它做 max() 会因为空序列报错。
-    lines.append(current.rstrip())
+    # 统一常见换行格式后用 split 保留首尾及连续空行，不能用会丢尾部空行的 splitlines。
+    paragraphs = message.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    for paragraph in paragraphs:
+        if font.measure(paragraph) <= max_text_width:
+            # 短段落含空串都直接保留，既减少逐字测量，也让空行参与高度计算。
+            lines.append(paragraph)
+            continue
+        current = ""
+        for char in paragraph:
+            # 逐字累加并实时测量，一旦超过可用宽度就先收下当前这行。
+            if current and font.measure(current + char) > max_text_width:
+                # 只有空格之前已占大半行才按单词断，避免中文夹英文时留下过大的空白。
+                head, separator, tail = current.rpartition(" ")
+                if (
+                    head
+                    and separator
+                    and char != " "
+                    and font.measure(head) >= max_text_width * 0.5
+                ):
+                    lines.append(head)
+                    current = tail + char
+                    continue
+                # 长词或中文按字符折行；单个超宽字符独占一行，保证循环始终能推进。
+                lines.append(current.rstrip())
+                current = "" if char == " " else char
+            else:
+                current += char
+        # 每个段落各自收尾，显式换行不能被自动折行吞掉；空消息同样保留一行。
+        lines.append(current.rstrip())
     return lines
 
 
@@ -275,11 +278,8 @@ class SnailManager:
         max_bubble_width = max(120, int(window_width * BUBBLE_WIDTH_RATIO))
         # 一行文字最多能占的宽度 = 气泡上限减去左右内边距。
         max_text_width = max(1, max_bubble_width - padding_x * 2)
-        if temp_font.measure(message) <= max_text_width:
-            wrapped_lines = [message]
-        else:
-            # 超过上限就自动换行：让气泡"长高"来容纳长文本，而不是无限变宽。
-            wrapped_lines = _wrap_message_by_width(temp_font, message, max_text_width)
+        # 所有消息都先解析显式换行，再自动折行，避免 Canvas 画多行而这里只预算一行。
+        wrapped_lines = _wrap_message_by_width(temp_font, message, max_text_width)
         # 宽度取换行后最宽的一行，既不超出上限也不会留下大片空白。
         longest_line = max(temp_font.measure(line) for line in wrapped_lines)
         bubble_width = min(max(120, longest_line + padding_x * 2), max_bubble_width)
