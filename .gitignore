@@ -16,6 +16,7 @@ dist/
 *.egg
 # PyInstaller 自动生成的 spec 是副产品，不进仓库
 *.spec
+build/
 
 # ---------- 真实数据（必须忽略！） ----------
 account.db

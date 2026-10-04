@@ -127,7 +127,7 @@ class _ActivePicker:
 
     dialog: ctk.CTkToplevel
     anchor: tk.Misc  # 锚点输入框：用来判断用户是不是又点了同一个 ▼
-    toggle: tk.Misc | None  # 调用方的 ▼ 按钮：点它算 toggle，不算「点了外面」
+    toggle: ctk.CTkButton | None  # 调用方的 ▼ 按钮：点它算 toggle，不算「点了外面」
     close: Callable[[], None]  # 关闭函数，由 ask_tags 内部的闭包提供
 
 
@@ -144,7 +144,7 @@ _active_picker: _ActivePicker | None = None
 _click_monitor_installed = False
 
 
-def _apply_logo_icon(window: tk.Misc) -> None:
+def _apply_logo_icon(window: tk.Tk | tk.Toplevel) -> None:
     """为弹窗设置项目 logo 图标。
 
     这里没有复用 dialogs._apply_logo_icon：dialogs.py 需要导入本模块调用
@@ -206,12 +206,12 @@ def _clear_picker(dialog: tk.Misc) -> None:
         _active_picker = None
 
 
-def _set_toggle_text(toggle: tk.Misc | None, text: str) -> None:
+def _set_toggle_text(toggle: ctk.CTkButton | None, text: str) -> None:
     """把调用方那个 ▼ 按钮的文字改成 text（▲ 或 ▼），失败一律静默。
 
     只做「换个图标」这一件事，所以任何异常都不值得往外冒：按钮可能早就没了
-    （用户关编辑记录弹窗时，那个 ▼ 会和弹窗一起被连带销毁），而形参类型也只承诺
-    是 tk.Misc、并不保证它有 text 选项。图标属于提示性信息——宁可这一次没翻过来，
+    （用户关编辑记录弹窗时，那个 ▼ 会和弹窗一起被连带销毁）；形参明确为 CTkButton，
+    正常支持 text 选项。图标属于提示性信息——宁可这一次没翻过来，
     也绝不能让关闭流程卡在半路。
     """
     if toggle is None:
@@ -221,7 +221,7 @@ def _set_toggle_text(toggle: tk.Misc | None, text: str) -> None:
             return
         toggle.configure(text=text)
     except (tk.TclError, AttributeError, ValueError):
-        # TclError：控件已销毁；AttributeError / ValueError：该控件没有 text 选项。
+        # 按钮销毁或配置过程异常时保留容错，避免图标更新打断关闭流程。
         pass
 
 
@@ -274,10 +274,10 @@ def _ensure_click_monitor(widget: tk.Misc) -> None:
 
 
 def ask_tags(
-    parent: tk.Misc,
+    parent: tk.Tk | tk.Toplevel,
     anchor: tk.Misc,
     current: str = "",
-    toggle_button: tk.Misc | None = None,
+    toggle_button: ctk.CTkButton | None = None,
     *,
     selected_tags: tuple[str, ...] = (),
 ) -> tuple[str, ...] | None:
@@ -315,12 +315,13 @@ def ask_tags(
     # 只认「parent 自己握着 grab」这一种：Tk 的本地 grab 会把发给同应用其他窗口的
     # 鼠标事件全部改投给 grab 窗口，所以别处握着 grab 时本函数压根不会被调用到。
     previous_grab: tk.Misc | None = None
+    current_grab: tk.Misc | None = None  # 查询前先绑定，避免异常路径留下未赋值变量。
     try:
         current_grab = parent.grab_current()
         holds_grab = current_grab is not None and current_grab.winfo_toplevel() is parent
     except tk.TclError:
         holds_grab = False
-    if holds_grab:
+    if holds_grab and current_grab is not None:  # 在使用点显式收窄，保证释放对象非空。
         previous_grab = current_grab
         try:
             current_grab.grab_release()
@@ -392,7 +393,7 @@ def ask_tags(
     # 局部更新（置顶只重排一行、删除只销毁一行）全靠它找到「要动的那个控件」，
     # 它同时也是 _scroll_list 算式里「一共有几行」的唯一依据。
     # _build_row 每画一行就往里追加一条，_render_list 整表重画时整个清空重填。
-    _row_refs: list[tuple[str, tk.Misc, tk.Misc]] = []
+    _row_refs: list[tuple[str, ctk.CTkFrame, ctk.CTkButton]] = []
     # 单独保存名称按钮：整表重绘后重建引用，单项 toggle 时只改对应按钮样式。
     _selection_buttons: dict[str, ctk.CTkButton] = {}
 
@@ -900,7 +901,7 @@ def ask_tags(
     # ---------- 重画列表 ----------
     # 只在「数据真的变了」的动作之后调用：打开弹窗、保存、删除。
 
-    def _set_pin_state(pin_button: tk.Misc, *, disabled: bool) -> None:
+    def _set_pin_state(pin_button: ctk.CTkButton, *, disabled: bool) -> None:
         """同步某一行的「顶」按钮可不可点。
 
         只有列表的**第一行**该是灰的（它已经在最上面了）。置顶与删除都会让「谁是
@@ -970,7 +971,7 @@ def ask_tags(
 
         _resize_dialog(len(rows))
 
-    def _build_row(name: str, first: bool = False) -> tuple[tk.Misc, tk.Misc]:
+    def _build_row(name: str, first: bool = False) -> tuple[ctk.CTkFrame, ctk.CTkButton]:
         """画一行标签：透明容器 + 名字按钮（左，撑满）+「顶」+「×」（右）。
 
         高亮只画在名字按钮上、容器保持透明，否则整行（连同右边两个按钮）会一起变蓝，
