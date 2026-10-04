@@ -1,6 +1,5 @@
 <div align="center">
-  <img width="350" alt="蜗牛气泡框" src="https://github.com/user-attachments/assets/5fcc3c23-4fba-46d6-84f4-cac6085c8be4" />
-</div>
+  <img width="350" alt="蜗牛气泡框" src="https://github.com/user-attachments/assets/d7d61db3-37e8-42d6-a04c-bd0d46297e28" />
 
 # AccountKeeper 本地记账软件
 
