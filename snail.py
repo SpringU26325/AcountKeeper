@@ -90,11 +90,21 @@ class SnailManager:
         self._bubble_view: tk.Canvas | None = None
         self._geometry_after_id: str | None = None
         self._geometry_signature: tuple[int, ...] | None = None
+        self._focus_after_id: str | None = None
+        # 运行状态与入场状态分开，才能让 start/stop 幂等并准确管理一条动画链。
+        self._running = False
+        self._bindings: list[tuple[tk.Misc, str, str]] = []
         self.snail_label: ctk.CTkLabel | None = None
         self.snail_photo: ctk.CTkImage | None = None
 
     def start(self) -> None:
         """Load the snail image, create its label, and start its animation."""
+        if self._running:
+            if self._is_active():
+                return  # 重复启动不能重建图片、覆盖位置或再开一条动画链。
+            self.stop()
+        if not self._widget_exists(self.master) or not self._widget_exists(self.title_block):
+            return  # 父窗口或标题已销毁时不能再创建装饰控件。
         try:
             image = self._prepare_snail_image()
             # 40 是逻辑显示尺寸，源图保留高分辨率，让 CTk 按 DPI 直接生成清晰图像。
@@ -119,32 +129,95 @@ class SnailManager:
         )
         # 蜗牛是标题区的悬浮装饰，显式提升层级以满足独立组件的显示要求。
         self.snail_label.lift()
+        self._running = True
+        # 原生 bind 返回可精确移除的句柄；add 保留窗口和 CTk 原来的同名回调。
+        self._bind(self.master, "<Map>", self._on_window_shown)
+        self._bind(self.master, "<FocusOut>", self._on_focus_out)
+        self._bind(self.master, "<FocusIn>", self._on_focus_in)
+        for widget in (self.master, self.title_block, self.snail_label):
+            self._bind(widget, "<Configure>", self._on_geometry_changed)
+            self._bind(widget, "<Destroy>", self._on_destroy)
+        # 点击仍交给 CTkLabel 转发到图片子控件，随整个 label 销毁，不影响外部窗口绑定。
+        self.snail_label.bind("<Button-1>", self._snail_clicked)
+        self.snail_label.bind("<Button-3>", self._snail_right_clicked)
         # 先强制刷新几何信息，否则 winfo_width() 可能返回 1（窗口尚未真正布局完成）。
         self.master.update_idletasks()
+        if not self._is_active():
+            return  # 空闲布局会执行其他回调；若期间已关闭窗口，不能接着启动动画。
         window_width = self.master.winfo_width()
         # 只有窗口已布局且已显示时才摆放蜗牛，否则坐标不可靠。
         # 这条分支覆盖"窗口早已显示、之后才创建蜗牛"的场景；正常启动时窗口还没显示，走下面的 <Map>。
         if window_width > 1 and self.master.winfo_ismapped():
             self._window_shown = True
             self._enter_from_right(window_width)
-        # 正常启动时窗口尚未显示，而此时的 winfo_width() 不是 1 而是 Tk 默认的 200，
-        # 拿它当入口坐标会让蜗牛从窗口偏左处冒出来，所以入口摆放必须推迟到窗口真正显示的 <Map> 事件。
-        self.master.bind("<Map>", self._on_window_shown)
-        self.snail_label.bind("<Button-1>", self._snail_clicked)
-        # 右键彩蛋：随机传送到行进路线上并冒出一句固定文案（<Button-3> 即 Windows 下的右键）。
-        self.snail_label.bind("<Button-3>", self._snail_right_clicked)
         # 用户真正切走窗口（例如 Alt+Tab）时暂停动画，切回来自动恢复；
         # 用焦点事件而不是键盘事件判断，才不会把 Alt 这类系统按键误当成"离开窗口"。
-        self.master.bind("<FocusOut>", self._on_focus_out)
-        self.master.bind("<FocusIn>", self._on_focus_in)
-        # 原生 bind + add 保留 CTk 自己的尺寸监听；只处理相关控件，不被气泡重绘自激。
-        for widget in (self.master, self.title_block, self.snail_label):
-            tk.Misc.bind(widget, "<Configure>", self._on_geometry_changed, add="+")
+        self._queue_focus_check()
         self._animate_snail()
+
+    @staticmethod
+    def _widget_exists(widget: tk.Misc | None) -> bool:
+        if not isinstance(widget, tk.Misc):
+            return False  # Tk 无法解析已销毁控件时可能只传来路径字符串，不能再调用 winfo。
+        try:
+            return bool(widget.winfo_exists())
+        except tk.TclError:
+            return False  # Tcl 解释器已关闭时 winfo 也会报错，按控件不存在处理。
+
+    def _is_active(self) -> bool:
+        return self._running and all(
+            self._widget_exists(widget)
+            for widget in (self.master, self.title_block, self.snail_label)
+        )
+
+    def _bind(self, widget: tk.Misc, sequence: str, callback) -> None:
+        # 保存每条绑定的 Tcl 命令句柄，stop 只摘自己的处理器，不清空整个事件序列。
+        funcid = tk.Misc.bind(widget, sequence, callback, add="+")
+        self._bindings.append((widget, sequence, funcid))
+
+    def _cancel_after(self, attribute: str) -> None:
+        timer_id = getattr(self, attribute)
+        # 先清空引用再取消，已到时、重复停止或销毁重入都不会再次使用旧句柄。
+        setattr(self, attribute, None)
+        if timer_id is not None:
+            try:
+                self.master.after_cancel(timer_id)
+            except (tk.TclError, ValueError):
+                pass  # 已到时或解释器关闭时无需再取消，句柄仍必须清空。
+
+    def stop(self) -> None:
+        """取消自身任务、精确解绑并释放装饰控件，可重复调用或随后重新启动。"""
+        self._running = False  # 先停调度，避免 destroy 事件或空闲回调在清理中再次续期。
+        for attribute in ("snail_animation_id", "_geometry_after_id", "_focus_after_id"):
+            self._cancel_after(attribute)
+        bindings, self._bindings = self._bindings, []
+        for widget, sequence, funcid in bindings:
+            try:
+                tk.Misc.unbind(widget, sequence, funcid)
+            except (tk.TclError, ValueError):
+                pass  # 外部销毁的控件可能已清掉 Tcl 命令；不影响其他控件继续收尾。
+        self._destroy_active_bubble(restore_pause=False)
+        label, self.snail_label = self.snail_label, None
+        if self._widget_exists(label):
+            label.destroy()
+        self.snail_photo = None
+        self.snail_x = 0
+        self.snail_started = False
+        self.snail_paused = False
+        self._window_shown = False
+        self._window_focused = False
+        self._geometry_signature = None
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        if not self._running or event.widget not in (self.master, self.title_block, self.snail_label):
+            return  # 顶层绑定也收到普通子控件销毁，不能据此关闭蜗牛。
+        if event.widget is self.snail_label:
+            self.snail_label = None  # 已在 destroy 流程内，不再对同一 label 重入销毁。
+        self.stop()
 
     def _on_geometry_changed(self, event: tk.Event) -> None:
         """将一轮窗口、标题和图片尺寸变化合并到布局完成之后处理。"""
-        if event.widget not in (self.master, self.title_block, self.snail_label):
+        if not self._running or event.widget not in (self.master, self.title_block, self.snail_label):
             return
         if self._geometry_after_id is None:
             # 等 CTk 的 DPI 尺寸与标题布局一起落定，避免按这一轮中间尺寸反复移动。
@@ -153,10 +226,7 @@ class SnailManager:
     def _reflow_geometry(self) -> None:
         """仅在实际几何变化时收拢暂停位置并重排现有气泡。"""
         self._geometry_after_id = None
-        if (
-            self.snail_label is None or not self.snail_label.winfo_exists()
-            or not self.title_block.winfo_exists()
-        ):
+        if not self._is_active():
             return
         window_width, snail_width, text_left, text_right = self._snail_bounds()
         window_height = self.master.winfo_height()
@@ -181,21 +251,38 @@ class SnailManager:
             # 原 Canvas 和关闭定时器保持不变，只重绘；缩放不会续期或解除暂停。
             self._layout_speech_bubble()
 
-    def _on_focus_out(self, _event: tk.Event) -> None:
-        """窗口失去焦点时暂停动画，避免在后台空转重绘。"""
-        self._window_focused = False
-        self.snail_paused = True
+    def _on_focus_out(self, event: tk.Event) -> None:
+        self._on_focus_in(event)  # 两种事件都查询最终焦点，内部切焦不能按事件名称直接暂停。
 
-    def _on_focus_in(self, _event: tk.Event) -> None:
-        """窗口重新获得焦点时恢复动画；气泡仍在显示则保持暂停，避免蜗牛与气泡错位。"""
-        self._window_focused = True
-        # 气泡打开期间 snail_paused 同样为 True，这里不能无条件清零，
-        # 否则「点开气泡 → 切走窗口 → 切回来」会让蜗牛在气泡还挂着时重新爬动。
-        if self._bubble_canvas is None:
-            self.snail_paused = False
+    def _on_focus_in(self, event: tk.Event) -> None:
+        if not self._is_active() or not self._widget_exists(event.widget):
+            return
+        if event.widget.winfo_toplevel() == self.master.winfo_toplevel():
+            self._queue_focus_check()
 
-    def _on_window_shown(self, _event: tk.Event) -> None:
+    def _queue_focus_check(self) -> None:
+        if self._running and self._focus_after_id is None:
+            # 一次内部切焦会先 Out 再 In，等事件完成后统一查询实际焦点，避免暂停闪跳。
+            self._focus_after_id = self.master.after_idle(self._sync_window_focus)
+
+    def _sync_window_focus(self) -> None:
+        self._focus_after_id = None
+        if not self._is_active():
+            return
+        try:
+            focused = self.master.focus_get()
+            self._window_focused = (
+                focused is not None and focused.winfo_toplevel() == self.master.winfo_toplevel()
+            )
+        except (tk.TclError, KeyError):
+            self._window_focused = False  # 外部窗口或销毁中的焦点对象无法解析时视作失焦。
+        # 只有主窗口实际持焦且没有活动气泡时才恢复，切回窗口不能让气泡与蜗牛错位。
+        self.snail_paused = not self._window_focused or self._bubble_canvas is not None
+
+    def _on_window_shown(self, event: tk.Event) -> None:
         """窗口真正显示后补一次入口摆放：只有这时 winfo_width() 才是真实宽度。"""
+        if not self._is_active() or event.widget is not self.master:
+            return  # 子控件 Map 会沿顶层绑定传播，不能用它提前触发主窗口入场。
         self._window_shown = True
         # 已经入场过就不再摆：从最小化恢复同样会触发 <Map>，那时应保持蜗牛当前位置。
         if not self.snail_started:
@@ -250,6 +337,10 @@ class SnailManager:
 
     def _animate_snail(self) -> None:
         """让蜗牛从右向左爬行，遇到标题和左边界时传送。"""
+        self._cancel_after("snail_animation_id")
+        if not self._is_active():
+            self.stop()
+            return  # 销毁检查必须先于暂停心跳，已停止时不能再续期任何动画任务。
         # 暂停时只维持定时器心跳，不做位移，这样恢复时能立刻接着爬。
         if self.snail_paused:
             self.snail_animation_id = self.master.after(30, self._animate_snail)
@@ -262,10 +353,6 @@ class SnailManager:
         if not self._window_shown or self.master.winfo_width() <= 1:
             self.snail_animation_id = self.master.after(100, self._animate_snail)
             return
-        # 控件已被销毁（例如窗口关闭）时彻底停止循环，避免对已销毁对象调用方法报错。
-        if self.snail_label is None or not self.snail_label.winfo_exists():
-            return
-
         window_width, snail_width, text_left, text_right = self._snail_bounds()
         if not self.snail_started:
             # 首帧只负责摆好初始位置，不移动，避免出现"从左上角突然跳到右边"的闪烁。
@@ -290,9 +377,7 @@ class SnailManager:
         """销毁当前气泡 Canvas，并在需要时恢复蜗牛动画。"""
         # 必须先取消自动关闭定时器：否则气泡已被点掉后，3 秒到的回调仍会再执行一次，
         # 反复点击蜗牛就会累积多个待触发的定时器，导致"点了没反应"或动画抖动。
-        if self._bubble_after_id is not None:
-            self.master.after_cancel(self._bubble_after_id)
-            self._bubble_after_id = None
+        self._cancel_after("_bubble_after_id")
         if self._bubble_canvas is not None:
             # 控件可能已随窗口一起被销毁，此时 destroy 会抛 TclError，忽略即可。
             try:
@@ -303,7 +388,7 @@ class SnailManager:
         # 子视口随外层 Canvas 一起销毁，清掉引用，下一条消息从顶部开始阅读。
         self._bubble_view = None
         self._bubble_message = None
-        if restore_pause and self._window_focused:
+        if restore_pause and self._running and self._window_focused:
             # 气泡关闭后让蜗牛继续爬行；连点蜗牛时传 False 可保持暂停，避免动画闪跳。
             # 窗口已失焦时也不恢复：否则用户切走后气泡到点自动关闭，蜗牛又会在后台爬。
             self.snail_paused = False
@@ -312,7 +397,7 @@ class SnailManager:
         """在主窗口内创建一个跟随蜗牛的圆角气泡 Canvas。"""
         # 先清掉旧气泡，保证同时只存在一个气泡（restore_pause=False 避免中途恢复动画）。
         self._destroy_active_bubble(restore_pause=False)
-        if self.snail_label is None or not self.snail_label.winfo_exists():
+        if not self._is_active():
             return
 
         # Canvas 保持同一个实例，尺寸变化只改布局，避免闪烁及误重置自动关闭时间。
@@ -326,8 +411,9 @@ class SnailManager:
 
     def _restart_bubble_timeout(self) -> None:
         """新消息或主动滚动后重新计时，普通重排不调用此函数。"""
-        if self._bubble_after_id is not None:
-            self.master.after_cancel(self._bubble_after_id)
+        if not self._is_active() or self._bubble_canvas is None:
+            return  # stop 后即使收到延迟滚动，也不能重新登记关闭回调。
+        self._cancel_after("_bubble_after_id")
         # 滚动也算正在阅读，最后一次滚动后的3秒才关闭，不让长文读到一半消失。
         self._bubble_after_id = self.master.after(3000, self._destroy_active_bubble)
 
@@ -499,6 +585,8 @@ class SnailManager:
 
     def _snail_clicked(self, _event: tk.Event) -> None:
         """点击蜗牛时随机显示一条 JSON 消息气泡，并暂停蜗牛动画。"""
+        if not self._is_active():
+            return  # 已清理的旧点击回调不能再读取消息或创建新气泡。
         # 先暂停蜗牛，防止它继续移动导致气泡位置显得错乱。
         self.snail_paused = True
         message = DEFAULT_SNAIL_MESSAGE
@@ -520,6 +608,8 @@ class SnailManager:
 
     def _snail_right_clicked(self, _event: tk.Event) -> None:
         """彩蛋：右键蜗牛时随机传送到行进路线上，并弹出固定文案的气泡。"""
+        if not self._is_active():
+            return
         # 与左键一致，先暂停：否则蜗牛会在气泡展示期间继续爬走，气泡看起来像脱了钩。
         self.snail_paused = True
         self._teleport_snail()

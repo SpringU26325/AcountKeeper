@@ -5,14 +5,14 @@ chcp 65001 >nul
 :: 使用方式：在 PyCharm 终端里输入 .\build.bat 运行，或者直接双击本文件
 
 echo ==========================================
-echo   开始打包 AccountKeeper v0.1.4
+echo   开始打包 AccountKeeper v0.1.5
 echo ==========================================
 
 :: 用 python -m PyInstaller 替代直接调用 pyinstaller
 :: 这样可以确保使用的是当前 Python 环境下的打包工具
 python -m PyInstaller --noconfirm --onefile --windowed ^
   --icon="image/logo.ico" ^
-  --name="AccountKeeper_v0.1.4-alpha" ^
+  --name="AccountKeeper_v0.1.5-alpha" ^
   --add-data "image;image" ^
   --add-data "snail_messages.json;." ^
   --collect-all customtkinter ^
