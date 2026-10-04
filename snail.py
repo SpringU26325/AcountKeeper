@@ -158,8 +158,27 @@ class SnailManager:
             return
         self.snail_x = window_width
         self.snail_started = True
+        self._place_snail()
+
+    def _place_snail(self) -> None:
+        """全部定位统一使用物理像素，保持与 winfo_* 的测量结果一致。"""
         if self.snail_label is not None and self.snail_label.winfo_exists():
-            self.snail_label.place(x=self.snail_x, y=15, anchor="nw")
+            # 显式调用原生 Tk：CTk 只缩放图片尺寸，不对位置二次缩放或缓存旧定位。
+            tk.Place.place(self.snail_label, x=self.snail_x, y=15, anchor="nw")
+
+    def _snail_bounds(self) -> tuple[int, int, int, int]:
+        """取得窗口宽度、蜗牛宽度与标题左右边界，全部为物理像素。"""
+        window_width = self.master.winfo_width()
+        # 已布局时使用当前实际宽度，DPI 改变后的下一次路线计算会自动取到新尺寸。
+        snail_width = (
+            self.snail_label.winfo_width()
+            if self.snail_label is not None and self.snail_label.winfo_exists()
+            else 40
+        )
+        # root 坐标相减后得到窗口内坐标，拖动主窗不会改变标题避让口径。
+        text_left = self.title_block.winfo_rootx() - self.master.winfo_rootx()
+        text_right = text_left + self.title_block.winfo_width()
+        return window_width, snail_width, text_left, text_right
 
     def _prepare_snail_image(self) -> Image.Image:
         """读取已清理的透明素材，保留源图像素与抗锯齿 alpha。"""
@@ -197,19 +216,13 @@ class SnailManager:
         if self.snail_label is None or not self.snail_label.winfo_exists():
             return
 
-        window_width = self.master.winfo_width()
-        snail_width = self.snail_label.winfo_width()
+        window_width, snail_width, text_left, text_right = self._snail_bounds()
         if not self.snail_started:
             # 首帧只负责摆好初始位置，不移动，避免出现"从左上角突然跳到右边"的闪烁。
             # 兜底：正常启动时 <Map> 事件已经摆好，这里只在事件没赶上（例如绑定前窗口就已显示）时生效。
             self._enter_from_right(window_width)
             self.snail_animation_id = self.master.after(30, self._animate_snail)
             return
-        # 用屏幕绝对坐标相减换算成主窗口内的相对坐标，
-        # 这样即使窗口被拖动或移动位置，标题的判定区间依然正确。
-        text_left = self.title_block.winfo_rootx() - self.master.winfo_rootx()
-        text_right = text_left + self.title_block.winfo_width()
-
         # 每次左移 2 像素，配合 30ms 的定时器形成匀速爬行动画。
         self.snail_x -= 2
         # 当蜗牛身体与标题文字产生重叠时，直接"传送"到标题左侧，模拟从标题后面钻过去。
@@ -219,8 +232,8 @@ class SnailManager:
         if self.snail_x < 0:
             self.snail_x = window_width
 
-        # 只改 x 坐标，避免每帧重建控件；y 始终固定在窗口顶部。
-        self.snail_label.place_configure(x=self.snail_x, y=15)
+        # 通过同一物理坐标入口移动，不重建控件；y 固定为顶部15物理像素。
+        self._place_snail()
         self.snail_animation_id = self.master.after(30, self._animate_snail)
 
     def _destroy_active_bubble(self, restore_pause: bool = True) -> None:
@@ -403,16 +416,8 @@ class SnailManager:
 
     def _snail_route_segments(self) -> list[tuple[int, int]]:
         """给出行进路线上可停留的横向区间（已挖掉与标题文字重叠的那一段）。"""
-        window_width = self.master.winfo_width()
-        # 拿不到控件宽度时按 40 估算（与实际图片尺寸一致），避免算出负数区间。
-        snail_width = (
-            self.snail_label.winfo_width()
-            if self.snail_label is not None and self.snail_label.winfo_exists()
-            else 40
-        )
-        # 与 _animate_snail 用同一套相对坐标：屏幕坐标相减换算到主窗口内。
-        text_left = self.title_block.winfo_rootx() - self.master.winfo_rootx()
-        text_right = text_left + self.title_block.winfo_width()
+        # 与动画共用边界，避免 DPI 改变时两处采用不同的蜗牛尺寸或标题坐标。
+        window_width, snail_width, text_left, text_right = self._snail_bounds()
         # 右端要留出一个蜗牛身位，保证传送后整只蜗牛都在窗口内可见。
         right_limit = max(0, window_width - snail_width)
         segments: list[tuple[int, int]] = []
@@ -444,8 +449,8 @@ class SnailManager:
         self.snail_x = random.randint(start, end)
         # 标记为已入场：否则 _animate_snail 的首帧会按"从右侧爬进来"重置坐标，传送就白做了。
         self.snail_started = True
-        # 只改 x，y 与动画保持一致固定在窗口顶部。
-        self.snail_label.place_configure(x=self.snail_x, y=15)
-        # 强制刷新一次几何信息：place_configure 不会立刻更新 winfo_x()，
+        # 彩蛋也走同一定位入口，传送后的下一帧不会因 CTk 缓存跳回入场位置。
+        self._place_snail()
+        # 强制刷新一次几何信息：place 不会立刻更新 winfo_x()，
         # 不刷新的话紧接着创建的气泡仍会按蜗牛传送前的位置去定位。
         self.master.update_idletasks()
