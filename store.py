@@ -1,12 +1,13 @@
 """SQLite persistence for AccountKeeper."""
 
 import csv
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import shutil
 import sqlite3
+from time import monotonic
 from typing import Iterable, Iterator
 
 from config import CSV_FIELDS, DB_PATH
@@ -89,6 +90,46 @@ class AccountStore:
         finally:
             # 无论成功或失败都必须关闭连接，否则会累积文件句柄。
             connection.close()
+
+    def snapshot_database(self, destination: Path) -> Path:
+        """生成经过完整性检查的独立数据库快照，不修改源库。"""
+        source_path = self.path.resolve()
+        destination = Path(destination).resolve()
+        if destination == source_path:
+            raise ValueError("快照目标不能是源数据库。")
+        created = False
+        completed = False
+        try:
+            # mode=ro 拒绝源库缺失，不能沿用会创建空库的 _connect。
+            # timeout=0 让锁等待交给 backup 的进度回调，避免先被默认五秒拖住。
+            with closing(sqlite3.connect(
+                source_path.as_uri() + "?mode=ro", uri=True, timeout=0
+            )) as source:
+                # 独占创建只允许新目标，也能拒绝现有文件及指向源库的硬链接。
+                with destination.open("xb"):
+                    pass
+                created = True
+                with closing(sqlite3.connect(destination)) as target:
+                    deadline = monotonic() + 3.0
+
+                    def check_deadline(_status: int, _remaining: int, _total: int) -> None:
+                        # 单调时钟不受系统校时影响；忙重试也会回调，不能无限卡住界面。
+                        if monotonic() >= deadline:
+                            raise TimeoutError("数据库正忙，请稍后重试")
+
+                    source.backup(
+                        target, pages=256, progress=check_deadline, sleep=0.05
+                    )
+                    # backup 已完成目标事务；检查副本而非源库，避免对真实账本做测试写入。
+                    if target.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+                        raise sqlite3.DatabaseError("数据库快照完整性检查失败。")
+                completed = True
+            return destination
+        finally:
+            if created and not completed:
+                # 两个 closing 都已退出后才删失败产物，Windows 不能删除仍被连接占用的库。
+                for suffix in ("", "-journal", "-wal", "-shm"):
+                    Path(str(destination) + suffix).unlink(missing_ok=True)
 
     def _initialize_database(self) -> None:
         with self._connect() as connection:

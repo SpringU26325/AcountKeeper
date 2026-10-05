@@ -5,21 +5,25 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import os
+import sqlite3
 import subprocess
 import sys
 import tkinter as tk
+import zipfile
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+from backup import create_backup
 import tag_prefs
 import calendar_picker
 import dialogs
 import settings
 from chart_window import show_chart_window
 from config import DATA_DIR, DEFAULT_EXPORT_DIR
-from dialog_lifecycle import _cancel_owned_tasks
+from dialog_lifecycle import ManagedToplevel, _cancel_owned_tasks
+from dialogs import center_dialog_on_parent
 from snail import SnailManager
 from store import Account, AccountStore
 from tag_aggregation import MULTI_TAG_TOTALS_NOTE, aggregate_records_by_tag
@@ -40,6 +44,7 @@ class AccountKeeperApp(ctk.CTk):
         self._calendar_building = 0
         self._calendar_closing = False
         self._calendar_destroyed = False
+        self._backup_running = False  # 模态对话框会处理事件，禁止嵌套触发同一次备份。
         # store 由外部注入，方便测试时替换成临时数据库，避免测试污染真实账本。
         self.store = store
         # last_export_dir 由启动流程注入，带默认值保证单独构造窗口时仍可用：
@@ -168,8 +173,10 @@ class AccountKeeperApp(ctk.CTk):
             filter_callback=self.filter_records,
             refresh_callback=self.refresh_records,
             delete_callback=self.delete_record,
+            edit_callback=self.edit_selected_record,
             stats_callback=self.show_stats,
             export_callback=self.export_csv,
+            backup_callback=self.backup_data,
             # 图表依赖 matplotlib，用 lambda 延迟到实际点击时才导入，加快启动速度。
             chart_callback=lambda: show_chart_window(self),
             open_folder_callback=self.open_data_folder,
@@ -181,6 +188,9 @@ class AccountKeeperApp(ctk.CTk):
         self.table_frame = RecordTableFrame(self, self.edit_record)
         self.table_frame.pack(fill="both", expand=True, padx=24, pady=(0, 0))
         self.tree = self.table_frame.tree
+        # 单选、取消选择及重建列表都同步按钮，避免操作上一轮筛选留下的记录。
+        self.tree.bind("<<TreeviewSelect>>", self._sync_record_actions, add="+")
+        self._sync_record_actions()
 
     def refresh_records(self) -> None:
         # 刷新按钮与新增/删除/编辑后的刷新都收敛到这一处，避免多份重复的渲染逻辑。
@@ -221,13 +231,12 @@ class AccountKeeperApp(ctk.CTk):
             )
             if keyword and not matches:
                 continue
-            # iid 直接用 record_id，这样双击/删除时能由选中项反推出数据库主键。
+            # ID 不再显示为列，但 iid 仍保存主键，编辑/删除继续按同一个标识定位。
             self.tree.insert(
                 "",
                 "end",
                 iid=str(record.record_id),
                 values=(
-                    record.record_id,
                     record.record_date,
                     f"{record.amount:.2f}",
                     # #58 Step 2c-2：多标签用预定义分隔符「、」连接成一个单元格字符串
@@ -240,6 +249,24 @@ class AccountKeeperApp(ctk.CTk):
                     record.note,
                 ),
             )
+
+        self._sync_record_actions()
+
+    def _selected_record_id(self) -> int | None:
+        selected = self.tree.selection()
+        if not selected or not self.tree.exists(selected[0]):
+            return None
+        try:
+            return int(selected[0])
+        except ValueError:
+            return None  # 只接受记录主键，异常行标识不能进入编辑/删除业务。
+
+    def _sync_record_actions(self, _event: tk.Event | None = None) -> None:
+        if self._calendar_closing:
+            return  # 销毁时仍可能投递选择事件，不能再配置已销毁的按钮。
+        record_id = self._selected_record_id()
+        self.toolbar.set_record_actions_enabled(record_id is not None)
+        self.table_frame.set_selected_record(record_id)
 
     def add_record(self) -> None:
         try:
@@ -310,13 +337,11 @@ class AccountKeeperApp(ctk.CTk):
         self.refresh_records()
 
     def delete_record(self) -> None:
-        selected = self.tree.selection()
+        record_id = self._selected_record_id()
         # 没有任何选中行时给出提示而不是静默忽略，避免用户以为按钮失效。
-        if not selected:
+        if record_id is None:
             messagebox.showinfo("删除记录", "请先选择一条记录。")
             return
-        # iid 就是 record_id（见 filter_records），因此可直接转成主键。
-        record_id = int(selected[0])
         # 删除属于不可逆操作，必须先弹自定义确认框。
         if not dialogs.confirm_delete(self):
             return
@@ -325,6 +350,14 @@ class AccountKeeperApp(ctk.CTk):
             messagebox.showinfo("删除记录", "找不到该记录")
             return
         self.refresh_records()
+
+    def edit_selected_record(self) -> None:
+        """常驻按钮按当前选中主键打开同一编辑流程。"""
+        record_id = self._selected_record_id()
+        if record_id is None:
+            messagebox.showinfo("编辑记录", "请先选择一条记录。")
+            return
+        self._edit_record_by_id(record_id)
 
     def edit_record(self, event: tk.Event) -> None:
         """双击记录行时打开编辑窗口。"""
@@ -335,13 +368,18 @@ class AccountKeeperApp(ctk.CTk):
         try:
             record_id = int(item_id)
         except ValueError:
-            return
+            return  # 表头/空白及非记录行不应打开编辑窗。
+        self._edit_record_by_id(record_id)
+
+    def _edit_record_by_id(self, record_id: int) -> None:
+        """按钮和双击共用预填、取消与保存流程，防止业务口径分叉。"""
         # 从内存缓存里找到对应的完整记录，用于给编辑框预填当前值。
         record = next(
             (item for item in self.store.records if item.record_id == record_id),
             None,
         )
         if record is None:
+            messagebox.showerror("编辑失败", "找不到该记录。")
             return
 
         # 用户取消编辑时返回 None，此时保持原样不做任何改动。
@@ -356,6 +394,88 @@ class AccountKeeperApp(ctk.CTk):
             messagebox.showerror("编辑失败", "找不到该记录或记录更新失败。")
             return
         self.refresh_records()
+
+    def _confirm_backup_overwrite(self, save_path: Path) -> bool:
+        # 与删除确认共用受管理的 CTkToplevel 生命周期；原生 messagebox 不适合危险操作。
+        dialog = ManagedToplevel(self)
+        dialog.attributes("-alpha", 0.0)  # 先透明布局，复用删除/编辑的一次居中后显现流程。
+        dialog.title("确认覆盖备份")
+        dialog.geometry("460x240")
+        tk.Wm.resizable(dialog, False, False)  # 不再安排 CTk 标题栏重绘，避免定位后又重入布局。
+        dialog.transient(self)
+        dialog.configure(fg_color="#F0F4F8")
+        try:
+            dialog.iconbitmap(self.iconbitmap())
+        except tk.TclError:
+            pass  # 图标是装饰，失败不能阻断覆盖确认。
+        result = [False]
+        content = ctk.CTkFrame(dialog, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=24, pady=20)
+        ctk.CTkLabel(
+            content, text=f"目标文件已存在，确认覆盖吗？\n{save_path.name}",
+            wraplength=400, font=("Microsoft YaHei UI", 12), text_color="#243447",
+        ).pack(fill="x", expand=True, pady=(0, 16))
+        buttons = ctk.CTkFrame(content, fg_color="transparent")
+        buttons.pack(fill="x")
+        buttons.grid_columnconfigure((0, 1), weight=1)
+
+        def finish(confirmed: bool) -> None:
+            if dialog.closing:
+                return  # 已收到父窗/标题栏关闭请求时，迟到的回车不能再确认覆盖。
+            result[0] = confirmed
+            dialog.destroy()
+
+        for column, text, confirmed, color, hover in (
+            (0, "取消", False, "#90A4AE", "#78909C"),
+            (1, "确认覆盖", True, "#E76F51", "#C9573D"),
+        ):
+            ctk.CTkButton(
+                buttons, text=text, command=lambda value=confirmed: finish(value),
+                width=120, height=34, corner_radius=9, fg_color=color,
+                hover_color=hover, font=("Microsoft YaHei UI", 11),
+            ).grid(row=0, column=column, sticky="ew", padx=(0, 6) if column == 0 else (6, 0))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+        dialog.bind("<Escape>", lambda _event: finish(False))
+        dialog.bind("<Return>", lambda _event: finish(True))
+        dialog.finish_setup()
+        if dialog.closing or not center_dialog_on_parent(self, dialog):
+            return False
+        # grab 和 wait_window 沿用删除确认语义，关闭/取消保持 False，只有确认才允许覆盖。
+        dialog.grab_set()
+        self.wait_window(dialog)
+        return result[0]
+
+    def backup_data(self) -> None:
+        if self._backup_running or self._calendar_closing:
+            return
+        self._backup_running = True
+        try:
+            chosen = filedialog.asksaveasfilename(
+                parent=self, defaultextension=".zip",
+                initialfile=f"AccountKeeper_backup_{datetime.now().date().isoformat()}.zip",
+                initialdir=str(self.last_export_dir), filetypes=[("ZIP 文件", "*.zip")],
+                confirmoverwrite=False,  # 关闭系统覆盖询问，危险操作只走项目 CTk 确认框。
+            )
+            if not chosen or self._calendar_closing:
+                return
+            save_path = Path(chosen).expanduser().resolve()
+            if save_path.exists() and not self._confirm_backup_overwrite(save_path):
+                return
+            if self._calendar_closing:
+                return  # 模态确认期间主窗可能已退出，不能继续备份或写配置。
+            exported = create_backup(self.store, save_path)
+            # 只有完整 ZIP 发布成功才记路径；配置失败保留备份成功结果，只打印已有警告。
+            if settings.save_settings(exported.parent):
+                self.last_export_dir = exported.parent
+            messagebox.showinfo("备份成功", f"备份已保存到：\n{exported}")
+        except TimeoutError:
+            if not self._calendar_closing:
+                messagebox.showerror("备份失败", "数据库正忙，请稍后重试")
+        except (OSError, sqlite3.Error, zipfile.BadZipFile, ValueError, tk.TclError) as error:
+            if not self._calendar_closing:
+                messagebox.showerror("备份失败", f"无法备份数据：{error}")
+        finally:
+            self._backup_running = False  # 成功、取消、异常都归还入口，允许下一次重试。
 
     def export_csv(self) -> None:
         # 月份由月历弹窗点选（issues #3.2，不再手输），用户取消时返回 None。

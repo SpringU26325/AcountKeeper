@@ -27,6 +27,37 @@ _CHIP_GAP_X = 6  # 同一行里 chip 之间的水平间距
 _CHIP_GAP_Y = 4  # 换行后上下两行 chip 之间的垂直间距
 
 
+def _entry_surface(
+    master: ctk.CTkBaseClass,
+    textvariable: tk.StringVar | None = None,
+    placeholder_text: str | None = None,
+) -> tuple[ctk.CTkFrame, ctk.CTkEntry]:
+    """日期、金额、标签及备注共用的输入外框。"""
+    # 外框统一描边；内部输入框和附加按钮不再各画一圈边框，避免控件割裂。
+    surface = ctk.CTkFrame(master, height=40, corner_radius=8, border_width=1,
+                           border_color="#D8E1EA", fg_color="#F8FAFC")
+    surface.columnconfigure(0, weight=1)
+    entry = ctk.CTkEntry(
+        surface, width=1, height=38, corner_radius=0, border_width=0,
+        fg_color="#F8FAFC", text_color="#243447", font=("Microsoft YaHei UI", 12),
+        textvariable=textvariable, placeholder_text=placeholder_text,
+    )
+    # 最小请求宽度不占满网格；内边距避开外框圆角，伸缩空间交给字段外框。
+    entry.grid(row=0, column=0, sticky="ew", padx=(9, 6), pady=1)
+    return surface, entry
+
+
+def _field_column(master: ctk.CTkFrame, title: str) -> ctk.CTkFrame:
+    """字段标题统一放在输入框上方。"""
+    # 共用标题行高和间距，让日期、金额、类型、标签与备注的输入基线一致。
+    field = ctk.CTkFrame(master, fg_color="transparent", corner_radius=0)
+    field.columnconfigure(0, weight=1)
+    ctk.CTkLabel(field, text=title, height=20, anchor="w",
+                 font=("Microsoft YaHei UI", 11), text_color="#64748B").grid(
+        row=0, column=0, sticky="ew", pady=(0, 6))
+    return field
+
+
 class TagChipsFrame(ctk.CTkFrame):
     """标签 chips、输入框与多选入口组成的可复用控件。"""
 
@@ -34,10 +65,10 @@ class TagChipsFrame(ctk.CTkFrame):
         self,
         master: ctk.CTkBaseClass,
         on_layout_change: Callable[[], None] | None = None,
+        *,
+        placeholder_text: str | None = None,
     ) -> None:
         super().__init__(master, fg_color="transparent", corner_radius=0)
-        font_regular = ("Microsoft YaHei UI", 12)
-        self.tag_input_var = tk.StringVar()
         self._tags: list[str] = []
         self._tag_buttons: dict[str, ctk.CTkButton] = {}
         self._chips_width = -1
@@ -46,42 +77,44 @@ class TagChipsFrame(ctk.CTkFrame):
         self._on_layout_change = on_layout_change
         self.columnconfigure(0, weight=1)
 
-        self.tag_entry = ctk.CTkEntry(
-            self,
-            height=36,
-            font=font_regular,
-            corner_radius=9,
-            border_width=1,
-            border_color="#C6D4DF",
-            fg_color="#F8FAFC",
-            textvariable=self.tag_input_var,
-        )
-        self.tag_entry.grid(row=0, column=0, sticky="ew")
+        # 原生占位符不能绑定 textvariable；直接读控件，避免把提示文字当成标签。
+        self.input_surface, self.tag_entry = _entry_surface(
+            self, placeholder_text=placeholder_text)
+        self.input_surface.grid(row=0, column=0, sticky="ew")
         self.tag_entry.bind("<Return>", lambda _event: self._commit_tag_input())
 
         self.tag_button = ctk.CTkButton(
-            self,
+            self.input_surface,
             text="▼",
             command=self._pick_tags,
-            width=36,
-            height=36,
-            corner_radius=9,
-            fg_color="#E3EAF2",
+            width=32,
+            height=38,
+            corner_radius=7,
+            fg_color="#F8FAFC",
             hover_color="#D2DEE9",
             text_color="#243447",
             font=("Microsoft YaHei UI", 11),
         )
-        self.tag_button.grid(row=0, column=1, padx=(6, 0), sticky="e")
+        self.tag_button.grid(row=0, column=1, padx=(0, 1), pady=1, sticky="e")
 
-        self.chips_frame = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
-        self.chips_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        # 半行宽字段更容易换行；视口最多三行，余下滚动，防止挤掉备注和表格。
+        self.chips_view = ctk.CTkScrollableFrame(self, width=0, height=28, corner_radius=0,
+                                               fg_color="transparent")
+        # CTk 内部滚动条默认申请 200px 高；取消该最小请求，才能让一行标签只占一行。
+        self.chips_view._scrollbar.configure(height=0)
+        self.chips_view._scrollbar.grid_remove()
+        self.chips_view.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.chips_frame = ctk.CTkFrame(self.chips_view, fg_color="transparent", corner_radius=0)
+        self.chips_view.columnconfigure(0, weight=1)
+        self.chips_frame.grid(row=0, column=0, sticky="ew")
         self.chips_frame.grid_remove()
+        self.chips_view.grid_remove()
         self.chips_frame.bind("<Configure>", self._on_chips_configure)
 
     def _commit_tag_input(self) -> None:
         """把输入框里的文字冲刷成 chip，并清空输入框。"""
-        self._add_tags(split_tag_input(self.tag_input_var.get()))
-        self.tag_input_var.set("")
+        self._add_tags(split_tag_input(self.tag_entry.get()))
+        self.tag_entry.delete(0, "end")
 
     def _add_tag(self, name: str) -> bool:
         """加一颗 chip；名字为空或已存在时什么都不做。"""
@@ -98,6 +131,8 @@ class TagChipsFrame(ctk.CTkFrame):
                 self.chips_frame,
                 text=f"{tag} ×",
                 command=lambda target=tag: self._remove_tag(target),
+                # 按文字请求宽度排布，短标签不再占默认 140px，避免无意义换行。
+                width=0,
                 height=_CHIP_HEIGHT,
                 corner_radius=_CHIP_CORNER_RADIUS,
                 fg_color="#E3EAF2",
@@ -124,6 +159,7 @@ class TagChipsFrame(ctk.CTkFrame):
 
     def _schedule_relayout(self) -> None:
         """等新 chip 完成几何测量后再重排，避免按未测量的 1px 宽度换行。"""
+        self.chips_view.grid()
         self.chips_frame.grid()
         self.after_idle(self._relayout_tags)
 
@@ -137,6 +173,7 @@ class TagChipsFrame(ctk.CTkFrame):
     def _relayout_tags(self) -> None:
         """按当前宽度流式换行；仅行数变化时通知外层调整高度。"""
         if not self._tag_buttons:
+            self.chips_view.grid_remove()
             self.chips_frame.grid_remove()
             rows = 0
         else:
@@ -164,7 +201,14 @@ class TagChipsFrame(ctk.CTkFrame):
                 column += 1
             rows = row + 1
 
+        # 仅超出三行视口才显示滚动条，常见一两个标签不必占用滚动条的宽度。
+        if rows > 3:
+            self.chips_view._scrollbar.grid()
+        else:
+            self.chips_view._scrollbar.grid_remove()
+
         if rows != self._layout_rows:
+            self.chips_view.configure(height=min(rows, 3) * (_CHIP_HEIGHT + _CHIP_GAP_Y))
             self._layout_rows = rows
             if self._on_layout_change is not None:
                 self._on_layout_change()
@@ -192,7 +236,7 @@ class TagChipsFrame(ctk.CTkFrame):
             button.destroy()
         self._tag_buttons.clear()
         self._tags.clear()
-        self.tag_input_var.set("")
+        self.tag_entry.delete(0, "end")
         self._relayout_tags()
 
     def set_tags(self, tags: tuple[str, ...]) -> None:
@@ -206,464 +250,189 @@ class TagChipsFrame(ctk.CTkFrame):
         picked = globals()["ask_tags"](
             self.winfo_toplevel(),
             self.tag_entry,
-            self.tag_input_var.get(),
+            self.tag_entry.get(),
             toggle_button=self.tag_button,
             selected_tags=self.get_tags(),
         )
         if picked is None:
             return
-        typed = split_tag_input(self.tag_input_var.get())
+        typed = split_tag_input(self.tag_entry.get())
         final = tuple(dict.fromkeys((*picked, *typed)))
         self.clear_tags()
         self._add_tags(final)
 
 
 class InputFrame(ctk.CTkFrame):
-    """Input controls for adding a record."""
+    """双行录入卡片，收支符号仍交给逻辑层处理。"""
 
-    def __init__(
-        self,
-        master: ctk.CTk,
-        add_callback: Callable[[], None],
-    ) -> None:
-        super().__init__(
-            master,
-            corner_radius=14,
-            fg_color="#FFFFFF",
-            border_width=1,
-            border_color="#D8E1EA",
-        )
-        font_regular = ("Microsoft YaHei UI", 12)
-        font_small = ("Microsoft YaHei UI", 11)
-        # 日期默认填今天，减少用户手动输入的次数。
+    def __init__(self, master: ctk.CTk, add_callback: Callable[[], None]) -> None:
+        super().__init__(master, corner_radius=14, fg_color="#FFFFFF",
+                         border_width=1, border_color="#D8E1EA")
         self.date_var = tk.StringVar(value=date.today().isoformat())
-        # 默认选中「支出」，因为日常记账中支出占绝大多数。
         self.amount_type_var = tk.StringVar(value="支出")
         self.note_var = tk.StringVar()
-
-        # ---------- 卡片内的整体结构（需求 3.2） ----------
-        # 第 0 行 = 标题行（标题 + 支出/收入切换 + 添加按钮），用 title_frame 承载；
-        # 第 1 行 = 字段区（两行字段），用 master_frame 承载。
-        # 两个容器都 grid 到 self 的第 0 列并 sticky="ew"，宽度因此完全相同，
-        # 于是标题行最右侧的「添加」按钮与字段区最右侧的「备注框」右边缘严格对齐。
-        # 【为什么要分成两层容器】标题文字的宽度和字段标签的宽度差得远（约 52px vs 22px），
-        # 若把标题行塞进字段网格的第 0 列，网格会按最宽的那一项撑开该列，
-        # 反而在「日期」标签和日期框之间凭空多出一段空隙。
-        # 外面这一列必须是 weight=1，两个容器才能撑满卡片宽度。
         self.columnconfigure(0, weight=1)
+        # 紧凑标题与上下留白给最小窗口保留记录行，不靠缩小输入框来腾空间。
+        ctk.CTkLabel(self, text="记一笔", height=20, font=("Microsoft YaHei UI", 13, "bold"),
+                     text_color="#243447", anchor="w").grid(
+            row=0, column=0, sticky="ew", padx=16, pady=(8, 6))
 
-        # ---------- 标题行（需求 3.2）：标题 ⋯ | 支出/收入切换 | 添加 ----------
-        # 列结构：0=标题（宽度由文字决定）｜1=弹性空白｜2=切换按钮｜3=添加按钮
-        # 第 1 列是唯一的弹性列：它吃掉全部剩余宽度，把右侧的「切换 + 添加」整体顶到
-        # 卡片最右端并保持成组。窗口拉宽时，多出来的宽度只落在标题与按钮组之间，
-        # 按钮组始终贴着右内边距，两者间距恒定 12px。
-        title_frame = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
-        title_frame.grid(row=0, column=0, padx=0, pady=(12, 8), sticky="ew")
-        title_frame.columnconfigure(0, weight=0)
-        title_frame.columnconfigure(1, weight=1)
-        title_frame.columnconfigure(2, weight=0)
-        title_frame.columnconfigure(3, weight=0)
+        # 第一行让日期、金额分配弹性空间，收支与添加保持固定尺寸和输入框基线。
+        first_row = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
+        first_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
+        first_row.columnconfigure((0, 1), weight=1, uniform="primary_field")
+        date_field = _field_column(first_row, "日期")
+        date_field.grid(row=0, column=0, sticky="new", padx=(0, 12))
+        self.date_surface, self.date_entry = _entry_surface(date_field, self.date_var)
+        self.date_surface.grid(row=1, column=0, sticky="ew")
+        self.date_button = ctk.CTkButton(
+            self.date_surface, text="▼", command=self._pick_date, width=32, height=38,
+            corner_radius=7, fg_color="#F8FAFC", hover_color="#D2DEE9",
+            text_color="#243447", font=("Microsoft YaHei UI", 11))
+        self.date_button.grid(row=0, column=1, padx=(0, 1), pady=1, sticky="e")
 
-        ctk.CTkLabel(
-            title_frame,
-            text="添加记录",
-            font=("Microsoft YaHei UI", 13, "bold"),
-            text_color="#243447",
-        ).grid(row=0, column=0, padx=(16, 0), pady=0, sticky="w")
-
-        # 支出/收入切换按钮（需求 3.2）：只决定金额的正负号，不直接改写输入框里的数字。
-        # 它从金额框旁边挪到标题行后，与「添加」一起构成右侧紧凑操作区。
-        # width=120 必须配合 dynamic_resizing=False 才会生效：
-        # CTkSegmentedButton 内部的每个分段按钮都是以 width=0 创建的，
-        # 默认（dynamic_resizing=True）会让外层容器自动收缩到「文字宽度」，
-        # 无论把 width 写成多少，实测都恒为 74px 左右；
-        # 关掉自动收缩后，width=120 才会被完整尊重。
-        # 视觉层级：改用浅灰底 + 浅蓝选中态 + 深色文字，并关掉默认 3px 灰边框
-        # （border_width=0）与 theme 灰底（fg_color="transparent"），
-        # 让它读起来是「状态指示」而非另一套重组件；「添加」才是主操作。
+        amount_field = _field_column(first_row, "金额")
+        amount_field.grid(row=0, column=1, sticky="new", padx=(0, 12))
+        # 金额不用 textvariable，保留占位提示；“元”只是单位，不参与正负号转换。
+        self.amount_surface, self.amount_entry = _entry_surface(
+            amount_field, placeholder_text="请输入金额")
+        self.amount_surface.grid(row=1, column=0, sticky="ew")
+        ctk.CTkLabel(self.amount_surface, text="元", width=28, height=38,
+                     font=("Microsoft YaHei UI", 11), text_color="#64748B").grid(
+            row=0, column=1, padx=(0, 3), pady=1)
+        type_field = _field_column(first_row, "收支类型")
+        type_field.grid(row=0, column=2, sticky="n", padx=(0, 12))
         self.amount_type_button = ctk.CTkSegmentedButton(
-            title_frame,
-            values=["支出", "收入"],
-            variable=self.amount_type_var,
-            # 候选在用户点标签区 ▼ 时由 tag_picker 现算；收支切换不影响共享标签池。
-            # amount_type_var 由 CTkSegmentedButton 自己维护：用户点击走的是内部
-            # set(value, from_button_callback=True)，那里会写回 self._variable。
-            width=120,
-            height=36,
-            dynamic_resizing=False,
-            corner_radius=9,
-            border_width=0,
-            # 用与卡片一致的白色填充外框角落，避免 theme 默认灰底形成一圈「重外框」，
-            # 同时比 "transparent" 更稳：分段按钮的 background_corner_colors 需要真实色值。
-            fg_color="#FFFFFF",
-            font=font_small,
-            selected_color="#CFE0F8",
-            selected_hover_color="#BFD6F5",
-            # 浅色主题下必须显式指定未选中态的底色与文字色，否则「收入」二字会看不见。
-            unselected_color="#F0F3F7",
-            unselected_hover_color="#E2E8F0",
-            text_color="#243447",
-        )
-        # sticky="e"：按钮贴着自己那一列的右边缘，靠弹性列把它整体推到卡片右侧。
-        # 右 padx=12 是「切换」与「添加」之间的间距（见下），两者成组。
-        self.amount_type_button.grid(
-            row=0, column=2, padx=(0, 12), pady=0, sticky="e"
-        )
+            type_field, values=["支出", "收入"], variable=self.amount_type_var,
+            width=120, height=40, dynamic_resizing=False, corner_radius=8,
+            border_width=0, fg_color="#FFFFFF", font=("Microsoft YaHei UI", 11),
+            selected_color="#CFE0F8", selected_hover_color="#BFD6F5",
+            unselected_color="#F0F3F7", unselected_hover_color="#E2E8F0",
+            text_color="#243447")
+        self.amount_type_button.grid(row=1, column=0)
+        self.add_button = ctk.CTkButton(
+            first_row, text="添加记录", command=add_callback, width=104, height=40,
+            corner_radius=8, fg_color="#2F80ED", hover_color="#256BC7",
+            font=("Microsoft YaHei UI", 11))
+        self.add_button.grid(row=0, column=3, sticky="se")
 
-        # 添加按钮：标题已经占了「添加记录」四个字，按钮用「添加」即可。
-        # width=96、height=36、corner_radius=9、font 11 —— 与切换按钮同一套尺寸基线，
-        # 保证右侧两枚控件等高、同圆角、同字号，垂直居中对齐。
-        # 右 padx=16 是卡片内边距，与字段区（master_frame 的右 padx）保持一致，
-        # 所以按钮右边缘与备注框右边缘落在同一条竖线上。
-        # command=add_callback 与原来完全一致。
-        ctk.CTkButton(
-            title_frame,
-            text="添加",
-            command=add_callback,
-            width=96,
-            height=36,
-            corner_radius=9,
-            fg_color="#2F80ED",
-            hover_color="#256AC4",
-            font=font_small,
-        ).grid(row=0, column=3, padx=(0, 16), pady=0, sticky="e")
-
-        # ---------- 字段区：按比例自适应的三行布局（需求 3.2；第三行为 #58 Step 3a 新增）----------
-        # 【三条设计意图】
-        #   1. 输入框按比例自适应：日期框、金额框、标签框、备注框都不写死 width，
-        #      而是靠 grid 的列权重（weight）分配宽度。窗口拉宽时一起变宽、拉窄时
-        #      一起变窄，任何宽度下都填满可用空间，卡片右侧不会留下大片空白。
-        #   2. 只有图标型控件固定宽度：▼ 按钮 36px（日期、标签各一个）。它只有一个
-        #      字符，跟着伸缩只会变形或拉得很空洞。（支出/收入切换按钮与添加按钮已挪到标题行。）
-        #   3. 三行共用同一套列网格：第 0 行（日期 | 金额）分占第 1 / 第 3 列，
-        #      标签区与备注跨满第 1~3 列，所以各行的左右边缘天然落在同一批竖线上。
-        # 【为什么中间要有一层 master_frame】多行共用的列必须落在同一个容器里才可能
-        #   对齐；master_frame 用 sticky="ew" 撑满 InputFrame，成为各行共享的列网格。
-        # 【权重分配】第 1 列 : 第 3 列 = 15 : 25，对应「日期约占 15%、金额约占 25%」。
-        #   注意权重分配的是「固定部分（两个标签列、一个 ▼ 按钮）之外剩余的空间」，
-        #   所以窗口越宽，各输入框的实际占比会比 15/25 略有放大；但两者的比例关系
-        #   始终保持不变，这正是「按比例自适应」的预期行为。
-        #   跨列的行（标签、备注）不受权重影响：权重只决定各行内部「列与列」怎么分宽度。
-        # 【窄窗口下的安全性】窗口最小尺寸是 820x560（见 ui.py），卡片内部至少 772px，
-        #   而本布局各控件的自然宽度合计远小于此，始终留有余量，所以任何被允许的
-        #   窗口宽度下字段都完整可见、不会重叠，也不会被压缩到看不全。
-        # 【列结构】
-        #   第 0 列 = 标签（日期 / 标签 / 备注）—— 权重 0，宽度只由文字决定
-        #   第 1 列 = 日期框组（日期框 + ▼）—— weight=15，按比例伸缩
-        #   第 2 列 = 标签（金额）—— 权重 0，宽度只由文字决定
-        #   第 3 列 = 金额框 —— weight=25，按比例伸缩
-        # 行与行之间留 10px 垂直间距：上行下边距 5px + 下行上边距 5px。
-        # 【卡片高度不用手工算】Tk 的几何传播是默认开启的（全仓唯一的 pack_propagate(False)
-        #   在 ui.py 的 header 上），master_frame 会按各行子控件的需求高度自动长高，
-        #   chips 换成两行卡片就自动多出一行的高度；这里刻意不维护任何「卡片高度常量」，
-        #   以免它与实际布局对不上。
-        master_frame = ctk.CTkFrame(
-            self,
-            fg_color="transparent",
-            corner_radius=0,
-        )
-        # 右 padx=16：添加按钮已搬到标题行，字段区不再有「按钮列」来提供这圈内边距，
-        # 所以改由 master_frame 自己留白；否则备注框、金额框会顶死在卡片右边框上。
-        # 留 16px 后，字段区右边缘与标题行添加按钮的右边缘严格对齐。
-        master_frame.grid(row=1, column=0, padx=(0, 16), pady=(0, 14), sticky="ew")
-        # 只给两个「输入列」权重：它们会吃掉全部剩余宽度，所以卡片右侧不会留白。
-        # 两个标签列的权重保持 0，宽度只由内容决定，各行才能始终左对齐。
-        master_frame.columnconfigure(1, weight=15)
-        master_frame.columnconfigure(3, weight=25)
-
-        # ---------- 第一行左侧：日期（输入框 + ▼ 日历按钮） ----------
-        ctk.CTkLabel(
-            master_frame,
-            text="日期",
-            font=font_small,
-            text_color="#455A64",
-        ).grid(row=0, column=0, padx=(16, 6), pady=(0, 5), sticky="w")
-
-        # 输入框与 ▼ 按钮放进透明容器水平排布；若各自 grid 到不同列，
-        # 会把整行高度撑高并让标签错位。
-        date_frame = ctk.CTkFrame(
-            master_frame,
-            fg_color="transparent",
-            corner_radius=0,
-        )
-        # sticky="ew"：日期框组随第 1 列的权重一起伸缩，两端贴住列边缘，
-        # 于是它和第二行的类别框左、右边缘同时对齐。
-        # 右侧不留 padx：与金额区的间距统一由「金额」标签的左侧 padx 控制，
-        # 避免两处同时加空隙后实际间距翻倍。
-        date_frame.grid(row=0, column=1, padx=(0, 0), pady=(0, 5), sticky="ew")
-        # 日期框可以放心使用 textvariable：它没有 placeholder_text，不存在占位符失效问题。
-        # 这里不写 width：宽度交给列权重决定，窗口拉宽时日期框跟着变宽。
-        # （▼ 按钮仍固定 36px，见下方。）
-        self.date_entry = ctk.CTkEntry(
-            date_frame,
-            height=36,
-            font=font_regular,
-            corner_radius=9,
-            border_width=1,
-            border_color="#C6D4DF",
-            fg_color="#F8FAFC",
-            textvariable=self.date_var,
-        )
-        # 按钮文字用「▼」而不是 emoji 📅，理由有三条，按重要性排：
-        #   1) 字形来源：「▼」(U+25BC) 是 Microsoft YaHei UI **自带**字形；
-        #      📅 在该字体里没有字形，靠 Windows 的字体回退（Segoe UI Emoji）
-        #      才显示得出来。主流 Windows 上实测能正常显示，但它确实比 ▼ 多绕了
-        #      一层，跨环境一致性差一些。
-        #   2) 视觉重量：📅 是彩色 emoji，在一排灰蓝色线框按钮里显得突兀。
-        #   3) 宽度：emoji 的字宽随字体版本变，▼ 是稳定的单字形，按钮宽度好算。
-        # 先 pack 按钮并 side="right"：让它钉在容器右端不被挤压；
-        # 再 pack 输入框并 expand=True 占满剩余宽度，两者高度都是 36 保持齐平。
-        ctk.CTkButton(
-            date_frame,
-            text="▼",
-            command=self._pick_date,
-            width=36,
-            height=36,
-            corner_radius=9,
-            fg_color="#E3EAF2",
-            hover_color="#D2DEE9",
-            text_color="#243447",
-            font=("Microsoft YaHei UI", 11),
-        ).pack(side="right", padx=(6, 0))
-        # expand=True + fill="both"：输入框吃掉容器里 ▼ 按钮之外的全部宽度，
-        # 窗口变宽时新增的宽度全部落在日期框上（▼ 按钮宽度始终保持 36px）。
-        self.date_entry.pack(side="left", fill="both", expand=True)
-
-        # ---------- 第一行右侧：金额（只有输入框） ----------
-        ctk.CTkLabel(
-            master_frame,
-            text="金额",
-            font=font_small,
-            text_color="#455A64",
-        # 左侧 padx=12 + 标签宽 22 + 右侧 padx=6，恰好让日期组合与金额组合
-        # 之间留出约 40px 水平间距（总计 12+22+6=40），避免两个组合粘在一起。
-        ).grid(row=0, column=2, padx=(12, 6), pady=(0, 5), sticky="w")
-
-        # 金额字段占第 3 列并填满整列（sticky="ew"）。
-        # 这里不再需要透明容器：支出/收入切换按钮已经挪到标题行，金额框是这一列里
-        # 唯一的控件，直接 grid 即可；去掉容器也顺带避开了「容器 + 内部 pack」
-        # 两层布局叠在一起带来的行高偏差。
-        # 腾出来的约 100px（原切换按钮宽度）全部归金额框，所以金额框变宽了，
-        # 并且与第二行的备注框等宽、左右边缘都对齐。
-        # 不写 width：宽度完全由第 3 列的权重决定，窗口拉宽时金额框同步变宽。
-        # 右 padx 保持 0：间距统一由「金额」标签的左侧 padx 控制，
-        # 否则两处同时加空隙实际间距会翻倍。
-        # 金额输入框刻意不用 textvariable，而是用 placeholder_text 显示占位提示；
-        # 代价是取用户输入时必须读控件本身（amount_entry.get()），不能读 StringVar。
-        # 也正因为如此，这里不绑定 <KeyRelease> 去回写 StringVar：粘贴（尤其右键粘贴）
-        # 只发送 <<Paste>> 之类的虚拟事件、不产生按键事件，靠按键回写必然漏掉粘贴内容。
-        self.amount_entry = ctk.CTkEntry(
-            master_frame,
-            height=36,
-            font=font_regular,
-            corner_radius=9,
-            border_width=1,
-            border_color="#C6D4DF",
-            fg_color="#F8FAFC",
-            placeholder_text=" 请输入金额 ",
-        )
-        self.amount_entry.grid(row=0, column=3, padx=(0, 0), pady=(0, 5), sticky="ew")
-
-        # ---------- 第二行：标签区（chips + 输入框 + ▼，需求 3.14.3 形态 1） ----------
-        # 这一行内部再分两小行装在 tags_frame 里：第 0 行 = 输入框 + ▼，第 1 行 = chips。
-        # 【为什么输入行在 chips 之上】chips 会随标签增多而换行。若把它排在输入框上面，
-        #   每加一个标签就把正在输入的那个框往下顶一次、光标跟着跳；放在下面则输入框
-        #   位置恒定，只是卡片在长高。
-        # 【为什么标签区跨满第 1~3 列】chips 是流式换行的，给它最大宽度才能少换行；
-        #   而且「这条记录属于哪些标签」与金额、备注并列整行也更符合阅读顺序。
-        # height=36 + anchor="w" 让「标签」二字与输入框的垂直中心对齐：默认（按整行居中）
-        #   时，标签区一旦因 chips 换行变高，二字就会漂到两行之间、看着像属于 chips 那一行。
-        ctk.CTkLabel(
-            master_frame,
-            text="标签",
-            font=font_small,
-            text_color="#455A64",
-            height=36,
-            anchor="w",
-        ).grid(row=1, column=0, padx=(16, 6), pady=(5, 0), sticky="nw")
-
-        self.tag_chips = TagChipsFrame(master_frame)
-        # 标签区仍占原来的网格位置；跨列后与日期、金额、备注的右边缘保持对齐。
-        self.tag_chips.grid(
-            row=1, column=1, columnspan=3, padx=0, pady=(5, 0), sticky="ew"
-        )
-
-        # ---------- 第三行：备注 ----------
-        # 标签区（chips 会换行）占了第二行整行，备注不能再和它并排，因此下移到第三行；
-        # 从第 1 列起跨满 3 列（columnspan=3），右端仍落在 master_frame 的右内边距上，
-        # 与金额框、标签框右边缘对齐。
-        ctk.CTkLabel(
-            master_frame,
-            text="备注",
-            font=font_small,
-            text_color="#455A64",
-        ).grid(row=2, column=0, padx=(16, 6), pady=(5, 0), sticky="w")
-
-        # 不写 width：宽度完全由列权重（跨列时即整段可用宽度）决定，窗口拉宽时同步变宽。
-        note_entry = ctk.CTkEntry(
-            master_frame,
-            height=36,
-            font=font_regular,
-            corner_radius=9,
-            border_width=1,
-            border_color="#C6D4DF",
-            fg_color="#F8FAFC",
-            textvariable=self.note_var,
-        )
-        # 右侧不留 padx：右边缘的留白统一由 master_frame 自己的右 padx=(0, 16) 提供，
-        # 这样备注框右边缘才能与标题行的添加按钮右边缘对齐。
-        note_entry.grid(
-            row=2, column=1, columnspan=3, padx=(0, 0), pady=(5, 0), sticky="ew"
-        )
+        # 第二行标签与备注按 2:3 分配；标签增加仅向下展开，不推动输入框和备注。
+        second_row = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
+        second_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 12))
+        second_row.columnconfigure(0, weight=2, uniform="secondary_field")
+        second_row.columnconfigure(1, weight=3, uniform="secondary_field")
+        tags_field = _field_column(second_row, "标签（可选）")
+        tags_field.grid(row=0, column=0, sticky="new", padx=(0, 12))
+        # 只为主窗口启用提示，编辑区和选择器 footer 的预填交互保持原样。
+        self.tag_chips = TagChipsFrame(
+            tags_field, placeholder_text="输入标签后回车，或点 ▼ 选择")
+        self.tag_chips.grid(row=1, column=0, sticky="ew")
+        note_field = _field_column(second_row, "备注（可选）")
+        note_field.grid(row=0, column=1, sticky="new")
+        self.note_surface, self.note_entry = _entry_surface(note_field, self.note_var)
+        self.note_surface.grid(row=1, column=0, sticky="ew")
 
     def _pick_date(self) -> None:
-        """打开日历选择器，把选中的日期回填到日期输入框（需求 3.12）。"""
-        # 用 winfo_toplevel() 而不是 self：弹窗必须挂在主窗口上，
-        # 否则 transient 会认错父窗口，导致弹窗跑到主窗口下面或被最小化时一起消失。
-        # anchor 传日期输入框本体：日历会贴在它的左下角弹出（与类别 ▼ 一致），
-        # 而不是摆到屏幕中心——用户从哪一行点的 ▼，弹窗就出现在哪一行旁边。
-        picked = ask_date(
-            self.winfo_toplevel(),
-            self.date_var.get().strip(),
-            anchor=self.date_entry,
-        )
-        # 返回 None 表示用户取消/按 ESC，此时保持输入框原值不变。
+        """日历仍贴日期字段弹出，取消时保留原值。"""
+        # 完整外框作为锚点，避免内嵌输入框的左侧留白使日历发生视觉偏移。
+        picked = ask_date(self.winfo_toplevel(), self.date_var.get().strip(),
+                          anchor=self.date_surface)
         if picked:
             self.date_var.set(picked)
 
     def get_tags(self) -> tuple[str, ...]:
-        """转发读取 chips，保留新增区既有调用入口。"""
         return self.tag_chips.get_tags()
 
     def collect_tags(self) -> tuple[str, ...]:
-        """转发收集操作，提交前仍会冲刷输入框残留。"""
+        # 提交前冲刷残留手输标签，保持原有多标签去重和拆分口径。
         return self.tag_chips.collect_tags()
 
     def clear_tags(self) -> None:
-        """转发清空操作，新增记录成功后复位所有标签状态。"""
         self.tag_chips.clear_tags()
 
 
 class ToolbarFrame(ctk.CTkFrame):
-    """Search box and the responsive action-button bar."""
+    """全局工具与选中记录操作分成两行，减少按钮堆叠。"""
 
     def __init__(
-        self,
-        master: ctk.CTk,
-        filter_callback: Callable[..., None],
-        refresh_callback: Callable[[], None],
-        delete_callback: Callable[[], None],
-        stats_callback: Callable[[], None],
-        export_callback: Callable[[], None],
-        chart_callback: Callable[[], None],
-        open_folder_callback: Callable[[], None],
+        self, master: ctk.CTk, filter_callback: Callable[..., None],
+        refresh_callback: Callable[[], None], delete_callback: Callable[[], None],
+        stats_callback: Callable[[], None], export_callback: Callable[[], None],
+        backup_callback: Callable[[], None], chart_callback: Callable[[], None],
+        open_folder_callback: Callable[[], None], edit_callback: Callable[[], None],
     ) -> None:
         super().__init__(master, fg_color="transparent")
+        self.columnconfigure(0, weight=1)
         font_small = ("Microsoft YaHei UI", 11)
-        # 所有工具按钮共用同一套尺寸参数，保证视觉高度完全一致。
-        # 这里的 width 是「最小宽度」而不是固定宽度：外层 grid 的列权重会在窗口变宽时
-        # 把按钮一起拉宽（见下方 sticky="ew"）。取 110 是因为最长文字「删除选中记录」
-        # 实际只需约 81px（文字 68.8 + 两侧内边距 12），110 留有余量又不至于夸张；
-        # 关键在于六个按钮取同一个值，六列的「最小宽度」才相同，grid 才能把它们算成等宽。
-        button_config = {
-            "width": 110,
-            "height": 34,
-            "corner_radius": 9,
-            "font": font_small,
+        neutral_button = dict(width=68, height=32, corner_radius=8, font=font_small,
+                              fg_color="#E3EAF2", hover_color="#D2DEE9",
+                              text_color="#243447")
+        # 第一行区分全局操作；低频文件操作收进菜单，仍复用原有业务回调。
+        heading = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
+        heading.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        heading.columnconfigure(0, weight=1)
+        ctk.CTkLabel(heading, text="账目记录", anchor="w",
+                     font=("Microsoft YaHei UI", 13, "bold"),
+                     text_color="#243447").grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(heading, text="统计", command=stats_callback,
+                      **neutral_button).grid(row=0, column=1, padx=(0, 8))  # pyright: ignore[reportArgumentType]  # 参数已核验，混合字典展开丢失键值类型对应。
+        ctk.CTkButton(heading, text="图表", command=chart_callback,
+                      **neutral_button).grid(row=0, column=2, padx=(0, 8))  # pyright: ignore[reportArgumentType]  # 参数已核验，混合字典展开丢失键值类型对应。
+        self._file_callbacks = {
+            "导出 CSV": export_callback, "备份数据": backup_callback,
+            "打开数据目录": open_folder_callback,
         }
+        self.file_menu = ctk.CTkOptionMenu(
+            heading, values=list(self._file_callbacks), command=self._run_file_action,
+            width=92, height=32, corner_radius=8, font=font_small,
+            dropdown_font=font_small, dynamic_resizing=False,
+            fg_color="#E3EAF2", button_color="#D2DEE9", button_hover_color="#C4D2E0",
+            text_color="#243447")
+        self.file_menu.set("文件")
+        self.file_menu.grid(row=0, column=3)
+
+        # 第二行将搜索留在左侧，编辑/删除常驻右侧；只有搜索列吸收多余宽度。
+        actions = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
+        actions.grid(row=1, column=0, sticky="ew")
+        actions.columnconfigure(0, weight=1)
         self.search_entry = ctk.CTkEntry(
-            self,
-            width=200,
-            height=34,
-            corner_radius=9,
-            border_width=1,
-            border_color="#C6D4DF",
-            fg_color="#FFFFFF",
-            font=font_small,
-            placeholder_text="🔍 搜索日期/标签/备注",
-        )
-        # 用 grid 而不是 pack(side="left")：pack 是「从左往右按各自固定宽度依次占位」，
-        # 它不会在窗口变窄时让步，最右边的按钮会被挤出可视区域。
-        # grid 用「列权重」表达意图：第 0 列（搜索框）权重 0、宽度固定 200px 不参与伸缩；
-        # 第 1~6 列（六个按钮）权重都是 1 且同属一个 uniform 组
-        #   → 剩下多少宽度就由六列严格均分：窗口拉宽按钮变宽，拉窄按钮变窄。
-        # uniform 是一道额外保险：它强制同组列宽相等，即使将来某个按钮因文字变长
-        # 而抬高自己的最小宽度，六列也仍会取同一个宽度，不会出现参差不齐。
-        self.columnconfigure(0, weight=0)
-        for column_index in range(1, 7):
-            self.columnconfigure(column_index, weight=1, uniform="toolbar_button")
-        # 搜索框 sticky="w"：它所在列没有权重，宽度就固定 200px，不会被拉伸。
-        self.search_entry.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="w")
-        # 实时筛选的触发源必须挂在输入框上：没有 textvariable 就没有变量可监听，
-        # 逐字符过滤只能由输入事件驱动。
-        # 键盘输入用 <KeyRelease>；粘贴/剪切/清空走的是 <<Paste>>/<<Cut>>/<<Clear>> 虚拟事件
-        # （右键粘贴尤其不会产生按键事件），漏掉它们就会出现"粘了字但列表不刷新"。
-        # 虚拟事件的控件级回调先于 Tk 的类绑定执行，此刻文本还没插进输入框，
-        # 因此必须 after_idle 延后到插入完成之后再读，否则过滤用的还是旧内容。
-        self.search_entry.bind("<KeyRelease>", filter_callback, add="+")  # type: ignore[reportArgumentType] # CTk 覆写 bind 的 add 参数，Pylance 推断为 bool，实际接受 "+"
+            actions, width=200, height=36, corner_radius=8, border_width=1,
+            border_color="#D8E1EA", fg_color="#FFFFFF", font=font_small,
+            placeholder_text="搜索日期/标签/备注")
+        self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        # 虚拟事件先于 Tk 插入/剪切执行，延后读取才能让鼠标粘贴同样实时筛选。
+        self.search_entry.bind("<KeyRelease>", filter_callback, add=True)
         for sequence in ("<<Paste>>", "<<PasteSelection>>", "<<Cut>>", "<<Clear>>"):
             self.search_entry.bind(
-                sequence,
-                lambda _event: self.after_idle(filter_callback),
-                add="+",  # type: ignore[reportArgumentType] # CTk 覆写 bind 的 add 参数，Pylance 推断为 bool，实际接受 "+"
-            )
-        # 工具按钮按「轻-重」顺序从左到右排列，删除这类破坏性操作用红色以示警示。
-        # 六个按钮共用同一套 grid 参数：sticky="ew" 让按钮撑满所在列（列有多宽按钮就多宽）；
-        # 右内边距 8px 就是需求里「按钮之间的 8px 间距」。
-        # 最后一个按钮也留这 8px：六列的「最小宽度」必须完全一致，少了这 8px 的
-        # 那个列会比其他列宽出 8px，整体就不再等宽（这 8px 落在工具栏最右侧，
-        # 与卡片左内边距作用相同，视觉上看不出来）。
-        button_grid = {"row": 0, "padx": (0, 8), "pady": 0, "sticky": "ew"}
-        ctk.CTkButton(
-            self,
-            text="刷新",
-            command=refresh_callback,
-            fg_color="#607D8B",
-            hover_color="#4F6873",
-            **button_config,
-        ).grid(column=1, **button_grid)
-        ctk.CTkButton(
-            self,
-            text="删除选中记录",
-            command=delete_callback,
-            fg_color="#E76F51",
-            hover_color="#C9573D",
-            **button_config,
-        ).grid(column=2, **button_grid)
-        ctk.CTkButton(
-            self,
-            text="月度统计",
-            command=stats_callback,
-            fg_color="#5B8E7D",
-            hover_color="#477564",
-            **button_config,
-        ).grid(column=3, **button_grid)
-        ctk.CTkButton(
-            self,
-            text="导出为CSV",
-            command=export_callback,
-            fg_color="#7B6D8D",
-            hover_color="#635775",
-            **button_config,
-        ).grid(column=4, **button_grid)
-        ctk.CTkButton(
-            self,
-            text="查看图表",
-            command=chart_callback,
-            fg_color="#4A90D9",
-            hover_color="#3679BA",
-            **button_config,
-        ).grid(column=5, **button_grid)
-        # 按钮文字始终在按钮内居中（CTkButton 内部就是居中放置文本标签），
-        # 所以按钮变宽变窄都不会让文字跑偏，也不会截断。
-        ctk.CTkButton(
-            self,
-            text="打开数据目录",
-            command=open_folder_callback,
-            fg_color="#607D8B",
-            hover_color="#4F6873",
-            **button_config,
-        ).grid(column=6, **button_grid)
+                sequence, lambda _event: self.after_idle(filter_callback), add=True)
+        self.refresh_button = ctk.CTkButton(
+            actions, text="刷新", command=refresh_callback,
+            **{**neutral_button, "height": 36})  # pyright: ignore[reportArgumentType]  # 参数已核验，高度覆盖后的混合字典同样丢失键值类型对应。
+        self.refresh_button.grid(row=0, column=1)
+        self.edit_button = ctk.CTkButton(
+            actions, text="编辑选中", command=edit_callback, width=104, height=36,
+            corner_radius=8, font=font_small, fg_color="#DCEAFE",
+            hover_color="#CFE0F8", text_color="#245D9F", state="disabled")
+        self.edit_button.grid(row=0, column=2, padx=(16, 8))
+        self.delete_button = ctk.CTkButton(
+            actions, text="删除选中", command=delete_callback, width=104, height=36,
+            corner_radius=8, border_width=1, border_color="#E4C7C4",
+            font=font_small, fg_color="#FFFFFF", hover_color="#FFF1EE",
+            text_color="#B84035", state="disabled")
+        self.delete_button.grid(row=0, column=3)
+        self._record_actions_enabled = False
+
+    def _run_file_action(self, action: str) -> None:
+        # 打开模态业务之前恢复“文件”标题，重复选择同一项也能再次触发。
+        self.file_menu.set("文件")
+        self._file_callbacks[action]()
+
+    def set_record_actions_enabled(self, enabled: bool) -> None:
+        if enabled == self._record_actions_enabled:
+            return  # 选中事件可能重复投递，不必反复重画按钮。
+        self._record_actions_enabled = enabled
+        for button in (self.edit_button, self.delete_button):
+            button.configure(state="normal" if enabled else "disabled")
 
 
 class RecordTableFrame(ctk.CTkFrame):
@@ -678,12 +447,21 @@ class RecordTableFrame(ctk.CTkFrame):
             border_color="#D8E1EA",
         )
         font_small = ("Microsoft YaHei UI", 11)
+        # 底栏先占位，表格随后填剩余空间，最小窗口下编辑提示也不会被挤走。
+        footer = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
+        footer.pack(side="bottom", fill="x", padx=12, pady=(0, 8))
+        self.selection_label = ctk.CTkLabel(
+            footer, text="请选择一条记录", height=20, font=font_small,
+            text_color="#64748B")
+        self.selection_label.pack(side="left")
+        ctk.CTkLabel(footer, text="双击记录也可编辑", height=20, font=font_small,
+                     text_color="#64748B").pack(side="right")
         table_inner = ctk.CTkFrame(self, fg_color="transparent")
-        table_inner.pack(fill="both", expand=True, padx=10, pady=10)
+        table_inner.pack(fill="both", expand=True, padx=10, pady=(8, 6))
         # 列 key 用 tags 而不是 category（#62）：这一列现在装的是多值标签串，
         # key 名与类型对齐后，以后任何人看到 "tags" 都不会再误以为它是单值类别。
-        # 注意 key 与表头文字是两回事，而 values / iid 都是按位置给的，不受改名影响。
-        columns = ("id", "date", "amount", "tags", "note")
+        # 主键只保留在 iid 中；显示列删除 ID 不改变选择、双击和删除的行定位。
+        columns = ("date", "amount", "tags", "note")
         # 自定义 ttk 样式，是为了摆脱 Windows 原生 Treeview 的灰色边框和紧凑行高，
         # 让表格与浅色圆角卡片风格保持一致。
         style = ttk.Style(self)
@@ -710,11 +488,11 @@ class RecordTableFrame(ctk.CTkFrame):
             table_inner,
             columns=columns,
             show="headings",
+            selectmode="browse",
             style="Account.Treeview",
         )
         # show="headings" 表示隐藏默认的首列树形图标，只显示自定义表头。
         headings = (
-            ("id", "ID", 70),
             ("date", "日期", 120),
             ("amount", "金额", 120),
             # 表头文字仍写「标签」（§3.14.4：表格单元格用「、」连接，0 个时显示「—」）。
@@ -738,8 +516,13 @@ class RecordTableFrame(ctk.CTkFrame):
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
-        # 双击某一行即触发编辑回调（需求 3.5.1），比额外放一个「编辑」按钮更直观。
+        # 双击保留为快捷入口，常驻编辑按钮让新用户也能发现此功能。
         self.tree.bind("<Double-1>", edit_callback)
         # 只让表格所在的第 0 行/列获得伸缩权重，保证窗口拉大时表格占满剩余空间。
         table_inner.rowconfigure(0, weight=1)
         table_inner.columnconfigure(0, weight=1)
+
+    def set_selected_record(self, record_id: int | None) -> None:
+        # 使用稳定的主键反馈选择对象，筛选/刷新清空选择时同时撤掉旧提示。
+        self.selection_label.configure(
+            text=f"已选中记录 ID：{record_id}" if record_id is not None else "请选择一条记录")

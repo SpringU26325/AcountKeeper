@@ -138,7 +138,7 @@ class _Session:
     height: int = 1
     last_target: tuple[int, int, int, int] | None = None
     tasks: dict[str, str] = field(default_factory=dict)
-    bindings: list[tuple[tk.Misc, str, str]] = field(default_factory=list)
+    bindings: list[tuple[tk.Misc, str, str, str]] = field(default_factory=list)
 
     def close(self) -> None:
         _end_session(self)  # 活动登记保存会话身份，旧调用的收尾不得误关新会话。
@@ -400,9 +400,11 @@ def _end_session(session: _Session) -> None:
         except (tk.TclError, ValueError):
             pass  # 已执行或外部Destroy已取消的句柄仍须从会话清单移除。
     session.tasks.clear()
-    for widget, sequence, funcid in session.bindings:
+    for widget, sequence, funcid, script in session.bindings:
         try:
-            tk.Misc.unbind(widget, sequence, funcid)  # 按id摘自身回调，不能清除CTk同序列订阅。
+            current = tk.Misc.bind(widget, sequence)
+            widget.tk.call("bind", str(widget), sequence, current.replace(script, "").strip())  # Tk默认unbind不识别存活守卫，须精确摘本会话脚本并保留其他订阅。
+            widget.deletecommand(funcid)  # 立即回收命令；已进入分发的旧脚本由Tcl守卫拦截。
         except (tk.TclError, ValueError):
             pass  # 父窗销毁时该绑定可能已被Tk收回，其他收尾仍须继续。
     session.bindings.clear()
@@ -489,7 +491,12 @@ def _bind_session(session: _Session, widget: tk.Misc, sequence: str, callback) -
             callback(event)  # 同一窗复用时，排队的旧事件不允许处理新会话。
     funcid = tk.Misc.bind(widget, sequence, dispatch, add="+")
     if funcid:
-        session.bindings.append((widget, sequence, funcid))
+        current = tk.Misc.bind(widget, sequence)
+        prefix = 'if {"[' + funcid + ' '
+        own_script = next(line for line in current.splitlines() if line.startswith(prefix))
+        guarded_script = "if {[llength [info commands " + funcid + "]]} { " + own_script + " }"  # 嵌套事件可能先删命令，必须在进入Python前由Tcl检查存活。
+        widget.tk.call("bind", str(widget), sequence, current.replace(own_script, guarded_script))
+        session.bindings.append((widget, sequence, funcid, guarded_script))
 
 
 def _cancel() -> None:
