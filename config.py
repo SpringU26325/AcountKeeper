@@ -57,6 +57,9 @@ CATEGORY_PREFS_PATH = DATA_DIR / "categories.json"
 # 与 account.db 同目录，同样便于用户整体备份/迁移。
 TAG_PREFS_PATH = DATA_DIR / "tags.json"
 
+# 映射独立保存，避免 settings.save_settings 整份覆盖时洗掉用户显式保存的映射。
+IMPORT_MAPPINGS_PATH = DATA_DIR / "import_mappings.json"
+
 # 资源根目录：PyInstaller 打包后资源会被解压到 sys._MEIPASS，
 # 用 getattr 做兼容，未打包时回退到源码目录，保证两种运行方式都能找到图片。
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR))

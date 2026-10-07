@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from datetime import date
+import ctypes
+from ctypes import wintypes
 import tkinter as tk
 from typing import Callable
-from tkinter import ttk
+from tkinter import ttk, font as tkfont
 
 import customtkinter as ctk
 
 from calendar_picker import ask_date
+from file_picker import FileMenu
+from popup_common import make_toggle_button
 # 标签候选统一由 tag_prefs 算（就是它自己那份标签列表），
 # 不再从数据库 DISTINCT 取历史标签：那条路会让用户临时输入的写法越积越多，
 # 候选读取与偏好写入只在 tag_prefs 维护；UI 不缓存标签池，避免多处实现漂移。
@@ -17,6 +21,7 @@ from tag_picker import ask_tags
 # 手输的多标签要按顿号拆开，拆分与清理规则（strip / 去空 / 首次出现去重）
 # 与偏好层共用一份实现：#58 Step 3a 新增，避免这里再抄一遍口径、两处迟早漂开。
 from tag_prefs import split_tag_input
+from table_tag_badges import TagBadgeRenderer, tag_layout
 
 # ---------- 标签 chips 区的几何常量（需求 3.14.3 形态 1） ----------
 # 一颗 chip 的高度与圆角：28 + 圆角 14 刚好是「药丸」形，也比一行输入框（36）矮，
@@ -83,18 +88,7 @@ class TagChipsFrame(ctk.CTkFrame):
         self.input_surface.grid(row=0, column=0, sticky="ew")
         self.tag_entry.bind("<Return>", lambda _event: self._commit_tag_input())
 
-        self.tag_button = ctk.CTkButton(
-            self.input_surface,
-            text="▼",
-            command=self._pick_tags,
-            width=32,
-            height=38,
-            corner_radius=7,
-            fg_color="#F8FAFC",
-            hover_color="#D2DEE9",
-            text_color="#243447",
-            font=("Microsoft YaHei UI", 11),
-        )
+        self.tag_button = make_toggle_button(self.input_surface, self._pick_tags)
         self.tag_button.grid(row=0, column=1, padx=(0, 1), pady=1, sticky="e")
 
         # 半行宽字段更容易换行；视口最多三行，余下滚动，防止挤掉备注和表格。
@@ -267,7 +261,7 @@ class InputFrame(ctk.CTkFrame):
 
     def __init__(self, master: ctk.CTk, add_callback: Callable[[], None]) -> None:
         super().__init__(master, corner_radius=14, fg_color="#FFFFFF",
-                         border_width=1, border_color="#D8E1EA")
+                         border_width=1, border_color="#E0E8F0")
         self.date_var = tk.StringVar(value=date.today().isoformat())
         self.amount_type_var = tk.StringVar(value="支出")
         self.note_var = tk.StringVar()
@@ -285,10 +279,7 @@ class InputFrame(ctk.CTkFrame):
         date_field.grid(row=0, column=0, sticky="new", padx=(0, 12))
         self.date_surface, self.date_entry = _entry_surface(date_field, self.date_var)
         self.date_surface.grid(row=1, column=0, sticky="ew")
-        self.date_button = ctk.CTkButton(
-            self.date_surface, text="▼", command=self._pick_date, width=32, height=38,
-            corner_radius=7, fg_color="#F8FAFC", hover_color="#D2DEE9",
-            text_color="#243447", font=("Microsoft YaHei UI", 11))
+        self.date_button = make_toggle_button(self.date_surface, self._pick_date)
         self.date_button.grid(row=0, column=1, padx=(0, 1), pady=1, sticky="e")
 
         amount_field = _field_column(first_row, "金额")
@@ -331,6 +322,9 @@ class InputFrame(ctk.CTkFrame):
         note_field.grid(row=0, column=1, sticky="new")
         self.note_surface, self.note_entry = _entry_surface(note_field, self.note_var)
         self.note_surface.grid(row=1, column=0, sticky="ew")
+        # 只处理主页面入口的外侧圆角，避免共享chips在编辑窗里跟着改外观。
+        for button in (self.date_button, self.tag_chips.tag_button):
+            button.configure(background_corner_colors=("#F8FAFC", "#FFFFFF", "#FFFFFF", "#F8FAFC"))
 
     def _pick_date(self) -> None:
         """日历仍贴日期字段弹出，取消时保留原值。"""
@@ -363,10 +357,10 @@ class ToolbarFrame(ctk.CTkFrame):
     ) -> None:
         super().__init__(master, fg_color="transparent")
         self.columnconfigure(0, weight=1)
-        font_small = ("Microsoft YaHei UI", 11)
+        font_small = ("Microsoft YaHei UI", 12)
         neutral_button = dict(width=68, height=32, corner_radius=8, font=font_small,
-                              fg_color="#E3EAF2", hover_color="#D2DEE9",
-                              text_color="#243447")
+                              fg_color="#E8EEF5", hover_color="#DDE7F2",
+                              text_color="#475569")
         # 第一行区分全局操作；低频文件操作收进菜单，仍复用原有业务回调。
         heading = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
         heading.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -382,13 +376,11 @@ class ToolbarFrame(ctk.CTkFrame):
             "导出 CSV": export_callback, "备份数据": backup_callback,
             "打开数据目录": open_folder_callback,
         }
-        self.file_menu = ctk.CTkOptionMenu(
-            heading, values=list(self._file_callbacks), command=self._run_file_action,
-            width=92, height=32, corner_radius=8, font=font_small,
-            dropdown_font=font_small, dynamic_resizing=False,
-            fg_color="#E3EAF2", button_color="#D2DEE9", button_hover_color="#C4D2E0",
-            text_color="#243447")
-        self.file_menu.set("文件")
+        # 文件入口与日期/标签共用三角及定位；业务仍只通过原有回调执行。
+        self.file_menu = FileMenu(heading, tuple(self._file_callbacks), self._run_file_action)
+        self.file_menu.configure(fg_color="#E8EEF5")
+        for button in (self.file_menu.label_button, self.file_menu.toggle_button):
+            button.configure(fg_color="#E8EEF5", hover_color="#DDE7F2", text_color="#475569")
         self.file_menu.grid(row=0, column=3)
 
         # 第二行将搜索留在左侧，编辑/删除常驻右侧；只有搜索列吸收多余宽度。
@@ -423,8 +415,7 @@ class ToolbarFrame(ctk.CTkFrame):
         self._record_actions_enabled = False
 
     def _run_file_action(self, action: str) -> None:
-        # 打开模态业务之前恢复“文件”标题，重复选择同一项也能再次触发。
-        self.file_menu.set("文件")
+        # FileMenu已先隐藏并恢复三角，再进入模态业务，重复选择不依赖标题值变化。
         self._file_callbacks[action]()
 
     def set_record_actions_enabled(self, enabled: bool) -> None:
@@ -433,6 +424,12 @@ class ToolbarFrame(ctk.CTkFrame):
         self._record_actions_enabled = enabled
         for button in (self.edit_button, self.delete_button):
             button.configure(state="normal" if enabled else "disabled")
+
+
+def summarize_tags(tags: tuple[str, ...], width: int, font: tkfont.Font, scale: float = 1.0) -> str:
+    prefix, rest = tag_layout(tags, width, font, scale)
+    # 原生值保留同一摘要语义；Canvas只改变视觉，不能靠解析字符串还原标签。
+    return f"{prefix}{' ' if prefix else ''}+{rest}" if rest else prefix
 
 
 class RecordTableFrame(ctk.CTkFrame):
@@ -444,7 +441,7 @@ class RecordTableFrame(ctk.CTkFrame):
             corner_radius=14,
             fg_color="#FFFFFF",
             border_width=1,
-            border_color="#D8E1EA",
+            border_color="#E0E8F0",
         )
         font_small = ("Microsoft YaHei UI", 11)
         # 底栏先占位，表格随后填剩余空间，最小窗口下编辑提示也不会被挤走。
@@ -462,28 +459,19 @@ class RecordTableFrame(ctk.CTkFrame):
         # key 名与类型对齐后，以后任何人看到 "tags" 都不会再误以为它是单值类别。
         # 主键只保留在 iid 中；显示列删除 ID 不改变选择、双击和删除的行定位。
         columns = ("date", "amount", "tags", "note")
-        # 自定义 ttk 样式，是为了摆脱 Windows 原生 Treeview 的灰色边框和紧凑行高，
-        # 让表格与浅色圆角卡片风格保持一致。
+        # 仅复制本表格需要的clam元素，vista原生表头会忽略底色；不切全局主题。
         style = ttk.Style(self)
-        # borderwidth=0 用于去掉原生外观自带的立体边框；rowheight 加高让行更好点选。
-        style.configure(
-            "Account.Treeview",
-            background="#FFFFFF",
-            fieldbackground="#FFFFFF",
-            foreground="#263238",
-            rowheight=34,
-            font=font_small,
-            borderwidth=0,
-        )
-        style.configure(
-            "Account.Treeview.Heading",
-            background="#E8F0F6",
-            foreground="#37474F",
-            font=("Microsoft YaHei UI", 11, "bold"),
-            relief="flat",
-        )
-        # 原生选中色是深蓝，与浅色主题冲突，这里改成浅蓝以保持整体协调。
-        style.map("Account.Treeview", background=[("selected", "#D7E9FC")])
+        for source in ("Treeview.field", "Treeheading.cell", "Treeheading.border"):
+            name = "Account." + source
+            if name not in style.element_names():
+                style.element_create(name, "from", "clam", source)
+        style.layout("Account.Treeview", [("Account.Treeview.field", {"sticky": "nswe", "children": [
+            ("Treeview.padding", {"sticky": "nswe", "children": [("Treeview.treearea", {"sticky": "nswe"})]})]})])
+        style.layout("Account.Treeview.Heading", [("Account.Treeheading.cell", {"sticky": "nswe"}),
+            ("Account.Treeheading.border", {"sticky": "nswe", "children": [
+                ("Treeheading.padding", {"sticky": "nswe", "children": [("Treeheading.text", {"sticky": "we"})]})]})])
+        self.tag_font = tkfont.Font(root=self, family="Microsoft YaHei UI", size=-12)
+        self._style_table()
         self.tree = ttk.Treeview(
             table_inner,
             columns=columns,
@@ -491,11 +479,13 @@ class RecordTableFrame(ctk.CTkFrame):
             selectmode="browse",
             style="Account.Treeview",
         )
+        self.record_tags: dict[str, tuple[str, ...]] = {}
+        self.tree.tag_configure("stripe", background="#F7FAFD")
         # show="headings" 表示隐藏默认的首列树形图标，只显示自定义表头。
         headings = (
             ("date", "日期", 120),
             ("amount", "金额", 120),
-            # 表头文字仍写「标签」（§3.14.4：表格单元格用「、」连接，0 个时显示「—」）。
+            # 表头及空标签口径不变；超宽标签仅在表现层生成摘要。
             ("tags", "标签", 140),
             ("note", "备注", 300),
         )
@@ -513,11 +503,13 @@ class RecordTableFrame(ctk.CTkFrame):
             command=self.tree.yview,
         )
         # 双向绑定：拖动滚动条能滚动表格，鼠标滚轮滚动表格时滚动条位置也会同步更新。
-        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tag_tooltip = TreeviewTagTooltip(self, scrollbar)
+        self.tag_badges = TagBadgeRenderer(self, edit_callback)
+        self.tree.configure(yscrollcommand=self.tag_tooltip.scrolled)
         self.tree.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
         # 双击保留为快捷入口，常驻编辑按钮让新用户也能发现此功能。
-        self.tree.bind("<Double-1>", edit_callback)
+        self.tree.bind("<Double-1>", edit_callback, add="+")
         # 只让表格所在的第 0 行/列获得伸缩权重，保证窗口拉大时表格占满剩余空间。
         table_inner.rowconfigure(0, weight=1)
         table_inner.columnconfigure(0, weight=1)
@@ -526,3 +518,224 @@ class RecordTableFrame(ctk.CTkFrame):
         # 使用稳定的主键反馈选择对象，筛选/刷新清空选择时同时撤掉旧提示。
         self.selection_label.configure(
             text=f"已选中记录 ID：{record_id}" if record_id is not None else "请选择一条记录")
+
+    def _style_table(self) -> None:
+        scale = self._get_widget_scaling()
+        # CTk使用逻辑像素，Tk负字号使用物理像素，避免表格被再次按系统点数放大。
+        font = ("Microsoft YaHei UI", -max(1, round(12 * scale)))
+        self.tag_font.configure(family=font[0], size=font[1])
+        style = ttk.Style(self)
+        # field元素仍会画边缘；三种边色置白，让卡片只保留外层的轻描边。
+        style.configure("Account.Treeview", background="#FFFFFF", fieldbackground="#FFFFFF",
+                        foreground="#334155", font=font, rowheight=round(32 * scale), borderwidth=0,
+                        bordercolor="#FFFFFF", lightcolor="#FFFFFF", darkcolor="#FFFFFF")
+        style.configure("Account.Treeview.Heading", background="#EAF2FA", foreground="#475569",
+                        font=(*font, "bold"), relief="flat", borderwidth=0, padding=(0, round(7 * scale)))
+        style.map("Account.Treeview", background=[("selected", "#D7E9FC")], foreground=[("selected", "#243447")])
+
+    def _set_scaling(self, *args, **kwargs) -> None:
+        super()._set_scaling(*args, **kwargs)
+        if hasattr(self, "tag_font"):
+            self._style_table()  # 动态缩放必须同步测量字体，不能只放大CTk外框。
+            if hasattr(self, "tag_tooltip"):
+                self.tag_tooltip._layout()
+
+    def set_record_tags(self, iid: str, tags: tuple[str, ...]) -> str:
+        self.record_tags[iid] = tags
+        scale = self._get_widget_scaling()
+        # bbox/列宽已经是物理像素，只缩放逻辑内边距及胶囊尺寸。
+        return summarize_tags(tags, self.tree.column("tags", "width") - round(10 * scale), self.tag_font, scale)
+
+    def clear_records(self) -> None:
+        self.tag_tooltip.clear()
+        self.tag_badges.clear()  # 重建前隐藏旧Canvas，不能让同iid短暂显示上一轮内容。
+
+
+def _tooltip_work_area(root: tk.Misc) -> tuple[int, int, int, int] | None:
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("screen", wintypes.RECT),
+                    ("work", wintypes.RECT), ("flags", wintypes.DWORD)]
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    # 只查询主窗所属屏幕；64位句柄必须声明类型，不枚举或按鼠标选屏。
+    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.MonitorFromWindow.restype = wintypes.HANDLE
+    user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
+    monitor = user32.MonitorFromWindow(root.winfo_id(), 2)
+    info = MonitorInfo(size=ctypes.sizeof(MonitorInfo))
+    if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    rect = info.work
+    if rect.left < 0 or rect.top < 0:
+        return None  # 首版不定位到负坐标屏幕，避免Tk把负位置解释成右/下边距。
+    return rect.left, rect.top, rect.right, rect.bottom
+
+
+def _tooltip_position(cell, size, work) -> tuple[int, int]:
+    left, top, right, bottom = work
+    x, y, _width, height = cell
+    width, tip_height = size
+    target_y = y + height + 6
+    if target_y + tip_height > bottom - 8:
+        target_y = y - tip_height - 6
+    # 翻转后仍按同一个工作区钳制，不让边框盖进任务栏。
+    return (max(left + 8, min(x, right - width - 8)),
+            max(top + 8, min(target_y, bottom - tip_height - 8)))
+
+
+class TreeviewTagTooltip:
+    def __init__(self, table: RecordTableFrame, scrollbar: ttk.Scrollbar) -> None:
+        self.table, self.tree, self.scrollbar = table, table.tree, scrollbar
+        self.root = self.tree.winfo_toplevel()
+        self.window: tk.Toplevel | None = None
+        self.show_job: str | None = None
+        self.idle_job: str | None = None
+        self.current: str | None = None
+        self.position = (0, 0)
+        self.closed = False
+        self.bindings = []
+        # 原生绑定追加安装，记录自己的ID；关闭时不影响编辑及其他订阅者。
+        for widget, sequence, callback in (
+            (self.tree, "<Motion>", self._motion), (self.tree, "<Leave>", self._leave),
+            (self.tree, "<Configure>", self._layout), (self.tree, "<ButtonRelease-1>", self._layout),
+            (self.tree, "<ButtonPress>", self.hide), (self.tree, "<Double-1>", self.hide),
+            (self.tree, "<Unmap>", self.hide), (self.tree, "<Destroy>", self.destroy),
+            (self.tree, "<MouseWheel>", self.hide),
+            (self.root, "<FocusOut>", self.hide), (self.root, "<Unmap>", self.hide),
+            (self.root, "<ButtonPress>", self.hide), (self.root, "<Configure>", self._root_layout),
+        ):
+            self.bindings.append((widget, sequence, tk.Misc.bind(widget, sequence, callback, add="+")))
+
+    def _cell_at(self, x: int, y: int) -> str | None:
+        iid = self.tree.identify_row(y)
+        if not iid or self.tree.identify_region(x, y) != "cell":
+            return None
+        box = self.tree.bbox(iid, "tags")
+        # identify_column有列边界命中余量；真实bbox优先，极窄标签列也能被悬停。
+        if not box or not (box[0] <= x < box[0] + box[2] and box[1] <= y < box[1] + box[3]):
+            return None
+        tags = self.table.record_tags.get(iid, ())
+        if tags and self.table.tag_font.measure("、".join(tags)) > box[2] - round(10 * self.table._get_widget_scaling()):
+            return iid
+        return None
+
+    def _leave(self, event) -> None:
+        x, y = event.x_root - self.tree.winfo_rootx(), event.y_root - self.tree.winfo_rooty()
+        target = self.tree.winfo_containing(event.x_root, event.y_root)
+        # Treeview与覆盖Canvas之间的Leave不等于离开cell，保留原300ms任务。
+        if (target is self.tree or target in self.table.tag_badges.canvases) and self._cell_at(x, y) == self.current:
+            self.position = (x, y)
+            return
+        self.hide()
+
+    def _motion(self, event: tk.Event) -> None:
+        self.position = (event.x, event.y)
+        state = event.state
+        if not isinstance(state, int):
+            self.hide()  # Tk事件可能携带非数字占位值；无法判断拖动状态时不启动提示。
+            return
+        if state & 0x700:
+            self.hide()  # 按住鼠标拖动时不启动提示，避免拖列/拖选择中途冒窗。
+            return
+        iid = self._cell_at(*self.position)
+        if iid == self.current:
+            return  # 同cell内移动保留最初300ms计时，不反复推迟显示。
+        self.hide()
+        self.current = iid
+        if iid is not None:
+            self.show_job = self.tree.after(300, self._show)
+
+    def _show(self) -> None:
+        self.show_job = None
+        iid = self.current
+        if iid is None or not self.tree.winfo_viewable() or self._cell_at(*self.position) != iid:
+            return
+        try:
+            work = _tooltip_work_area(self.root)
+        except OSError:
+            return  # 工作区读取失败只跳过提示，不用屏幕总高度冒充工作区。
+        if work is None:
+            return
+        window = self.window = tk.Toplevel(self.tree, takefocus=0)
+        window.withdraw()
+        window.overrideredirect(True)
+        label = tk.Label(window, text="、".join(self.table.record_tags[iid]),
+                         font=self.table.tag_font, justify="left", bg="#FFFFFF", fg="#334155",
+                         relief="flat", borderwidth=0, highlightthickness=1, highlightbackground="#D8E5F2",
+                         padx=10, pady=7,
+                         wraplength=max(1, min(420, work[2] - work[0] - 30)))
+        label.pack()
+        window.update_idletasks()
+        if self.window is not window:
+            return  # idle会处理销毁/刷新；不能继续操作已经失效的提示窗。
+        try:
+            box = self.tree.bbox(iid, "tags")
+        except tk.TclError:
+            self.hide()  # idle期间记录可能已删除，失效锚点必须连同隐藏窗口一起收尾。
+            return
+        if not box:
+            self.hide()  # 行滚出视口时bbox为空字符串；不能继续取坐标或留下半成品提示窗。
+            return
+        cell_x, cell_y, cell_width, cell_height = box
+        cell = (self.tree.winfo_rootx() + cell_x, self.tree.winfo_rooty() + cell_y, cell_width, cell_height)
+        size = (min(label.winfo_reqwidth(), work[2] - work[0] - 16),
+                min(label.winfo_reqheight(), work[3] - work[1] - 16))
+        x, y = _tooltip_position(cell, size, work)
+        window.geometry(f"{size[0]}x{size[1]}+{x}+{y}")
+        window.deiconify()
+        window.lift()
+
+    def _cancel(self, name: str) -> None:
+        job = getattr(self, name)
+        if job is not None:
+            setattr(self, name, None)
+            try:
+                self.tree.after_cancel(job)
+            except tk.TclError:
+                pass  # 父窗可能已先取消所属任务；重复收尾不能重新抛出销毁错误。
+
+    def hide(self, _event=None) -> None:
+        self._cancel("show_job")
+        self.current = None
+        window, self.window = self.window, None
+        if window is not None:
+            window.destroy()
+
+    def scrolled(self, first, last) -> None:
+        self.hide()  # yscrollcommand也覆盖滚动条拖动及静止鼠标下的程序滚动。
+        self.scrollbar.set(first, last)
+        self.table.tag_badges.request()
+
+    def clear(self) -> None:
+        self.hide()
+        self._cancel("idle_job")
+        self.table.record_tags.clear()  # 先作废旧iid映射，刷新后同ID不能接到旧标签。
+
+    def _root_layout(self, event: tk.Event) -> None:
+        if event.widget is self.root:
+            self._layout(event)
+
+    def _layout(self, _event=None) -> None:
+        self.hide()
+        if not self.closed and self.idle_job is None:
+            self.idle_job = self.tree.after_idle(self._reflow)
+
+    def _reflow(self) -> None:
+        self.idle_job = None
+        # 一次idle合并连续尺寸变化；鼠标移动不遍历全表或重复测量摘要。
+        for iid, tags in self.table.record_tags.items():
+            if self.tree.exists(iid):
+                self.tree.set(iid, "tags", self.table.set_record_tags(iid, tags))
+        self.table.tag_badges.request()
+
+    def destroy(self, _event=None) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.clear()
+        for widget, sequence, binding in self.bindings:
+            try:
+                tk.Misc.unbind(widget, sequence, binding)
+            except tk.TclError:
+                pass  # 外部原生destroy也能进入此出口，已消失控件只做剩余收尾。
+        self.bindings.clear()

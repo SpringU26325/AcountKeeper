@@ -18,7 +18,7 @@ def create_backup(store: AccountStore, save_path: Path) -> Path:
     except FileNotFoundError:
         original_target = None  # UI 确认后仍可能有另一实例生成同名文件，发布前必须重查。
     json_paths = [data_dir / name for name in (
-        "settings.json", "tags.json", "categories.json"
+        "settings.json", "tags.json", "categories.json", "import_mappings.json"
     )]
     protected = [store.path.resolve(), *json_paths]
     protected.extend(Path(str(store.path.resolve()) + suffix) for suffix in (

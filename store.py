@@ -3,6 +3,7 @@
 import csv
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import shutil
@@ -12,23 +13,9 @@ from typing import Iterable, Iterator
 
 from config import CSV_FIELDS, DB_PATH
 
-# 本版程序要求数据库最终达到的结构版本号，存在 SQLite 自带的 PRAGMA user_version 里。
-# 语义是「目标版本」而不是「已完成的步骤数」：新库默认 0，启动时由 _migrate_to_multi_tag
-# 一次性抬到 2；已迁过的库靠 `version >= _SCHEMA_USER_VERSION` 整体跳过，保证迁移只跑一次。
-# 选它而不是自建标记表 / 往 settings.json 塞字段：SQLite 自带、无需额外文件，
-# 一条 PRAGMA 就能从命令行或探针直接看出库处于哪个版本。
-#
-# 0 → 1 与 1 → 2（Step 2c-1 抬高本常量时新增的那一段）做的是同一件事——
-# 把 accounts.category 里还没有进 record_tags 的值补成一行标签——所以没有再切一个函数，
-# 直接让 _migrate_to_multi_tag 复用同一段 SQL 一起完成，不存在歧义。
-#
-# 【规矩】将来再加**破坏性**步骤（会改写或删除既有数据、无法靠「重跑一次」收敛的那种）
-# 必须另立一个独立的迁移函数，不能挂进 _migrate_to_multi_tag。两个理由：
-# 1) 本函数的门槛是 `version >= _SCHEMA_USER_VERSION`，对已经升到 2 的库会整体跳过，
-#    新步骤混在这里就永远不会执行；
-# 2) 本函数只读 accounts、可安全反复重跑，与破坏性步骤「有备份才敢动、动过就不能再动」
-#    是两种不同性质，混在一起会把两套安全策略搅坏。
-_SCHEMA_USER_VERSION = 2
+# 历史标签迁移固定到 2；不能把目标改成 3，否则已迁过的库会再次补 legacy 标签。
+_MULTI_TAG_USER_VERSION = 2
+_SCHEMA_USER_VERSION = 3
 
 
 @dataclass
@@ -53,6 +40,27 @@ class Account:
     note: str
 
 
+@dataclass(frozen=True)
+class ImportRecord:
+    """已经通过预览确认的账本字段；外部单号与标签均不携入数据库。"""
+
+    record_date: str
+    amount: Decimal
+    note: str
+
+
+@dataclass(frozen=True)
+class ImportBatch:
+    """原始导入数量快照，不随单笔编辑或删除改写。"""
+
+    batch_id: int
+    imported_at: str
+    file_name: str
+    imported_count: int
+    skipped_count: int
+    non_transaction_count: int
+
+
 class AccountStore:
     """Persist account records in a local SQLite database."""
 
@@ -71,6 +79,8 @@ class AccountStore:
         # 建表之前问，而 _connect() 本身就会把新库凭空创建出来，时机太脆；改由迁移内部按
         # 「是否真有记录缺标签」决定（Step 2c-1）：全新库 / 无待补数据的库根本不进备份分支。
         self._migrate_to_multi_tag()
+        # 前一步失败时不跨级；基础账本仍可启动，批次接口通过就绪标记拒绝使用。
+        self.import_batches_available = self._migrate_to_import_batches()
         self.load()
 
     @contextmanager
@@ -79,14 +89,11 @@ class AccountStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path)
         try:
-            yield connection
-        except Exception:
-            # 任何异常都回滚，保证不会留下写了一半的脏数据（需求 3.1 要求数据不丢失）。
-            connection.rollback()
-            raise
-        else:
-            # 只有整段 with 块顺利执行完才提交，相当于一次原子事务。
-            connection.commit()
+            # 外键开关按连接生效；标签表没有外键，仍由 CRUD 显式清理，不改变旧口径。
+            connection.execute("PRAGMA foreign_keys = ON")
+            # SQLite 自带上下文同时覆盖事务体和提交失败，避免 commit 异常漏过 rollback。
+            with connection:
+                yield connection
         finally:
             # 无论成功或失败都必须关闭连接，否则会累积文件句柄。
             connection.close()
@@ -150,8 +157,8 @@ class AccountStore:
             # 就变成「两处真源」（否决理由见 requirements §3.14.2 的方案 A）。
             # (record_id, tag) 复合主键天然去重，同一条记录打两次同名标签只留一行，
             # 迁移 SQL 也才能靠 INSERT OR IGNORE 做到幂等。
-            # 故意不写 FOREIGN KEY：sqlite3 默认 foreign_keys=OFF，写了也不生效，
-            # 所以删除记录时由 delete() 显式清理关联（§3.14.5 已明确不依赖级联）。
+            # 标签表继续不写 FOREIGN KEY，删除由 delete/undo_import_batch 显式清理；
+            # 新批次外键启用不等于为旧标签表增设级联（§3.14 保留原口径）。
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS record_tags (
@@ -197,7 +204,7 @@ class AccountStore:
         - 1 → 2（Step 2c-1）：Step 1 与 Step 2b 之间落库的记录、以及迁移被跳过的库，
           其 category 列还有值却一行关联都没有，这里把它们补上。
         两段要做的事逐字相同（都只是「给零关联行的记录补一行标签」），所以不另立函数、
-        共用同一段 SQL；版本常量上方写了「将来破坏性步骤必须另立函数」的规矩，改这里前先看它。
+        共用同一段 SQL；本段目标固定为 2，后续批次迁移必须另立函数，不能提高本段门槛。
 
         补漏判定**必须带 NOT EXISTS**（只补「一行关联都没有」的记录）：若不加，给「已有标签、
         但旧 category 仍有值且与之不同」的记录再补一行，load() 就会凭空多出一个标签。
@@ -219,8 +226,8 @@ class AccountStore:
                 version_row = connection.execute("PRAGMA user_version").fetchone()
                 # PRAGMA 一定返回一行，这里仍做兜底，避免脏库返回空结果时下标报错。
                 version = version_row[0] if version_row else 0
-                if version >= _SCHEMA_USER_VERSION:
-                    # 已经迁过：直接放行。用 >= 而不是 ==，将来把常量继续往上加时不会误跑本段。
+                if version >= _MULTI_TAG_USER_VERSION:
+                    # 已经迁过：直接放行。固定门槛 2，后续 schema 升版不会重新补旧标签。
                     return
                 # 待补条数 =「TRIM 后非空」且「关联表里一行都没有」的记录数。
                 # 这里的 WHERE 与下面 INSERT 的 WHERE 逐字一致，所以数出 0 就真的无事可做。
@@ -262,10 +269,159 @@ class AccountStore:
                 # 「标签已写入、版本号却没升」的半迁移状态。
                 # PRAGMA 的位置参数不走占位符绑定，只能拼进 SQL；值来自模块常量、
                 # 不是外部输入，没有注入面。
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_USER_VERSION}")
+                connection.execute(f"PRAGMA user_version = {_MULTI_TAG_USER_VERSION}")
         except sqlite3.Error as error:
             # 覆盖「读版本 / 数待补条数」与「备份后写库」两条路径上的数据库错误。
             print(f"警告：标签迁移失败，本次跳过（下次启动重试）：{error}")
+
+    def _migrate_to_import_batches(self) -> bool:
+        """独立的 2→3 累计迁移；仅加表加列，不新增自动备份。"""
+        try:
+            with self._connect() as connection:
+                # 默认 sqlite3 不会为 DDL 自动开事务，必须先锁定并开启，才能整段回滚。
+                connection.execute("BEGIN IMMEDIATE")
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if version < 2 or version > 3:
+                    return False  # 旧迁移未完成或未来结构，不猜测、不跨级、不降低版本。
+                if version == 2:
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS import_batches ("
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                        "imported_at TEXT NOT NULL, file_name TEXT NOT NULL, "
+                        "note TEXT NOT NULL DEFAULT '', "
+                        "imported_count INTEGER NOT NULL CHECK(imported_count > 0), "
+                        "skipped_count INTEGER NOT NULL CHECK(skipped_count >= 0), "
+                        "non_transaction_count INTEGER NOT NULL "
+                        "CHECK(non_transaction_count >= 0))"
+                    )
+                    columns = {
+                        row[1] for row in connection.execute("PRAGMA table_info(accounts)")
+                    }
+                    if "import_batch_id" not in columns:
+                        # 可空且默认 NULL，让历史行、手动添加及旧版显式列名 INSERT 保持合法。
+                        connection.execute(
+                            "ALTER TABLE accounts ADD COLUMN import_batch_id INTEGER "
+                            "REFERENCES import_batches(id)"
+                        )
+                    connection.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_accounts_import_batch_id "
+                        "ON accounts(import_batch_id)"
+                    )
+                self._validate_import_schema(connection)
+                if version == 2:
+                    # 最后升版本；任何前置 DDL 或此语句失败，都与 schema 一起回滚。
+                    connection.execute(f"PRAGMA user_version = {_SCHEMA_USER_VERSION}")
+            return True
+        except sqlite3.Error as error:
+            print(f"警告：导入批次迁移未就绪，下次启动重试：{error}")
+            return False
+
+    @staticmethod
+    def _validate_import_schema(connection: sqlite3.Connection) -> None:
+        batch_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(import_batches)")
+        }
+        required = {
+            "id", "imported_at", "file_name", "note", "imported_count",
+            "skipped_count", "non_transaction_count",
+        }
+        account_columns = {
+            row[1]: row for row in connection.execute("PRAGMA table_info(accounts)")
+        }
+        column = account_columns.get("import_batch_id")
+        foreign_keys = connection.execute("PRAGMA foreign_key_list(accounts)").fetchall()
+        # 对残缺或人为改过的结构不盲目标记迁移成功，也不重建表覆盖用户现场。
+        valid_reference = any(
+            row[2:5] == ("import_batches", "import_batch_id", "id")
+            for row in foreign_keys
+        )
+        if (
+            not required <= batch_columns or column is None
+            or column[3] or not valid_reference
+        ):
+            raise sqlite3.DatabaseError("导入批次 schema 不完整，不能启用导入。")
+
+    def _require_import_batches(self) -> None:
+        if not self.import_batches_available:
+            raise sqlite3.DatabaseError("导入批次数据库尚未就绪。")
+
+    def list_import_batches(self) -> list[ImportBatch]:
+        self._require_import_batches()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, imported_at, file_name, imported_count, skipped_count, "
+                "non_transaction_count FROM import_batches ORDER BY id DESC"
+            ).fetchall()
+        return [ImportBatch(*row) for row in rows]
+
+    def import_batch(
+        self, records: Iterable[ImportRecord], file_name: str,
+        skipped_count: int = 0, non_transaction_count: int = 0,
+    ) -> ImportBatch | None:
+        """一次事务导入；调用者在提交成功后单独 load/刷新，避免把显示失败当回滚。"""
+        self._require_import_batches()
+        if any(type(count) is not int or count < 0 for count in (
+            skipped_count, non_transaction_count,
+        )):
+            raise ValueError("跳过笔数及非交易行数必须为非负整数。")
+        values = []
+        for record in records:
+            date = datetime.strptime(record.record_date, "%Y-%m-%d").date().isoformat()
+            if not self._is_valid_amount(record.amount):
+                raise ValueError("导入金额必须是有限非零数。")
+            # 按输入小数位严格拦截，包括尾随零；不得靠格式化掩盖超过两位小数的异常。
+            if int(record.amount.as_tuple().exponent) < -2:
+                raise ValueError("超过两位小数的导入金额禁止入账。")
+            values.append((date, f"{record.amount:.2f}", "", record.note.strip()))
+        if not values:
+            return None  # 零笔不创建批次，也不产生空事务。
+        name = Path(file_name).name
+        if not name:
+            raise ValueError("导入文件名不能为空。")
+        imported_at = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "INSERT INTO import_batches (imported_at, file_name, imported_count, "
+                "skipped_count, non_transaction_count) VALUES (?, ?, ?, ?, ?)",
+                (imported_at, name, len(values), skipped_count, non_transaction_count),
+            )
+            batch_id = cursor.lastrowid
+            if batch_id is None:
+                raise sqlite3.DatabaseError("未能取得导入批次 id。")
+            # 一批一次连接、一次提交；默认零标签，不调用逐笔 add 或写 tags.json。
+            connection.executemany(
+                "INSERT INTO accounts "
+                "(record_date, amount, category, note, import_batch_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [(*row, batch_id) for row in values],
+            )
+            result = ImportBatch(
+                batch_id, imported_at, name, len(values),
+                skipped_count, non_transaction_count,
+            )
+        return result  # 只有 commit 成功才返回；缓存及 UI 刷新不在写入事务里。
+
+    def undo_import_batch(self, batch_id: int) -> bool:
+        """原子撤销一个批次；不调用逐笔 delete，不触及任何偏好文件。"""
+        self._require_import_batches()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute(
+                "SELECT 1 FROM import_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+            if exists is None:
+                return False
+            # 导入后可能被编辑并加标签，必须先按当前批次记录清理全部关联，再删主记录。
+            connection.execute(
+                "DELETE FROM record_tags WHERE record_id IN "
+                "(SELECT id FROM accounts WHERE import_batch_id = ?)", (batch_id,),
+            )
+            connection.execute(
+                "DELETE FROM accounts WHERE import_batch_id = ?", (batch_id,),
+            )
+            connection.execute("DELETE FROM import_batches WHERE id = ?", (batch_id,))
+        return True  # 业务层之后 load 一次；任何删除或 commit 失败均不会走到此处。
 
     @staticmethod
     def _group_tags(tag_rows: list[tuple[int, str]]) -> dict[int, tuple[str, ...]]:
@@ -465,8 +621,8 @@ class AccountStore:
             cursor = connection.execute("DELETE FROM accounts WHERE id = ?", (record_id,))
             # rowcount 为 0 说明该 ID 不存在，交由调用方提示「找不到该记录」。
             deleted = cursor.rowcount > 0
-            # 显式清理关联行（§3.14.5）：sqlite3 默认 PRAGMA foreign_keys=OFF，建表时也没写
-            # FOREIGN KEY，所以 ON DELETE CASCADE 根本不会生效，只能自己删。
+            # 显式清理关联行（§3.14.5）：record_tags 没写 FOREIGN KEY，
+            # 即便连接启用批次外键，标签关联也没有 ON DELETE CASCADE，仍须自己删。
             # 只在真的删掉主记录时才清：删不到的路径上不该有任何写操作；
             # 而且 record_tags 里出现孤儿行本身就是「数据出了问题」的信号，
             # 顺手静默清掉会把信号一起抹掉，宁可留着让它暴露。

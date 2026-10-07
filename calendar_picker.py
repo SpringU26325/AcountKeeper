@@ -34,6 +34,7 @@ import customtkinter as ctk
 # config 是叶子模块（不导入任何项目模块），引用它的 RESOURCE_DIR 不会形成循环依赖。
 from config import RESOURCE_DIR
 from dialog_lifecycle import ManagedToplevel
+from popup_common import anchored_position
 
 # 弹窗尺寸：宽度两种模式共用（同一个窗口实例在模式间切换时不改宽度，才不会左右抖动）。
 # 高度按模式区分——日期模式 380 刚好容纳星期表头 + 最多 6 行日期格 + 底部按钮；
@@ -44,12 +45,6 @@ _DIALOG_HEIGHT_MONTH = 300
 # 模式 → 逻辑高度。集中成一张表，将来再加模式只需在这里补一项。
 _DIALOG_HEIGHT_BY_MODE = {"date": _DIALOG_HEIGHT_DATE, "month": _DIALOG_HEIGHT_MONTH}
 
-# 贴输入框弹出的两个几何常量。取值与 tag_picker 的 _GAP_ABOVE / _SCREEN_MARGIN
-# 严格一致：两个 ▼ 的弹窗相邻出现时，缝隙与贴边距离看起来才是同一套规则。
-# 刻意不 import tag_picker 的同名常量——tag_picker 反过来不依赖本模块，
-# 但为两个整数建一条交叉依赖不划算，宁可各自留一份并在这里注明同源。
-_GAP_ABOVE = 6  # 弹窗与输入框之间的竖向缝隙（物理像素）
-_SCREEN_MARGIN = 8  # 贴边保护，避免弹窗压在屏幕边缘上（物理像素）
 
 # 与 dialogs.py 内其他弹窗保持一致的浅色主题配色。
 _BG_COLOR = "#F0F4F8"
@@ -138,7 +133,7 @@ def _anchor_to_input(
 ) -> None:
     """把弹窗贴到 anchor（日期输入框）的左下角，下方放不下时翻到它上方。
 
-    算式逐条照抄 tag_picker._reanchor（横向钳制、竖向翻转、同一组常量），
+    坐标计算与标签、文件共用 anchored_position（横向钳制、竖向翻转），
     两个 ▼ 的行为才会一致。四处刻意偏离它，都是「日历不是下拉列表」带来的：
 
     1. **宽度不跟 anchor**。tag_picker 是列表、宽度与输入框等宽；日历是 7 列
@@ -172,17 +167,11 @@ def _anchor_to_input(
                 screen_height = window.winfo_screenheight()
                 anchor_x = anchor.winfo_rootx()
                 anchor_y = anchor.winfo_rooty()
-                # 左边缘与输入框左边缘对齐；越界时往回收，保证整条弹窗都留在屏幕内。
-                target_x = max(min(anchor_x, screen_width - width - _SCREEN_MARGIN), _SCREEN_MARGIN)
-                target_y = anchor_y + anchor_height + _GAP_ABOVE
-                if target_y + height > screen_height - _SCREEN_MARGIN:
-                    # 下方空间不够就翻到输入框上方；上方也不够时贴着屏幕底边放。
-                    above_y = anchor_y - height - _GAP_ABOVE
-                    target_y = (
-                        above_y
-                        if above_y >= _SCREEN_MARGIN
-                        else max(screen_height - height - _SCREEN_MARGIN, _SCREEN_MARGIN)
-                    )
+                # 共用物理像素算法；日历仍独立决定尺寸和无锚点时的居中兜底。
+                target_x, target_y = anchored_position(
+                    (anchor_x, anchor_y, anchor_height), (width, height),
+                    (screen_width, screen_height),
+                )
                 # 只在位置真的变了才发 wm_geometry：本函数会在「预置坐标」和「尺寸
                 # 变化后的校正」两条路径上被连续调用，少了这个判断就会多一次无谓的
                 # 移动（移动又各自触发 <Configure>）。
@@ -1221,7 +1210,7 @@ def ask_date(parent: tk.Tk | tk.Toplevel, initial_date: str, anchor: tk.Misc | N
         parent: 父窗口，弹窗会以 transient 方式挂在它上面。
         initial_date: 预选日期（YYYY-MM-DD），同时决定初始展示的月份。
         anchor: 锚点控件（日期输入框）：弹窗左边缘与它左边缘对齐、上边缘贴在它
-            下边缘再往下 _GAP_ABOVE 像素，下方放不下时翻到它上方。不传，或传进来
+            下边缘再往下 6 物理像素，下方放不下时翻到它上方。不传，或传进来
             的控件已经不存在时，退回屏幕居中（见 _anchor_to_input）。
 
     Returns:

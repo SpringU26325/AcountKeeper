@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import tkinter as tk
+from typing import Callable
 
 import customtkinter as ctk
+import calendar_picker
+import tag_picker
 
 # 月份选择也走 calendar_picker：本模块原来那份自绘的 CTkEntry 输入框已删除，
 # ask_month 只做一层薄封装。导入时改别名 picker_ask_month，避免与本模块下面
@@ -17,6 +21,7 @@ from calendar_picker import ask_date, ask_month as picker_ask_month
 from config import RESOURCE_DIR
 from dialog_lifecycle import ManagedToplevel
 from store import Account
+from tag_prefs import split_tag_input
 from widgets import TagChipsFrame
 
 
@@ -180,40 +185,349 @@ def ask_month(
     return picker_ask_month(parent, initial_month=initial_month, anchor=anchor, title=title)
 
 
-def ask_edit_record(
-    parent: ctk.CTk,
-    record: Account,
-) -> tuple[str, Decimal, tuple[str, ...], str] | None:
-    """显示预填记录编辑框，并返回通过校验的字段。
+@dataclass
+class _EditSession:
+    parent: tk.Misc
+    record: Account
+    dialog: _EditWindow | None = None
+    signal: tk.BooleanVar | None = None
+    result: tuple[str, Decimal, tuple[str, ...], str] | None = None
+    previous_grab: tk.Misc | None = None
+    open: bool = True
+    ready: bool = False
+    tasks: dict[str, str] = field(default_factory=dict)
+    bindings: list[tuple[tk.Misc, str, str, str]] = field(default_factory=list)
+    child_context: dict[str, object] = field(default_factory=dict)
+    layout_sample: tuple[int, int, int, int] | None = None
 
-    返回值的第三项是标签元组（不是单个字符串）：0 个标签也是合法结果，
-    由调用方原样交给 store.update。
-    标签候选不由调用方传入：点 ▼ 时由 picker 从唯一标签池现算，
-    不随编辑中的金额符号变化；Decimal 与 InvalidOperation 仍用于金额解析和校验。
-    """
-    dialog = ManagedToplevel(parent)
+
+_edit_window: _EditWindow | None = None
+_edit_session: _EditSession | None = None
+
+
+def _edit_alive(widget: tk.Misc | None) -> bool:
+    try:
+        return widget is not None and bool(widget.winfo_exists()) and not getattr(widget, "closing", False)
+    except (tk.TclError, AttributeError):
+        return False  # 构建半途或解释器退出时不得再恢复焦点、grab或复用缓存。
+
+
+def _edit_current(session: _EditSession) -> bool:
+    return _edit_session is session and session.open and _edit_alive(session.dialog)
+
+
+class _EditWindow(ManagedToplevel):
+    date_var: tk.StringVar
+    amount_type_var: tk.StringVar
+    amount_var: tk.StringVar
+    note_var: tk.StringVar
+    error_var: tk.StringVar
+    content: ctk.CTkScrollableFrame
+    tag_chips: _EditChips
+    entries: list[ctk.CTkEntry]
+    buttons: ctk.CTkFrame
+    pick_date: Callable[[], None]
+    cancel: Callable[[], None]
+    confirm: Callable[[], None]
+
+    def __init__(self, parent: tk.Misc, session: _EditSession) -> None:
+        self._edit_built = False
+        self.centered = False
+        session.dialog = self  # 先登记半成品；CTk构造中的update也必须能收到本次取消。
+        super().__init__(parent)
+        self.withdraw()
+        _build_edit_controls(self)
+        self._edit_built = True
+        try:
+            self._windows_set_titlebar_color(self._get_appearance_mode())
+            self.withdraw()  # 标题栏设置可能映射窗口，完整表单预填前仍须隐藏。
+        finally:
+            self.finish_setup()  # 保留#63：构建期关闭先记意图，控件齐备后才真实销毁。
+
+    def _windows_set_titlebar_color(self, color_mode: str) -> None:
+        if self._edit_built and not self.closing:
+            super()._windows_set_titlebar_color(color_mode)  # 参数名沿用父类以兼容关键字调用；延后同步flush，避免半张表单先参与布局。
+
+    def after(self, ms, func=None, *args):
+        if callable(func) and getattr(func, "__name__", "") in ("focus", "focus_set"):
+            session = _edit_session
+            if session is None or session.dialog is not self or not session.ready:
+                return None  # 隐藏标题栏更新不应向旧字段安排焦点恢复。
+            def restore_focus() -> None:
+                func(*args)  # 调度器只负责执行，丢弃Tk回调返回值以保持会话任务的None契约。
+            return _edit_schedule(session, "focus", restore_focus, ms)
+        return super().after(ms, func, *args)  # type: ignore[reportArgumentType] # Tk支持可选回调，转发父类运行时签名。
+
+    def destroy(self) -> None:
+        session = _edit_session
+        if session is not None and session.dialog is self:
+            _end_edit_session(session)  # 即使#63延后真实销毁，也先唤醒独立的会话等待。
+        super().destroy()
+
+    def _on_destroy(self, event: tk.Event) -> None:
+        global _edit_window
+        if event.widget is self:
+            if _edit_window is self:
+                _edit_window = None  # 原生Destroy/创建父窗退出后，下次必须建新缓存。
+            session = _edit_session
+            if session is not None and session.dialog is self:
+                _end_edit_session(session)
+        super()._on_destroy(event)
+
+
+def _edit_bind(session: _EditSession, widget: tk.Misc, sequence: str, callback: Callable[[tk.Event], None]) -> None:
+    def dispatch(event: tk.Event) -> None:
+        if _edit_current(session):
+            callback(event)  # 复用时已排队的旧事件不能改写新记录。
+    funcid = tk.Misc.bind(widget, sequence, dispatch, add="+")
+    if funcid:
+        script = tk.Misc.bind(widget, sequence)
+        own = next(line for line in script.splitlines() if line.startswith('if {"[' + funcid + ' '))
+        guarded = "if {[llength [info commands " + funcid + "]]} { " + own + " }"
+        widget.tk.call("bind", str(widget), sequence, script.replace(own, guarded))
+        session.bindings.append((widget, sequence, funcid, guarded))  # Tcl也检查命令存活，防嵌套事件在解绑后调用死命令。
+
+
+def _edit_schedule(session: _EditSession, key: str, callback: Callable[[], None], ms: int | None = None) -> str | None:
+    if not _edit_current(session):
+        return None
+    dialog = session.dialog
+    assert dialog is not None
+    old = session.tasks.pop(key, None)
+    if old is not None:
+        dialog.after_cancel(old)
+    def run() -> None:
+        session.tasks.pop(key, None)
+        if _edit_current(session):
+            callback()  # 缓存可跨会话，任务只能归当前会话，结束后不得迟到操作下一条。
+    task = dialog.after_idle(run) if ms is None else dialog.after(ms, run)
+    if task is not None:
+        session.tasks[key] = task
+    return task
+
+
+def _close_edit_children(dialog: _EditWindow) -> None:
+    calendar = calendar_picker._ses
+    if calendar is not None and calendar.open and calendar.parent is dialog:
+        calendar_picker._close()  # 只结束本编辑窗的子会话，不清主窗共享的日历缓存。
+    tags = tag_picker._active_picker
+    if tags is not None and tags.parent is dialog:
+        tags.close()  # 必须唤醒内层wait_variable，外层才能退出并开放下一次编辑。
+    for child in tuple(getattr(dialog, "_building_children", ())):
+        child.destroy()  # 子窗构造尚未登记会话时也保留关闭意图，由其finish_setup兑现。
+
+
+def _end_edit_session(session: _EditSession) -> None:
+    if not session.open:
+        return
+    session.open = False  # 先封住迟到回填；重入守卫到公共入口finally才释放。
+    dialog = session.dialog
+    if dialog is not None:
+        _close_edit_children(dialog)
+        for task in session.tasks.values():
+            try:
+                dialog.after_cancel(task)
+            except tk.TclError:
+                pass  # 原生销毁可能已经取消任务，仍要继续唤醒等待。
+        session.tasks.clear()
+    for widget, sequence, funcid, own in session.bindings:
+        try:
+            script = tk.Misc.bind(widget, sequence)
+            widget.tk.call("bind", str(widget), sequence, "\n".join(line for line in script.splitlines() if line != own))
+            widget.deletecommand(funcid)  # 精确删除自己的命令，保留父窗和CTk已有绑定。
+        except tk.TclError:
+            pass  # 父窗销毁后绑定已不存在，不能因此阻塞结束。
+    session.bindings.clear()
+    if dialog is not None and _edit_alive(dialog):
+        if dialog.grab_current() is dialog:
+            dialog.grab_release()  # 只释放自己的grab，不能抢走其它新模态窗的grab。
+        dialog.withdraw()
+    if session.previous_grab is not None and _edit_alive(session.previous_grab):
+        try:
+            if session.previous_grab.winfo_viewable() and session.previous_grab.grab_current() is None:
+                session.previous_grab.grab_set()  # 原持有者仍合法且没人新占用时才归还。
+        except tk.TclError:
+            pass  # 原持有者退出或不可见时不强行归还。
+    if session.signal is not None:
+        try:
+            session.signal.set(True)  # 结果与唤醒信号独立，旧调用只返回自己的结果。
+        except tk.TclError:
+            pass  # 整个Tk解释器关闭时不再有可唤醒的等待。
+
+
+def _prefill_edit(dialog: _EditWindow, record: Account) -> None:
+    dialog.date_var.set(record.record_date)  # 日期从本条记录覆盖，取消后的旧输入也不能留存。
+    valid = record.amount.is_finite() and record.amount != 0
+    dialog.amount_type_var.set("支出" if not valid or record.amount < 0 else "收入")  # 方向独立复位，不借主窗或上次编辑值。
+    dialog.amount_var.set(f"{abs(record.amount):.2f}" if valid else str(record.amount))  # 非有限历史值保留修正入口，不比较NaN。
+    dialog.tag_chips.set_tags(record.tags)  # 同时清手输残留和旧chips，再按本条记录顺序重建。
+    dialog.note_var.set(record.note)  # 空备注也必须覆盖，不能用“非空才填”造成串记录。
+    dialog.error_var.set("")  # 校验提示属于上次输入，新的完整会话没有旧错误。
+    for entry in dialog.entries:
+        entry._entry.selection_clear()
+        entry._entry.icursor(0)  # 复用输入框还保留选择/光标，须与首次打开一致。
+        entry._entry.xview_moveto(0)
+    dialog.tag_chips.chips_view._parent_canvas.yview_moveto(0)  # 短列表也归顶；布局结束后再归顶一次防旧滚动区域影响。
+    dialog.content._parent_canvas.yview_moveto(0)  # 大缩放的整表视口也从日期开始，不沿用旧滚动位置。
+
+
+class _EditChips(TagChipsFrame):
+    def _schedule_relayout(self) -> None:
+        self.chips_view.grid()
+        self.chips_frame.grid()
+        session = _edit_session
+        if session is not None:
+            _edit_schedule(session, "chips", self._relayout_tags)  # 合并批量chips任务，关闭即取消，旧便条不跨会话。
+
+    def _pick_tags(self) -> None:
+        session = _edit_session
+        if session is None or not _edit_current(session):
+            return
+        dialog = session.dialog
+        assert dialog is not None
+        try:
+            picked = tag_picker.ask_tags(dialog, self.tag_entry, self.tag_entry.get(),
+                                         toggle_button=self.tag_button, selected_tags=self.get_tags())
+        finally:
+            if _edit_current(session) and dialog.grab_current() is None:
+                dialog.grab_set()  # 标签子会话归还后再确认编辑会话有效，不抢别人的新grab。
+        if picked is not None and _edit_current(session):
+            session.child_context["tags"] = picked
+            final = tuple(dict.fromkeys((*picked, *split_tag_input(self.tag_entry.get()))))
+            self.set_tags(final)  # 只有原编辑会话仍有效才回填，关闭后的子结果必须丢弃。
+
+
+def _resize_edit(session: _EditSession) -> None:
+    dialog = session.dialog
+    assert dialog is not None
+    scale = ctk.ScalingTracker.get_window_scaling(dialog)
+    padding = 40 * ctk.ScalingTracker.get_widget_scaling(dialog.content)
+    height = int((dialog.content.winfo_reqheight() + padding) / scale + .5)
+    _parent, work, _fallback = _parent_work_area(session.parent)
+    _hwnd, outer = _native_window_rect(dialog)
+    decoration = outer.bottom - outer.top - dialog.winfo_height()
+    maximum = max(360, int((work.bottom - work.top - decoration) / scale))
+    height = max(360, min(height, maximum))  # 内容高度每次重算并按本父窗所在屏幕钳制，不沿用旧chips高度。
+    if dialog.content.winfo_reqheight() + padding > height * scale:
+        dialog.content._scrollbar.grid()  # 工作区容不下整表时允许滚动，不能把备注/确定按钮永久裁掉。
+    else:
+        dialog.content._scrollbar.grid_remove()  # 正常高度不占滚动条宽度，保持#24金额行和原表单布局。
+    dialog.maxsize(460, maximum)
+    if abs(dialog.winfo_height() - round(height * scale)) > 1 or abs(dialog.winfo_width() - round(460 * scale)) > 1:
+        dialog.geometry(f"460x{height}")  # 已有显式WM尺寸不能靠pack自然撑开；只改高，不重新居中。
+
+
+def _clamp_edit(dialog: _EditWindow, parent: tk.Misc) -> None:
+    _parent, work, _fallback = _parent_work_area(parent)
+    hwnd, rect = _native_window_rect(dialog)
+    x = min(max(rect.left, work.left), max(work.left, work.right - (rect.right - rect.left)))
+    y = min(max(rect.top, work.top), max(work.top, work.bottom - (rect.bottom - rect.top)))
+    if (x, y) != (rect.left, rect.top):
+        ctypes.windll.user32.SetWindowPos(wintypes.HWND(hwnd), None, x, y, 0, 0, 0x0015)  # 增高越界只作最小位移，保留用户拖动位置。
+
+
+def _layout_edit(session: _EditSession) -> None:
+    if not _edit_current(session):
+        return
+    dialog = session.dialog
+    assert dialog is not None
+    _resize_edit(session)
+    sample = (dialog.winfo_width(), dialog.winfo_height(), dialog.content.winfo_reqheight(), dialog.tag_chips._layout_rows)
+    if session.layout_sample != sample or not all(entry.winfo_ismapped() for entry in dialog.entries):
+        session.layout_sample = sample
+        _edit_schedule(session, "layout", lambda: _layout_edit(session))
+        return  # 两次idle几何一致后才露出，alpha=0覆盖旧尺寸和新尺寸之间的整段变化。
+    if session.ready:
+        _clamp_edit(dialog, session.parent)
+        return  # 同会话chips变化也等请求尺寸传播完，不重置焦点/滚动，更不重新居中。
+    if not dialog.centered:
+        if not center_dialog_on_parent(session.parent, dialog) or not _edit_current(session):
+            _end_edit_session(session)
+            return
+        dialog.centered = True  # 首次完整布局才居中；之后复开和chips变化都保留原位置。
+    else:
+        _clamp_edit(dialog, session.parent)
+        dialog.attributes("-alpha", 1.0)
+    dialog.tag_chips.chips_view._parent_canvas.yview_moveto(0)
+    dialog.content._parent_canvas.yview_moveto(0)
+    dialog.entries[0].focus_set()  # 每次会话回到日期；不会继承上次备注或子窗焦点。
+    dialog.grab_set()
+    session.ready = True
+
+
+def _chips_edit_height() -> None:
+    session = _edit_session
+    if session is not None and session.ready:
+        session.layout_sample = None
+        _edit_schedule(session, "layout", lambda: _layout_edit(session))  # 同会话增删合并重算，等待整表请求高度传播，不清子窗上下文。
+
+
+def ask_edit_record(parent: ctk.CTk, record: Account) -> tuple[str, Decimal, tuple[str, ...], str] | None:
+    global _edit_session, _edit_window
+    if _edit_session is not None or not _edit_alive(parent):
+        return None  # 模态编辑拒绝重入；不接管、不弹第二层提示、不丢未保存输入。
+    session = _EditSession(parent, replace(record))  # 保留调用瞬间记录快照，构造中Tk回调不能改掉本次预填来源。
+    _edit_session = session  # 必须早于变量创建、建窗及所有Tk update登记守卫。
+    try:
+        session.signal = tk.BooleanVar(master=parent)
+        held = parent.grab_current()
+        if held is not None and _edit_alive(held) and held.winfo_viewable() and held.winfo_toplevel() is parent.winfo_toplevel():
+            session.previous_grab = held  # 只借当前父窗控件树的合法grab。
+        if _edit_window is None or not _edit_alive(_edit_window) or not _edit_alive(_edit_window.master):
+            if _edit_window is not None:
+                _edit_window.destroy()
+            _edit_window = _EditWindow(parent, session)
+        dialog = _edit_window
+        assert dialog is not None
+        session.dialog = dialog
+        if not _edit_current(session):
+            return None
+        _edit_bind(session, parent, "<Destroy>", lambda event: _end_edit_session(session) if event.widget is parent else None)
+        dialog.attributes("-alpha", 0.0)
+        dialog.withdraw()
+        if str(dialog.transient()) != str(parent):
+            dialog.transient(parent)
+        _close_edit_children(dialog)
+        session.child_context.clear()  # 只在编辑会话开始清一次；同会话反复点▼不清上下文，也不销毁共享选择器缓存。
+        _prefill_edit(dialog, session.record)
+        dialog.deiconify()
+        _edit_schedule(session, "layout", lambda: _layout_edit(session))
+        signal = session.signal
+        assert signal is not None
+        if not signal.get():
+            parent.wait_variable(signal)  # 缓存窗口不销毁，等待的是本次独立结束信号。
+        return session.result
+    except BaseException:
+        if session.dialog is not None and _edit_alive(session.dialog):
+            session.dialog.finish_setup()
+            session.dialog.destroy()  # 构建异常也释放#63半成品登记，不能永久占住父窗与缓存。
+        raise
+    finally:
+        _end_edit_session(session)
+        _edit_session = None  # 子窗wait和公共调用完全退栈后，才接受下一条记录。
+
+
+def _build_edit_controls(dialog: _EditWindow) -> None:
     dialog.attributes("-alpha", 0.0)  # 隐藏初始布局和定位过程，避免先在系统默认位置闪现。
     dialog.title("编辑记录")
     dialog.minsize(460, 360)
     dialog.maxsize(460, _edit_dialog_max_height(dialog))
     # 直接设 Tk 的可调整状态，避免 CTk 覆写额外安排异步标题栏重绘回调。
     tk.Wm.resizable(dialog, False, True)
-    dialog.transient(parent)
     dialog.configure(fg_color="#F0F4F8")
     _apply_app_icon(dialog)
 
     dialog_font = ("Microsoft YaHei UI", 11)
     title_font = ("Microsoft YaHei UI", 13, "bold")
-    # 用单元素列表承载返回值，闭包函数 confirm 可以直接写入。
-    # #58 Step 3a：第三项由单个字符串改为标签元组，与 ask_edit_record 的返回注记一致。
-    result: list[tuple[str, Decimal, tuple[str, ...], str] | None] = [None]
-    # 四个字段都用当前记录值预填，用户只需改动需要修改的部分，减少重复输入。
-    date_var = tk.StringVar(value=record.record_date)
-    # 金额统一显示为两位小数，与表格中的显示格式保持一致。
-    amount_var = tk.StringVar(value=f"{record.amount:.2f}")
-    note_var = tk.StringVar(value=record.note)
+    # 变量只属缓存控件；每次会话覆盖其值，既不抓旧record，也不借主窗下一笔录入状态。
+    date_var = dialog.date_var = tk.StringVar(master=dialog)
+    amount_type_var = dialog.amount_type_var = tk.StringVar(master=dialog, value="支出")
+    amount_var = dialog.amount_var = tk.StringVar(master=dialog)
+    note_var = dialog.note_var = tk.StringVar(master=dialog)
 
-    content = ctk.CTkFrame(dialog, fg_color="transparent")
+    content = ctk.CTkScrollableFrame(dialog, fg_color="transparent", corner_radius=0, height=1)
+    content._scrollbar.configure(height=0)
+    content._scrollbar.grid_remove()  # 仅高度受工作区限制时启用整表滚动，通常场景仍是完整静态表单。
     content.pack(fill="both", expand=True, padx=24, pady=20)
     ctk.CTkLabel(
         content,
@@ -222,8 +536,8 @@ def ask_edit_record(
         text_color="#243447",
     ).pack(anchor="w")
 
-    tag_chips = TagChipsFrame(content, on_layout_change=None)
-    tag_chips.set_tags(record.tags)
+    dialog.content = content
+    tag_chips = dialog.tag_chips = _EditChips(content, on_layout_change=_chips_edit_height)  # type: ignore[reportArgumentType] # TagChipsFrame把master限为CTkBaseClass，但可滚动Frame是合法Tk容器，运行时支持此父窗。
 
     fields: tuple[tuple[str, tk.StringVar | TagChipsFrame], ...] = (
         ("日期", date_var),
@@ -234,23 +548,24 @@ def ask_edit_record(
 
     def _pick_date() -> None:
         """打开日历选择器，把选中的日期回填到日期输入框（需求 3.12）。"""
-        # anchor 传日期输入框本体：日历会贴着它弹出，而不是摆到屏幕中心。
-        # 日期框是 entries 里的第一个（见下面 for 循环里那个 continue——
-        # 日期行单独 append 后就跳过了剩余分支），而本闭包在定义时 entries
-        # 还空着，所以必须按**调用时**求值的 entries[0] 取，不能提前存变量；
-        # 空列表守卫只是防“字段配置被改得没有日期行”这种将来才会发生的事。
-        picked = ask_date(
-            dialog,
-            date_var.get().strip(),
-            anchor=entries[0] if entries else None,
-        )
+        session = _edit_session
+        if session is None or not _edit_current(session):
+            return
+        try:
+            picked = ask_date(dialog, date_var.get().strip(), anchor=entries[0])  # 调用时取日期框锚点，保留当前输入和贴靠位置。
+        finally:
+            if _edit_current(session) and dialog.grab_current() is None:
+                dialog.grab_set()  # 日历退出释放grab后，归还给仍有效的本次编辑会话。
         # 返回 None 表示用户取消/按 ESC，此时保持输入框原值不变。
-        if picked:
+        if picked and _edit_current(session):
+            session.child_context["date"] = picked  # 保存的是本次子调用结果，旧会话返回不许覆盖新日期。
             date_var.set(picked)
 
     # 按顺序收集输入框，用于最后把焦点落到第一个字段上。
     # 只有日期、金额、备注是 CTkEntry；标签 chips 不进列表，首项仍是日期框。
     entries: list[ctk.CTkEntry] = []
+    dialog.entries = entries
+    dialog.pick_date = _pick_date
     for label, value in fields:
         ctk.CTkLabel(
             content,
@@ -301,6 +616,37 @@ def ask_edit_record(
             entries.append(entry)
             continue
 
+        if label == "金额":
+            # 标签仍在上方；412px 行宽扣除120px按钮和12px间距，金额外框获得280px。
+            amount_row = ctk.CTkFrame(content, fg_color="transparent", corner_radius=0)
+            amount_row.pack(fill="x")
+            amount_row.columnconfigure(0, weight=1)
+            # 40px外框包住38px输入框，与主窗尺寸一致，不增加一行挤压标签/备注。
+            amount_surface = ctk.CTkFrame(
+                amount_row, height=40, corner_radius=8, border_width=1,
+                border_color="#D8E1EA", fg_color="#F8FAFC",
+            )
+            amount_surface.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+            amount_surface.columnconfigure(0, weight=1)
+            entry = ctk.CTkEntry(
+                amount_surface, textvariable=value, width=1, height=38,
+                corner_radius=0, border_width=0, fg_color="#F8FAFC",
+                text_color="#243447", font=dialog_font,
+            )
+            entry.grid(row=0, column=0, sticky="ew", padx=(9, 6), pady=1)
+            entries.append(entry)
+            # 切换只表达本窗意图，不改金额文本；符号统一在确认时转换。
+            # 中间圆角填色须与本行实际背景一致，照搬主窗白色会在灰底编辑窗露出白缝。
+            ctk.CTkSegmentedButton(
+                amount_row, values=["支出", "收入"], variable=amount_type_var,
+                width=120, height=40, dynamic_resizing=False, corner_radius=8,
+                border_width=0, fg_color=amount_row.cget("bg_color"), font=dialog_font,
+                selected_color="#CFE0F8", selected_hover_color="#BFD6F5",
+                unselected_color="#F0F3F7", unselected_hover_color="#E2E8F0",
+                text_color="#243447",
+            ).grid(row=0, column=1)
+            continue
+
         # 这里的输入框不需要 placeholder_text，因此可以放心使用 textvariable 双向绑定。
         entry = ctk.CTkEntry(
             content,
@@ -315,7 +661,7 @@ def ask_edit_record(
         entry.pack(fill="x")
         entries.append(entry)
 
-    error_var = tk.StringVar()
+    error_var = dialog.error_var = tk.StringVar(master=dialog)
     ctk.CTkLabel(
         content,
         textvariable=error_var,
@@ -324,25 +670,33 @@ def ask_edit_record(
     ).pack(anchor="w", pady=(5, 0))
 
     buttons = ctk.CTkFrame(content, fg_color="transparent")
+    dialog.buttons = buttons
     buttons.pack(fill="x", pady=(10, 0))
     # 两列等宽，保证两个按钮左右对称。
     buttons.grid_columnconfigure((0, 1), weight=1)
+
+    def close_dialog() -> None:
+        session = _edit_session
+        if session is not None and session.dialog is dialog:
+            _end_edit_session(session)  # 正常结束只隐藏，真正销毁才交给ManagedToplevel。
 
     def cancel() -> None:
         if dialog.closing:
             return  # 构建期间已收到关闭请求，不再重复确认或取消。
         # 返回 None 表示取消，调用方据此不做任何更新。
-        dialog.destroy()
+        close_dialog()
 
     def confirm() -> None:
-        if dialog.closing:
+        session = _edit_session
+        if session is None or session.dialog is not dialog or not _edit_current(session):
             return  # 取消先到时，后续回车不能再改写返回结果。
         try:
             # 日期格式与金额合法性同时校验，任一失败都走统一的错误提示。
             parsed_date = datetime.strptime(
                 date_var.get().strip(), "%Y-%m-%d"
             ).date()
-            parsed_amount = Decimal(amount_var.get().strip())
+            # 与添加区同链：手输负号也只表示金额大小，最终方向由本窗按钮决定。
+            parsed_amount = abs(Decimal(amount_var.get().strip()))
             # Decimal("nan") / Decimal("Infinity") 解析本身不会报错，但入库后任何金额大小比较
             # 都会抛 InvalidOperation，所以和新增记录一样在入口处就拒收非有限数。
             # 这一层同时还承担"自我纠错"：用户编辑那条历史 NaN 记录时，必须先改成合法数字。
@@ -351,21 +705,24 @@ def ask_edit_record(
         except (ValueError, InvalidOperation):
             error_var.set("日期格式应为 YYYY-MM-DD，金额必须是数字。")
             return
+        # 仅在提交逻辑赋符号，保持调用方和数据层只接收统一的带符号 Decimal。
+        if amount_type_var.get() == "支出":
+            parsed_amount = -parsed_amount
         # #58 Step 3a：标签改为多值，而且 0 个标签是合法的（§3.14.4 需答 Q2），
         # 所以「标签非空」这条校验连同提示里的那半句一起删除；留下的
         # 「金额不能为 0」是数据层也认的业务约束。
         if parsed_amount == 0:
-            error_var.set("金额不能为 0；正数表示收入，负数表示支出。")
+            error_var.set("金额不能为0，收支由按钮决定")
             return
         parsed_tags = tag_chips.collect_tags()
-        # 金额保持用户填写的正负号，因此编辑时可直接切换收入/支出属性。
-        result[0] = (
+        # 返回结构不变，原调用方直接 update；按钮切换本身不写库。
+        session.result = (
             parsed_date.isoformat(),
             parsed_amount,
             parsed_tags,
             note_var.get().strip(),
         )
-        dialog.destroy()
+        close_dialog()
 
     ctk.CTkButton(
         buttons,
@@ -393,14 +750,8 @@ def ask_edit_record(
     dialog.protocol("WM_DELETE_WINDOW", cancel)
     dialog.bind("<Return>", lambda _event: confirm())
     dialog.bind("<Escape>", lambda _event: cancel())
-    dialog.finish_setup()
-    if dialog.closing or not center_dialog_on_parent(parent, dialog):
-        return None  # 初始化期间被关闭，不再给已销毁窗口设置焦点或 grab。
-    entries[0].focus_set()
-    # 锁住焦点并阻塞等待，确保返回的编辑结果一定已经由用户确认。
-    dialog.grab_set()
-    parent.wait_window(dialog)
-    return result[0]
+    dialog.cancel = cancel
+    dialog.confirm = confirm
 
 
 def confirm_delete(parent: ctk.CTk) -> bool:

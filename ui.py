@@ -186,7 +186,7 @@ class AccountKeeperApp(ctk.CTk):
 
         # 表格是唯一始终占据剩余空间的区域，用 expand=True 保证窗口拉大时表格跟着变大。
         self.table_frame = RecordTableFrame(self, self.edit_record)
-        self.table_frame.pack(fill="both", expand=True, padx=24, pady=(0, 0))
+        self.table_frame.pack(fill="both", expand=True, padx=24, pady=(0, 8))
         self.tree = self.table_frame.tree
         # 单选、取消选择及重建列表都同步按钮，避免操作上一轮筛选留下的记录。
         self.tree.bind("<<TreeviewSelect>>", self._sync_record_actions, add="+")
@@ -214,10 +214,12 @@ class AccountKeeperApp(ctk.CTk):
         # 直接读输入框内容而不是 search_var：粘贴（尤其右键粘贴）只改控件内容、不产生按键事件，
         # 依赖变量会读到过期值，表现为"粘进去的文字筛不出结果"。
         keyword = self.search_entry.get().strip().lower()
-        # Treeview 不支持增量更新，只能先清空再按当前条件重新插入。
+        # 先清提示和完整标签映射，重建后同一个iid不能沿用旧会话的数据。
+        self.table_frame.clear_records()
         for item in self.tree.get_children():
             self.tree.delete(item)
         # 按日期倒序 + ID 倒序排列，让最新记录总是出现在最上面。
+        visible_row = 0  # 条纹按筛选后顺序计数，不能按主键奇偶给行着色。
         for record in sorted(
             self.store.records,
             key=lambda item: (item.record_date, item.record_id),
@@ -236,21 +238,20 @@ class AccountKeeperApp(ctk.CTk):
                 "",
                 "end",
                 iid=str(record.record_id),
+                tags=("stripe",) if visible_row % 2 else (),
                 values=(
                     record.record_date,
                     f"{record.amount:.2f}",
-                    # #58 Step 2c-2：多标签用预定义分隔符「、」连接成一个单元格字符串
-                    # （§3.14.4 的表格口径）。
-                    # #58 Step 3a：0 标签时显示「—」而不是空串——空格子分不出
-                    # 「这条记录没有标签」和「这一列没渲染出来」。
-                    # 判定只看 record.tags，不看数据库里遗留的 accounts.category 列：
-                    # 那一列自 Step 2c-2 起已不再参与展示。
-                    "、".join(record.tags) if record.tags else "—",
+                    # 摘要只在widgets表现层产生；搜索/编辑仍读取完整的缓存tuple。
+                    self.table_frame.set_record_tags(str(record.record_id), record.tags),
                     record.note,
                 ),
             )
+            visible_row += 1
 
         self._sync_record_actions()
+
+        self.table_frame.tag_badges.request()  # 插入完成后再测量可见行，避免逐行触发布局。
 
     def _selected_record_id(self) -> int | None:
         selected = self.tree.selection()

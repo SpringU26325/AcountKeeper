@@ -48,6 +48,7 @@ from tag_prefs import build_tag_candidates, delete_tag, move_tag_to_top, save_ta
 # config 是叶子模块（不导入任何项目模块），引用它的 RESOURCE_DIR 不会形成循环依赖。
 from config import RESOURCE_DIR
 from dialog_lifecycle import ManagedToplevel
+from popup_common import anchored_position
 
 # 与 calendar_picker.py / dialogs.py 的弹窗保持同一套浅色主题配色。
 _BG_COLOR = "#F0F4F8"
@@ -115,9 +116,7 @@ _TOGGLE_TEXT_OPEN = "▲"
 # 表现成「最后一行露一半、要滚动才看得全」。
 _LIST_CORNER_RADIUS = 8
 _PAD = 10  # 弹窗四周内边距
-_GAP_ABOVE = 6  # 弹窗与输入框之间的竖向缝隙
 _MIN_WIDTH = 180  # 输入框窄到离谱时的兜底宽度（逻辑像素）
-_SCREEN_MARGIN = 8  # 贴边保护，避免弹窗压在屏幕边缘上
 _POLL_INTERVAL_MS = 50  # 复查锚点位置的轮询间隔（Windows 下窗口移动是异步的）
 
 
@@ -697,13 +696,11 @@ def _reanchor(_event: tk.Event | None = None) -> None:
     width = max(anchor.winfo_width(), int(round(_MIN_WIDTH * scaling)))
     height = int(round(session.height * _window_scaling(dialog)))
     # 位置及宽高全部用物理像素，wm_geometry绕过CTk缩放，隐藏时不读取上次可见尺寸。
-    x = max(_SCREEN_MARGIN, min(anchor.winfo_rootx(), dialog.winfo_screenwidth() - width - _SCREEN_MARGIN))
-    y = anchor.winfo_rooty() + anchor.winfo_height() + _GAP_ABOVE
-    if y + height > dialog.winfo_screenheight() - _SCREEN_MARGIN:
-        above = anchor.winfo_rooty() - height - _GAP_ABOVE
-        y = above if above >= _SCREEN_MARGIN else max(
-            dialog.winfo_screenheight() - height - _SCREEN_MARGIN, _SCREEN_MARGIN
-        )
+    # 只抽取重复坐标公式，标签自己的宽度、会话及轮询机制保持原有语义。
+    x, y = anchored_position(
+        (anchor.winfo_rootx(), anchor.winfo_rooty(), anchor.winfo_height()),
+        (width, height), (dialog.winfo_screenwidth(), dialog.winfo_screenheight()),
+    )
     target = (width, height, x, y)
     if target != session.last_target:
         session.last_target = target  # 与上次目标比较，避免异步wm几何查询造成Configure循环。
