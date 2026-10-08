@@ -1,0 +1,439 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "rule_id": "state-001",
+      "value_set": [
+        "支付成功"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "未知",
+      "source": "真实样例",
+      "audited": false,
+      "provenance": [
+        "微信个人账单实测"
+      ]
+    },
+    {
+      "rule_id": "state-002",
+      "value_set": [
+        "已存入零钱"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "未知",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-003",
+      "value_set": [
+        "交易成功"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "未知",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-004",
+      "value_set": [
+        "已收钱"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "未知",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-005",
+      "value_set": [
+        "交易已完成"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "未知",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "草稿"
+      ]
+    },
+    {
+      "rule_id": "state-006",
+      "value_set": [
+        "不计收支"
+      ],
+      "field_scope": null,
+      "action": "跳过",
+      "reason_category": "中性交易",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-007",
+      "value_set": [
+        "充值"
+      ],
+      "field_scope": "trade_type",
+      "action": "跳过",
+      "reason_category": "中性交易",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-008",
+      "value_set": [
+        "提现"
+      ],
+      "field_scope": "trade_type",
+      "action": "跳过",
+      "reason_category": "中性交易",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-009",
+      "value_set": [
+        "零钱提现"
+      ],
+      "field_scope": "trade_type",
+      "action": "跳过",
+      "reason_category": "中性交易",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-010",
+      "value_set": [
+        "信用卡还款"
+      ],
+      "field_scope": "trade_type",
+      "action": "跳过",
+      "reason_category": "中性交易",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-011",
+      "value_set": [
+        "转账"
+      ],
+      "field_scope": "trade_type",
+      "action": "跳过",
+      "reason_category": "中性交易",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-012",
+      "value_set": [
+        "账户转存"
+      ],
+      "field_scope": "trade_type",
+      "action": "跳过",
+      "reason_category": "中性交易",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-013",
+      "value_set": [
+        "理财通购买"
+      ],
+      "field_scope": "trade_type",
+      "action": "跳过",
+      "reason_category": "中性交易",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-014",
+      "value_set": [
+        "零钱通存取"
+      ],
+      "field_scope": "trade_type",
+      "action": "跳过",
+      "reason_category": "中性交易",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-015",
+      "value_set": [
+        "转入代发"
+      ],
+      "field_scope": "status",
+      "action": "跳过",
+      "reason_category": "中性交易",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-016",
+      "value_set": [
+        "交易关闭"
+      ],
+      "field_scope": "status",
+      "action": "跳过",
+      "reason_category": "失败关闭",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-017",
+      "value_set": [
+        "已关闭"
+      ],
+      "field_scope": "status",
+      "action": "跳过",
+      "reason_category": "失败关闭",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-018",
+      "value_set": [
+        "支付失败"
+      ],
+      "field_scope": "status",
+      "action": "跳过",
+      "reason_category": "失败关闭",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-019",
+      "value_set": [
+        "交易失败"
+      ],
+      "field_scope": "status",
+      "action": "跳过",
+      "reason_category": "失败关闭",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-020",
+      "value_set": [
+        "TRADE_CLOSED"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "未知（关闭语义歧义）",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "支付宝开放平台文档"
+      ]
+    },
+    {
+      "rule_id": "state-021",
+      "value_set": [
+        "已全额退款"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "退款",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-022",
+      "value_set": [
+        "已成功部分退款"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "退款",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-023",
+      "value_set": [
+        "部分退款"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "退款",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "草稿"
+      ]
+    },
+    {
+      "rule_id": "state-024",
+      "value_set": [
+        "退款失败"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "退款",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-025",
+      "value_set": [
+        "退款处理中"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "退款",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-026",
+      "value_set": [
+        "退款成功"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "退款",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-027",
+      "value_set": [
+        "REFUND_SUCCESS"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "退款",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "支付宝开放平台文档"
+      ]
+    },
+    {
+      "rule_id": "state-028",
+      "value_set": [
+        "REFUND_CLOSED"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "退款",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "支付宝开放平台文档"
+      ]
+    },
+    {
+      "rule_id": "state-029",
+      "value_set": [
+        "REFUNDING"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "退款",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "rule_id": "state-030",
+      "value_set": [
+        "REFUNDCLOSE"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "退款",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "微信商户文档"
+      ]
+    },
+    {
+      "rule_id": "state-031",
+      "value_set": [
+        "CHANGE"
+      ],
+      "field_scope": "status",
+      "action": "待确认",
+      "reason_category": "退款",
+      "source": "公开资料",
+      "audited": false,
+      "provenance": [
+        "微信商户文档"
+      ]
+    }
+  ]
+}

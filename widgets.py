@@ -1,4 +1,10 @@
-"""Reusable user-interface frames for AccountKeeper."""
+"""主页面及编辑窗共用的输入控件、工具栏与记录表格，只管理表现层状态。
+
+输入控件收集金额大小和收支意图，符号转换及写入分别由 ui/dialogs 的提交入口处理。
+RecordTableFrame 保存当前表格行的完整标签映射；Treeview 的标签值仅是显示摘要。
+摘要和徽标预算共用 table_tag_badges.tag_layout，tooltip 直接读取完整元组。
+表格相关验收入口为 _probe/probe_table_visuals.py，布局入口为 _probe/probe_main_layout.py。
+"""
 
 from __future__ import annotations
 
@@ -19,12 +25,12 @@ from popup_common import make_toggle_button
 # 候选读取与偏好写入只在 tag_prefs 维护；UI 不缓存标签池，避免多处实现漂移。
 from tag_picker import ask_tags
 # 手输的多标签要按顿号拆开，拆分与清理规则（strip / 去空 / 首次出现去重）
-# 与偏好层共用一份实现：#58 Step 3a 新增，避免这里再抄一遍口径、两处迟早漂开。
+# 新增区与编辑区共用一份拆分实现，避免手输标签的去空、去重口径漂移。
 from tag_prefs import split_tag_input
 from table_tag_badges import TagBadgeRenderer, tag_layout
 
 # ---------- 标签 chips 区的几何常量（需求 3.14.3 形态 1） ----------
-# 一颗 chip 的高度与圆角：28 + 圆角 14 刚好是「药丸」形，也比一行输入框（36）矮，
+# 一颗 chip 的高度与圆角：28 + 圆角 14 刚好是「药丸」形，也比一行输入框（38）矮，
 # 一眼能看出它是可以点掉的小标，而不是输入框。
 _CHIP_HEIGHT = 28
 _CHIP_CORNER_RADIUS = 14
@@ -64,7 +70,7 @@ def _field_column(master: ctk.CTkFrame, title: str) -> ctk.CTkFrame:
 
 
 class TagChipsFrame(ctk.CTkFrame):
-    """标签 chips、输入框与多选入口组成的可复用控件。"""
+    """维护当前输入的标签副本；增删 chip 不修改账本记录或常用标签池。"""
 
     def __init__(
         self,
@@ -74,8 +80,8 @@ class TagChipsFrame(ctk.CTkFrame):
         placeholder_text: str | None = None,
     ) -> None:
         super().__init__(master, fg_color="transparent", corner_radius=0)
-        self._tags: list[str] = []
-        self._tag_buttons: dict[str, ctk.CTkButton] = {}
+        self._tags: list[str] = []  # 保留输入/选择顺序，提交时导出 tuple，不向外暴露可变列表。
+        self._tag_buttons: dict[str, ctk.CTkButton] = {}  # 名称同时是去重身份和控件查找键。
         self._chips_width = -1
         # 高度重算只关心实际行数变化；宽度变化但仍排成相同行数时无需通知外层。
         self._layout_rows = 0
@@ -179,6 +185,7 @@ class TagChipsFrame(ctk.CTkFrame):
                 button = self._tag_buttons.get(tag)
                 if button is None:
                     continue
+                # 标签名完整保留，以控件请求宽度决定换行，不用字符个数猜中英文字宽。
                 need = button.winfo_reqwidth() + _CHIP_GAP_X
                 if column and width and used + need > width:
                     row += 1
@@ -208,7 +215,7 @@ class TagChipsFrame(ctk.CTkFrame):
                 self._on_layout_change()
 
     def _chips_available_width(self) -> int:
-        """返回 chips 可用宽度；尚未映射时用 0 表示暂不换行。"""
+        """优先取已布局容器宽度；都只有初始 1px 时用 0 表示暂不换行。"""
         for widget in (self.chips_frame, self):
             width = widget.winfo_width()
             if width > 1:
@@ -250,6 +257,7 @@ class TagChipsFrame(ctk.CTkFrame):
         )
         if picked is None:
             return
+        # 选择器等待会处理事件，完成后再读手输残留；取消则不改当前输入。
         typed = split_tag_input(self.tag_entry.get())
         final = tuple(dict.fromkeys((*picked, *typed)))
         self.clear_tags()
@@ -346,7 +354,7 @@ class InputFrame(ctk.CTkFrame):
 
 
 class ToolbarFrame(ctk.CTkFrame):
-    """全局工具与选中记录操作分成两行，减少按钮堆叠。"""
+    """分两行呈现全局工具与记录操作；业务和选中主键由主窗口回调管理。"""
 
     def __init__(
         self, master: ctk.CTk, filter_callback: Callable[..., None],
@@ -427,13 +435,14 @@ class ToolbarFrame(ctk.CTkFrame):
 
 
 def summarize_tags(tags: tuple[str, ...], width: int, font: tkfont.Font, scale: float = 1.0) -> str:
+    """把共用布局结果转为原生 cell 摘要，N=0 时保留 +总数而不截断标签名。"""
     prefix, rest = tag_layout(tags, width, font, scale)
     # 原生值保留同一摘要语义；Canvas只改变视觉，不能靠解析字符串还原标签。
     return f"{prefix}{' ' if prefix else ''}+{rest}" if rest else prefix
 
 
 class RecordTableFrame(ctk.CTkFrame):
-    """Record table and its scrollbar."""
+    """承接 ui 的行插入，协调完整标签映射、原生摘要、徽标和悬停提示。"""
 
     def __init__(self, master: ctk.CTk, edit_callback: Callable[[tk.Event], None]) -> None:
         super().__init__(
@@ -470,6 +479,7 @@ class RecordTableFrame(ctk.CTkFrame):
         style.layout("Account.Treeview.Heading", [("Account.Treeheading.cell", {"sticky": "nswe"}),
             ("Account.Treeheading.border", {"sticky": "nswe", "children": [
                 ("Treeheading.padding", {"sticky": "nswe", "children": [("Treeheading.text", {"sticky": "we"})]})]})])
+        # 保留可更新的字体对象供测量/Canvas/tooltip 共用，参数由 _style_table 与原生行同步。
         self.tag_font = tkfont.Font(root=self, family="Microsoft YaHei UI", size=-12)
         self._style_table()
         self.tree = ttk.Treeview(
@@ -479,6 +489,7 @@ class RecordTableFrame(ctk.CTkFrame):
             selectmode="browse",
             style="Account.Treeview",
         )
+        # 仅映射当前插入行的 iid→完整标签，值来自 store 缓存；筛选重建时清空，不解析 cell 文本。
         self.record_tags: dict[str, tuple[str, ...]] = {}
         self.tree.tag_configure("stripe", background="#F7FAFD")
         # show="headings" 表示隐藏默认的首列树形图标，只显示自定义表头。
@@ -502,7 +513,7 @@ class RecordTableFrame(ctk.CTkFrame):
             orient="vertical",
             command=self.tree.yview,
         )
-        # 双向绑定：拖动滚动条能滚动表格，鼠标滚轮滚动表格时滚动条位置也会同步更新。
+        # 先建 tooltip 再建引用它的徽标层；滚动通知同时负责隐藏提示、同步滚动条和重绘覆盖层。
         self.tag_tooltip = TreeviewTagTooltip(self, scrollbar)
         self.tag_badges = TagBadgeRenderer(self, edit_callback)
         self.tree.configure(yscrollcommand=self.tag_tooltip.scrolled)
@@ -523,6 +534,7 @@ class RecordTableFrame(ctk.CTkFrame):
         scale = self._get_widget_scaling()
         # CTk使用逻辑像素，Tk负字号使用物理像素，避免表格被再次按系统点数放大。
         font = ("Microsoft YaHei UI", -max(1, round(12 * scale)))
+        # 中英文字宽必须按原生行的同一字号测量，否则最大 N 与 Canvas 实际占宽会不一致。
         self.tag_font.configure(family=font[0], size=font[1])
         style = ttk.Style(self)
         # field元素仍会画边缘；三种边色置白，让卡片只保留外层的轻描边。
@@ -535,23 +547,28 @@ class RecordTableFrame(ctk.CTkFrame):
 
     def _set_scaling(self, *args, **kwargs) -> None:
         super()._set_scaling(*args, **kwargs)
+        # CTk 构造期也会触发缩放回调，字段存在后才同步原生表格并排入摘要重算。
         if hasattr(self, "tag_font"):
             self._style_table()  # 动态缩放必须同步测量字体，不能只放大CTk外框。
             if hasattr(self, "tag_tooltip"):
                 self.tag_tooltip._layout()
 
     def set_record_tags(self, iid: str, tags: tuple[str, ...]) -> str:
+        """保存完整标签并返回插入用摘要；列宽变化时也经此入口重新测量。"""
         self.record_tags[iid] = tags
         scale = self._get_widget_scaling()
         # bbox/列宽已经是物理像素，只缩放逻辑内边距及胶囊尺寸。
         return summarize_tags(tags, self.tree.column("tags", "width") - round(10 * scale), self.tag_font, scale)
 
     def clear_records(self) -> None:
+        """供 ui 在删除旧行前调用：先使提示/映射失效，再隐藏旧绘制层。"""
+        # 此入口只清表现层会话；Treeview 行仍由 ui 删除，账本缓存仍归 store 管理。
         self.tag_tooltip.clear()
         self.tag_badges.clear()  # 重建前隐藏旧Canvas，不能让同iid短暂显示上一轮内容。
 
 
 def _tooltip_work_area(root: tk.Misc) -> tuple[int, int, int, int] | None:
+    """读取 Windows 主窗所在屏幕的工作区；负坐标屏幕返回 None，首版不跨屏定位。"""
     class MonitorInfo(ctypes.Structure):
         _fields_ = [("size", wintypes.DWORD), ("screen", wintypes.RECT),
                     ("work", wintypes.RECT), ("flags", wintypes.DWORD)]
@@ -572,6 +589,7 @@ def _tooltip_work_area(root: tk.Misc) -> tuple[int, int, int, int] | None:
 
 
 def _tooltip_position(cell, size, work) -> tuple[int, int]:
+    """用屏幕物理坐标的 cell 矩形、提示尺寸和工作区边界计算下方/上方位置。"""
     left, top, right, bottom = work
     x, y, _width, height = cell
     width, tip_height = size
@@ -584,17 +602,21 @@ def _tooltip_position(cell, size, work) -> tuple[int, int]:
 
 
 class TreeviewTagTooltip:
+    """控制溢出标签 cell 的 300ms 悬停及布局失效，自行管理原生 Tk 窗口和绑定。"""
+
     def __init__(self, table: RecordTableFrame, scrollbar: ttk.Scrollbar) -> None:
         self.table, self.tree, self.scrollbar = table, table.tree, scrollbar
         self.root = self.tree.winfo_toplevel()
+        # 普通 hide 销毁提示窗口但保留控制器；它不是 CTkToplevel，不接入 dialog_lifecycle。
         self.window: tk.Toplevel | None = None
-        self.show_job: str | None = None
-        self.idle_job: str | None = None
-        self.current: str | None = None
-        self.position = (0, 0)
-        self.closed = False
-        self.bindings = []
+        self.show_job: str | None = None  # tree 注册的延迟显示任务，离开/交互时取消。
+        self.idle_job: str | None = None  # tree 注册的摘要重算任务，刷新/永久退出时取消。
+        self.current: str | None = None  # 悬停行 iid；列固定为 tags，同 iid 移动不重启计时。
+        self.position = (0, 0)  # 始终是 Treeview 局部坐标，Canvas 事件须先转换。
+        self.closed = False  # 永久退出守卫，避免销毁重入再次安排布局。
+        self.bindings = []  # 每项保存注册控件、事件名、绑定 ID，销毁时在原控件上精确解绑。
         # 原生绑定追加安装，记录自己的ID；关闭时不影响编辑及其他订阅者。
+        # 进入/离开由 cell 边界判断；点击、滚动、失焦、Unmap 隐藏，布局变化另排摘要重算。
         for widget, sequence, callback in (
             (self.tree, "<Motion>", self._motion), (self.tree, "<Leave>", self._leave),
             (self.tree, "<Configure>", self._layout), (self.tree, "<ButtonRelease-1>", self._layout),
@@ -607,6 +629,7 @@ class TreeviewTagTooltip:
             self.bindings.append((widget, sequence, tk.Misc.bind(widget, sequence, callback, add="+")))
 
     def _cell_at(self, x: int, y: int) -> str | None:
+        """只返回当前点所在的溢出标签行；表头、空白、其他列及完整放下的标签均返回 None。"""
         iid = self.tree.identify_row(y)
         if not iid or self.tree.identify_region(x, y) != "cell":
             return None
@@ -615,11 +638,13 @@ class TreeviewTagTooltip:
         if not box or not (box[0] <= x < box[0] + box[2] and box[1] <= y < box[1] + box[3]):
             return None
         tags = self.table.record_tags.get(iid, ())
+        # 判定依据是完整标签而非摘要的 +N 字样，真实标签本身也可能含有这些字符。
         if tags and self.table.tag_font.measure("、".join(tags)) > box[2] - round(10 * self.table._get_widget_scaling()):
             return iid
         return None
 
     def _leave(self, event) -> None:
+        # 从屏幕坐标反查真实目标，区分离开 cell 与跨入同 cell 的 Canvas 覆盖层。
         x, y = event.x_root - self.tree.winfo_rootx(), event.y_root - self.tree.winfo_rooty()
         target = self.tree.winfo_containing(event.x_root, event.y_root)
         # Treeview与覆盖Canvas之间的Leave不等于离开cell，保留原300ms任务。
@@ -643,10 +668,10 @@ class TreeviewTagTooltip:
         self.hide()
         self.current = iid
         if iid is not None:
-            self.show_job = self.tree.after(300, self._show)
+            self.show_job = self.tree.after(300, self._show)  # 延迟由控制器持有，不给每行各建一个任务。
 
     def _show(self) -> None:
-        self.show_job = None
+        self.show_job = None  # 回调已消费句柄；显示前仍须确认行、鼠标位置和宿主可见性。
         iid = self.current
         if iid is None or not self.tree.winfo_viewable() or self._cell_at(*self.position) != iid:
             return
@@ -656,9 +681,11 @@ class TreeviewTagTooltip:
             return  # 工作区读取失败只跳过提示，不用屏幕总高度冒充工作区。
         if work is None:
             return
+        # tree 是真实创建父控件，但父控件销毁不替代 after/绑定清理，仍须走本控制器的 destroy。
         window = self.window = tk.Toplevel(self.tree, takefocus=0)
         window.withdraw()
         window.overrideredirect(True)
+        # 每次现读完整元组，不能把可视摘要或上一次提示内容当成标签来源。
         label = tk.Label(window, text="、".join(self.table.record_tags[iid]),
                          font=self.table.tag_font, justify="left", bg="#FFFFFF", fg="#334155",
                          relief="flat", borderwidth=0, highlightthickness=1, highlightbackground="#D8E5F2",
@@ -677,6 +704,7 @@ class TreeviewTagTooltip:
             self.hide()  # 行滚出视口时bbox为空字符串；不能继续取坐标或留下半成品提示窗。
             return
         cell_x, cell_y, cell_width, cell_height = box
+        # bbox 是 tree 局部物理坐标，转到屏幕后才按主窗工作区翻转/钳制，不再乘 CTk 缩放。
         cell = (self.tree.winfo_rootx() + cell_x, self.tree.winfo_rooty() + cell_y, cell_width, cell_height)
         size = (min(label.winfo_reqwidth(), work[2] - work[0] - 16),
                 min(label.winfo_reqheight(), work[3] - work[1] - 16))
@@ -688,16 +716,17 @@ class TreeviewTagTooltip:
     def _cancel(self, name: str) -> None:
         job = getattr(self, name)
         if job is not None:
-            setattr(self, name, None)
+            setattr(self, name, None)  # 先清身份再取消 Tcl 任务，重复收尾不会拿旧句柄再次取消。
             try:
                 self.tree.after_cancel(job)
             except tk.TclError:
                 pass  # 父窗可能已先取消所属任务；重复收尾不能重新抛出销毁错误。
 
     def hide(self, _event=None) -> None:
+        """取消显示并销毁提示窗口，保留绑定及布局任务，让控制器继续服务表格。"""
         self._cancel("show_job")
         self.current = None
-        window, self.window = self.window, None
+        window, self.window = self.window, None  # 先移走引用，Destroy/idle 重入能识别旧提示已失效。
         if window is not None:
             window.destroy()
 
@@ -707,28 +736,33 @@ class TreeviewTagTooltip:
         self.table.tag_badges.request()
 
     def clear(self) -> None:
+        """刷新前取消显示和重算任务，并作废旧 iid 映射；不永久关闭控制器。"""
         self.hide()
         self._cancel("idle_job")
         self.table.record_tags.clear()  # 先作废旧iid映射，刷新后同ID不能接到旧标签。
 
     def _root_layout(self, event: tk.Event) -> None:
+        # 主窗绑定也会收到子控件的几何事件；只认主窗自身，避免把表格等子控件布局误当成主窗变化。
         if event.widget is self.root:
             self._layout(event)
 
     def _layout(self, _event=None) -> None:
+        # 旧提示位置/摘要宽度已失效；等本轮几何通知结束后再合并测量，避免边拖列边反复计算。
         self.hide()
         if not self.closed and self.idle_job is None:
             self.idle_job = self.tree.after_idle(self._reflow)
 
     def _reflow(self) -> None:
         self.idle_job = None
-        # 一次idle合并连续尺寸变化；鼠标移动不遍历全表或重复测量摘要。
+        # 本轮重算当前表格映射里的行（可含视口外行），Canvas 随后的 render 只扫描可见视口。
+        # 必须从完整 tuple 重算，不能在已经缩略的 cell 文本上继续缩略；普通 Motion 不走此循环。
         for iid, tags in self.table.record_tags.items():
             if self.tree.exists(iid):
                 self.tree.set(iid, "tags", self.table.set_record_tags(iid, tags))
         self.table.tag_badges.request()
 
     def destroy(self, _event=None) -> None:
+        """永久关闭控制器：取消两类任务、销毁提示、清映射并按绑定 ID 精确解绑。"""
         if self.closed:
             return
         self.closed = True

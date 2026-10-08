@@ -1,21 +1,13 @@
-"""日历 / 月历选择器弹窗（需求 3.12、issues #3.2）。
+"""日期/月历选择器（需求 3.12、#3.2），共用一个可重建的 CTk 缓存窗口。
 
-对外两个入口，共用**同一个**复用弹窗实例：
-  - ask_date()：日期模式。给「添加记录」和「编辑记录」的日期字段提供可视化
-    日历，减少用户手动敲 YYYY-MM-DD 时的格式错误。
-  - ask_month()：月份模式。给「月度统计 / 导出 CSV / 查看图表」的月份字段提供
-    月历（4 列 × 3 行 + 年份切换），把 issue #3.2 要求的「点选而不是手敲」落地。
-
-两种模式的差异只有两处：主体画什么（日期网格 / 月份网格）、◀ ▶ 翻的是月还是年。
-开窗、摆位、模态、收尾这一整套骨架完全共用（见 _begin_session / _finish_session），
-所以不存在「两份必须长期同步的实现」。
-
-定位方式与「标签」弹窗保持一致：贴着输入框的左下角弹出，下方空间不够时
-翻到上方。调用方通过 anchor 把输入框交进来；不传（或输入框已经不存在）时退回
-屏幕居中，见 _anchor_to_input。
-
-实现上刻意不引入 tkcalendar 等新依赖，纯 CustomTkinter 拼装，
-以便和项目内其他弹窗共用同一套配色、圆角与字体。
+ask_date/ask_month 返回 ISO 日期/月或 None，只选择不写库；prewarm/shutdown 供主窗准备及退出。
+_win 保存控件池及按模式记忆的真实尺寸；_ses 每次重建选择、信号、锚点及清理句柄。
+普通结束只隐藏并写信号唤醒 wait_variable；真正销毁清窗口缓存，下次调用可重新建窗。
+新调用先结束旧会话再接管，旧等待栈保留自己的 session 引用，不能读取新会话结果。
+就绪后日历持 grab，结束时释放；编辑调用方负责在仍有效时恢复自己的 grab。
+锚点定位借用公共物理坐标公式，日历尺寸仍独立；无有效锚点退回屏幕居中。
+隐藏预创建在主线程分批进行，不建立用户会话、不取得 grab；提前点击取消后续批次并补齐控件。
+ManagedToplevel 保护建窗期间的销毁重入；主窗还有成对构建回调，不能仅靠隐藏代替最终收尾。
 """
 
 from __future__ import annotations
@@ -90,13 +82,8 @@ def _logical_size(mode: str) -> tuple[int, int]:
 
 
 def _physical_size(window: tk.Misc, mode: str) -> tuple[int, int]:
-    """把弹窗的**逻辑**尺寸换算成当前 DPI 下的物理像素。
-
-    需要它是因为「摆位」这条路径上只有两个尺寸来源，且两种都不能读 winfo_width()：
-      - 复用打开：该模式上一次真正显示时量到的尺寸（见 _close 里记的 _win.last_size）；
-      - 首次打开：窗口还没映射，winfo_width() 只会谎报 200（CTkToplevel 的初始值），
-        只能由「逻辑常量 × 窗口缩放」算。
-    """
+    """把逻辑常量换算为物理尺寸；调用方另可优先用该模式已记录的真实尺寸。"""
+    # 隐藏窗可能仍留上个模式或初始尺寸，不能用此刻 winfo_width 猜本次尺寸；只乘缩放一次。
     scale = ctk.ScalingTracker.get_window_scaling(window)
     width, height = _logical_size(mode)
     return (int(width * scale), int(height * scale))
@@ -109,16 +96,15 @@ def _center_window(window: tk.Tk | tk.Toplevel, size: tuple[int, int] | None = N
     保留它的三条理由：anchor 是可选形参；anchor 可能在打开期间被连带销毁
     （编辑记录弹窗关掉的时候）；_ensure_window 建窗那一刻也还没有 anchor。
 
-    这里用原生 wm_geometry 而不是 CTkToplevel.geometry()：后者会把宽高**和坐标**
-    一起按 DPI 缩放（见 ctk_toplevel.geometry 的 _apply_geometry_scaling），
-    而 winfo_* 系列返回的都是物理像素，两者混用会让窗口整体偏几十像素。
+    使用原生 wm_geometry 保持整个定位路径按物理像素处理。当前 CTk geometry 只缩放宽高，
+    不缩放位置；此处不能以「CTk 会放大坐标」为理由再把 x/y 除以缩放系数。
 
     size 传入「预置坐标要用的尺寸」：复用打开用上次量到的真实尺寸，首次打开用
     「逻辑常量 × DPI 缩放」换算出的物理尺寸。两种情况都不能读 winfo_width()。
     """
     width, height = size if size is not None else (window.winfo_width(), window.winfo_height())
     target_x = max((window.winfo_screenwidth() - width) // 2, 0)
-    # 垂直方向不用严格二分：略偏上更符合视觉重心，也不会被任务栏压住。
+    # 垂直位置略偏上；此兜底用屏幕总尺寸，不是排除任务栏的工作区边界。
     target_y = max((window.winfo_screenheight() - height) // 3, 0)
     # 仅在位置确实需要变化时才移动：移动本身会再次触发 <Configure>，
     # 少了这个判断就会无限自我触发（死循环）。
@@ -133,29 +119,16 @@ def _anchor_to_input(
 ) -> None:
     """把弹窗贴到 anchor（日期输入框）的左下角，下方放不下时翻到它上方。
 
-    坐标计算与标签、文件共用 anchored_position（横向钳制、竖向翻转），
-    两个 ▼ 的行为才会一致。四处刻意偏离它，都是「日历不是下拉列表」带来的：
-
-    1. **宽度不跟 anchor**。tag_picker 是列表、宽度与输入框等宽；日历是 7 列
-       日期网格，宽度是内容决定的（_DIALOG_WIDTH），跟输入框走会被压窄、日期列
-       挤成一团。所以这里只借 anchor 的**位置**，不借它的宽度。
-    2. **不挂 anchor 的 <Configure>、也不挂 50ms 轮询**。tag_picker 需要它们，
-       是因为它的列表可能在编辑弹窗**还没完成布局**时就弹出来了（它自己的注释里
-       记着实测旧宽偏 52px、旧 y 偏 92px）。日历没有这个问题：用户必须先在屏幕上
-       点中 ▼ 按钮，而按钮能被点中就意味着 anchor 早已布局完毕，读数可信。
-    3. **恰恰因为不挂 anchor 的事件**，用户把日历拖走后不会有任何回调把它拽回来——
-       这是需要的：日历是模态窗（grab_set），用户很可能想把它挪开去看主窗口里的
-    数字。tag_picker 是不可拖动的下拉列表，没有这个诉求，两者该有差异。
-    4. **anchor 读不出有效高度时退回屏幕居中**，而不是像 tag_picker 那样直接
-       return 等下一轮；日历没有等待窗口，退回兜底才能保证任何情况下都有位置。
-
+    坐标与标签/文件共用 anchored_position，日历只借锚点位置，不跟随输入框宽度。
+    会话监听本窗几何/映射，不订阅锚点 Configure 或位置轮询；就绪后纯位移不重新贴靠。
+    锚点不存在或高度尚未有效时退回屏幕居中，不等待一个不可用的输入框。
     坐标口径：winfo_* 与 wm_geometry 都是物理像素，不经过 CTk 的缩放换算。
     """
     if anchor is not None:
         try:
             anchor_exists = bool(anchor.winfo_exists())
         except tk.TclError:
-            anchor_exists = False
+            anchor_exists = False  # 父窗连带销毁锚点时仍可走定位兜底，不把查询故障当有效坐标。
         if anchor_exists:
             anchor_height = anchor.winfo_height()
             # <=1 是「控件尚未完成布局」的谎报值：此时 rooty 指向的还不是最终位置。
@@ -208,13 +181,13 @@ def _parse_iso_month(value: str | None) -> tuple[int, int] | None:
 
 # ==================== 方案 3：弹窗实例复用 ====================
 # 状态拆成两个模块级容器，把「窗口级」和「打开级」严格分开：
-#   _win —— 窗口级：整个进程只建一次窗，只有主窗口销毁时才真正 destroy。
+#   _win —— 窗口级：控件池随缓存窗复用；创建父窗退出、shutdown 或外部销毁后可重建。
 #   _ses —— 打开级：每次「打开 → 关闭」是一个完整周期，关闭时收尾、打开时整体重建。
-# 所有回调都从这两个容器「现读」，不靠闭包捕获，因此复用后不会读到上一次的旧状态
+# 窗口级动作现读当前容器；显现任务及会话绑定还保留身份校验，不能只凭窗口仍存在判断有效。
 # 格子本身跨会话复用，但每次渲染更新命令，避免回填上一月或上一年的值。
 _win: SimpleNamespace | None = None
 _ses: SimpleNamespace | None = None
-_prewarm: SimpleNamespace | None = None
+_prewarm: SimpleNamespace | None = None  # 隐藏准备的 parent 注册任务及销毁绑定，独立于 dialog 的会话任务。
 
 
 class _CalendarWindow(ManagedToplevel):
@@ -255,6 +228,7 @@ class _CalendarWindow(ManagedToplevel):
 
 @dataclass
 class _GridCell:
+    """窗口级按钮与上次绘制状态；格子可复用，日期/月回填命令每次渲染重新赋值。"""
     button: ctk.CTkButton
     text: str = ""
     selected: bool = False
@@ -561,8 +535,8 @@ def _recenter(_event: tk.Event | None = None) -> None:
     用户拖动标题栏 → 坐标改变 → 若此时重新贴位，窗口会被立刻拽回输入框旁边，
     手感上就是「窗口拖不动」。因此只在尺寸变化时重摆，纯位移直接忽略。
 
-    尺寸变化时也仍然按**锚点**（而不是屏幕）重算，这样换月导致行数从 6 行变 5 行、
-    弹窗变矮时，它会自己重新贴回输入框下方，而不是跑到屏幕中央去。
+    尺寸变化仍按本次锚点重算，适用于模式尺寸或缩放校正；格子池固定容纳六周，
+    不能把换月等同于窗口自动变矮。无锚点才用屏幕居中。
     """
     win = _win
     ses = _ses
@@ -653,7 +627,7 @@ def _schedule_reveal(win: SimpleNamespace, session: SimpleNamespace) -> None:
 
 
 def _wake() -> None:
-    """唤醒挂在 wait_variable 上的调用方：变量只要「值有变化」即可，不必有意义。"""
+    """写本次信号唤醒 wait_variable；计数不承载选择结果，结果另存于 session.result。"""
     if _ses is None:
         return
     try:
@@ -676,9 +650,8 @@ def _cleanup() -> None:
             except (tk.TclError, ValueError):
                 pass  # 销毁期间任务可能已被Tk取消，仍需清空本次句柄。
             slot[0] = None
-    # ② 解绑 <Configure>：当初用 tk.Misc.bind 就是为了拿到 funcid，这里按 funcid 精确摘除。
-    #    不能用 dialog.unbind(...)：CTk 的覆写收到非 None 的 funcid 会抛 ValueError，
-    #    而 CTkEntry/CTkFrame 的 bind 又根本不返回 funcid。
+    # ② 三类会话绑定均从原注册控件按 ID 摘除，保留窗口级及 CTk 自身订阅。
+    # 显式使用 tk.Misc 固定原生 ID 契约；不能把 CTkEntry/Frame 的解绑限制套到 CTkToplevel。
     for widget, event, slot in (
         (dialog, "<Configure>", _ses.configure_funcid),
         (dialog, "<Map>", _ses.map_funcid),
@@ -695,7 +668,7 @@ def _cleanup() -> None:
     try:
         dialog.grab_release()
     except tk.TclError:
-        pass
+        pass  # 原生销毁已释放资源时不阻断后续隐藏及信号通知；不在此恢复调用方旧 grab。
 
 
 def _close() -> None:
@@ -704,7 +677,7 @@ def _close() -> None:
         return
     _cleanup()
     # 记下本次真正显示时的尺寸，供下一次复用打开预置坐标（此刻窗口可见，值是可信的）。
-    # 按模式分别记录：日期弹窗记 320x380、月份弹窗记 320x300，各记各的，
+    # 按模式分别记录物理尺寸，不能混用日期/月历高度，也不能把它当未缩放的逻辑常量，
     # 否则下一次打开会拿到另一个模式的高度，第一帧就错位（#3.1 修掉的 A1 同类病）。
     if _ses.ready and _win.dialog.winfo_width() > 1:
         _win.last_size[_ses.mode] = (
@@ -759,8 +732,8 @@ def _build_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
     """首次预创建或打开时建立外壳，之后一直复用同一个实例。
 
     窗口级的东西（控件树、字体）只在这里建一次；打开级状态一律不进这里，
-    全部由 ask_date / ask_month 每次打开时重建。回调都是模块级函数、一律现读
-    _win / _ses，所以不存在「闭包捕获到上一次状态」的问题。
+    全部由 ask_date / ask_month 每次打开时重建；窗口级动作现读 _win/_ses，
+    日期/月格子在每次渲染时重新设置选择命令，不能把旧格子命令当作当前会话状态。
 
     mode 只影响**建窗那一刻**的尺寸提示：建窗可能由日期模式（ask_date）触发，
     也可能由月份模式（ask_month）触发，两种模式高度不同（见 _logical_size）。
@@ -932,7 +905,7 @@ def _build_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
 
 
 def _cancel_prewarm() -> None:
-    """取消后台准备的便条；已经创建的格子留给正常打开复用。"""
+    """取消主线程隐藏准备的 parent 任务/绑定；保留已建格子供点击补齐，不销毁缓存。"""
     global _prewarm
     warm, _prewarm = _prewarm, None
     if warm is None:
@@ -952,7 +925,7 @@ def _cancel_prewarm() -> None:
 
 
 def shutdown(parent: tk.Tk | tk.Toplevel) -> None:
-    """父窗退出时取消准备并关闭其拥有的缓存，亦可唤醒建窗期间重入的选择。"""
+    """取消属于 parent 的预创建，并按创建 master 链销毁其缓存；不同于仅结束本次选择。"""
     if _prewarm is not None and _prewarm.parent is parent:
         _cancel_prewarm()
     win = _win
@@ -970,6 +943,7 @@ def prewarm(parent: tk.Tk | tk.Toplevel) -> None:
     global _prewarm
     if _win is not None or _prewarm is not None:
         return  # 用户已先打开或已有准备任务，不能重建缓存/改写当前选择。
+    # 任务注册在 parent 而非隐藏 dialog，最终退出必须显式取消，窗口级清理不会代管根窗任务。
     warm = SimpleNamespace(parent=parent, idle=[None], timer=[None], destroy_binding=None)
     _prewarm = warm
 
@@ -1009,6 +983,7 @@ def prewarm(parent: tk.Tk | tk.Toplevel) -> None:
             return
         warm.timer[0] = None
         try:
+            # 每批至多六格，4ms 是让出事件循环的软阈值；外壳和单控件构造不能被这个预算截断。
             deadline = perf_counter() + 0.004
             for _ in range(6):
                 if len(win.day_cells) < 42:
@@ -1063,8 +1038,7 @@ def _begin_session(
     ):
         return False  # 退出期间不再接受重入的点击请求。
 
-    # 【打开前】先把上一次遗留的会话收干净：单例复用要求任何时刻最多只有一个日历在等，
-    # 否则会出现「两个弹窗同时可见」和「两次 wait_variable 同时挂起」。
+    # 新调用先结束旧会话，旧 wait_variable 会被唤醒但可能尚未退栈；只能有一个活动会话。
     if _ses is not None and _ses.open:
         _close()
 
@@ -1082,9 +1056,7 @@ def _begin_session(
         dialog.transient(parent)  # 仅父窗变化时重设，重复wm transient也会触发显示/布局。
 
     today = date.today()
-    # 【打开级状态】每次打开整体重建，所有字段都是「本次打开」的新值。用模块级 _ses
-    # 承载、回调一律现读，因此 state / result / signal 天然是「跨打开长期存活且始终
-    # 指向本次」的那一份，日期/月份格子的闭包不会串到上一次打开。
+    # 每次新建状态与信号；模块 _ses 指向新会话，旧等待栈保留自己的别名以返回旧结果。
     _ses = SimpleNamespace(
         open=True,
         ready=False,
@@ -1111,7 +1083,7 @@ def _begin_session(
         # 本次打开的锚点（日期输入框）。_recenter 在尺寸变化时要靠它重算位置，
         # 所以必须跟着「本次打开」每回重建，不能留在窗口级的 _win 里。
         anchor=anchor,
-        # 单元素列表当句柄槽，回调内部可原地改写，关闭时统一取消/解绑。
+        # 单元素列表当句柄槽，dialog 注册两类 idle；绑定各回原控件按 ID 摘除，不能只清 slot。
         setup_idle=[None],
         reveal_idle=[None],
         configure_funcid=[None],

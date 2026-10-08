@@ -1,4 +1,10 @@
-"""Main AccountKeeper window and application-level business callbacks."""
+"""主窗口组装与业务回调：输入校验、收支符号转换及调用 store，不直接执行 SQL。
+
+store.records 是完整账本缓存，搜索和编辑从中取值；表格仅持有当前筛选行的展示状态。
+刷新顺序为撤销旧提示/映射/覆盖层、重建 Treeview 行、同步操作按钮、请求徽标重绘。
+摘要及字体测量归 widgets/table_tag_badges，不能反解析显示文本来还原标签或主键。
+表格交互验收入口为 _probe/probe_table_visuals.py；用隔离宿主，避免连接真实账本。
+"""
 
 from __future__ import annotations
 
@@ -31,7 +37,7 @@ from widgets import InputFrame, RecordTableFrame, ToolbarFrame
 
 
 class AccountKeeperApp(ctk.CTk):
-    """The desktop interface for viewing and managing expense records."""
+    """协调收支录入、筛选和编辑；子控件管理自身状态，持久化交给注入的 store。"""
 
     def __init__(
         self,
@@ -160,7 +166,7 @@ class AccountKeeperApp(ctk.CTk):
         )
         self.input_frame.pack(fill="x", padx=24, pady=(0, 8))
         # 把这些控件引用提升到主窗口，方便各回调直接读取/清空；控件本身仍归 InputFrame 所有。
-        # 标签刻意不提升（#58 Step 3a）：它不是一个 StringVar，而是 chips 那个有序集合，
+        # 标签刻意不提升：它不是一个 StringVar，而是 chips 那个有序集合，
         # 归 InputFrame 自己管，主窗口只经 collect_tags() / clear_tags() 两个口子打交道。
         # 不把 _tags 提到主窗口，是为了不让两条路径去改同一份标签集合。
         self.date_var = self.input_frame.date_var
@@ -193,6 +199,8 @@ class AccountKeeperApp(ctk.CTk):
         self._sync_record_actions()
 
     def refresh_records(self) -> None:
+        """按当前搜索词重绘缓存，不重新读库，也不清空筛选条件。"""
+        # 正常新增/删除/编辑成功后 store 已 load；刷新按钮本身不会读取外部改库结果。
         # 刷新按钮与新增/删除/编辑后的刷新都收敛到这一处，避免多份重复的渲染逻辑。
         self.filter_records()
 
@@ -206,15 +214,15 @@ class AccountKeeperApp(ctk.CTk):
             else:
                 subprocess.run(["xdg-open", str(DATA_DIR)])
         except Exception:
-            # 打不开资源管理器也不能让程序崩溃，退而求其次把路径打印给用户。
+            # 打不开资源管理器也不能让程序崩溃，退而求其次用提示框展示路径。
             messagebox.showinfo("数据目录", f"数据目录位于：\n{DATA_DIR}")
 
     def filter_records(self, *_args: str) -> None:
+        """从完整缓存筛选并重建展示行；不改缓存、原始 tags 元组或记录主键。"""
         # 用 *_args 吸收事件对象/回调参数，使同一函数既能当事件回调也能被直接调用。
-        # 直接读输入框内容而不是 search_var：粘贴（尤其右键粘贴）只改控件内容、不产生按键事件，
-        # 依赖变量会读到过期值，表现为"粘进去的文字筛不出结果"。
+        # 搜索框未绑定 textvariable，直接读取控件作为唯一来源；粘贴的触发及延迟读取归 ToolbarFrame。
         keyword = self.search_entry.get().strip().lower()
-        # 先清提示和完整标签映射，重建后同一个iid不能沿用旧会话的数据。
+        # 删除旧行前先取消提示及摘要任务、清映射并隐藏覆盖层，避免复用 iid 时串入上一轮内容。
         self.table_frame.clear_records()
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -225,6 +233,7 @@ class AccountKeeperApp(ctk.CTk):
             key=lambda item: (item.record_date, item.record_id),
             reverse=True,
         ):
+            # 始终匹配完整 tags，摘要隐藏的标签乃至只显示计数的行也必须可被搜索。
             # 日期、备注或任一标签单独命中即可；逐标签比较避免拼接符两侧被误当成连续文字。
             matches = (
                 keyword in record.record_date.lower()
@@ -242,18 +251,19 @@ class AccountKeeperApp(ctk.CTk):
                 values=(
                     record.record_date,
                     f"{record.amount:.2f}",
-                    # 摘要只在widgets表现层产生；搜索/编辑仍读取完整的缓存tuple。
+                    # 插入前登记 iid → 完整 tuple，返回值仅作摘要；tooltip/徽标也不能从摘要反解析。
                     self.table_frame.set_record_tags(str(record.record_id), record.tags),
                     record.note,
                 ),
             )
             visible_row += 1
 
-        self._sync_record_actions()
+        self._sync_record_actions()  # 删除并重建后原选择已失效，不能保留上一轮的按钮可用状态。
 
         self.table_frame.tag_badges.request()  # 插入完成后再测量可见行，避免逐行触发布局。
 
     def _selected_record_id(self) -> int | None:
+        """只认当前仍存在的选中行 iid，不按可变行序或单元格文本定位记录。"""
         selected = self.tree.selection()
         if not selected or not self.tree.exists(selected[0]):
             return None
@@ -265,28 +275,26 @@ class AccountKeeperApp(ctk.CTk):
     def _sync_record_actions(self, _event: tk.Event | None = None) -> None:
         if self._calendar_closing:
             return  # 销毁时仍可能投递选择事件，不能再配置已销毁的按钮。
+        # 此处只更新展示状态；实际编辑/删除回调仍重新读取当前选择，不能缓存旧主键。
         record_id = self._selected_record_id()
         self.toolbar.set_record_actions_enabled(record_id is not None)
         self.table_frame.set_selected_record(record_id)
 
     def add_record(self) -> None:
         try:
-            # 日期必须严格符合 YYYY-MM-DD，strptime 失败会直接跳到 except 分支。
+            # 按年/月/日解析并在写入时用 isoformat 规范化；解析失败走统一输入提示。
             record_date = datetime.strptime(
                 self.date_var.get().strip(), "%Y-%m-%d"
             ).date()
-            # 直接读控件内容：金额框用的是 placeholder_text 而不是 textvariable，
-            # 且粘贴不会触发按键事件，读 StringVar 会漏掉粘贴（含右键粘贴）进来的数字。
+            # 金额框使用 placeholder_text 而未绑定 textvariable，提交时直接读取实际文本。
             raw_amount = self.amount_entry.get().strip()
             # 空字符串不是合法的 Decimal，这里主动抛 ValueError 走统一的错误提示分支。
             if not raw_amount:
                 raise ValueError
             # 先取绝对值拿到"金额大小"，正负号完全交给下面的类型开关决定。
             amount = abs(Decimal(raw_amount))
-            # Decimal("nan") / Decimal("Infinity") 都能正常解析、也能正常入库（存成 "NaN"），
-            # 但之后任何"金额 > 0"这类大小比较都会抛 InvalidOperation，直接把界面渲染炸掉
-            # （这就是账本里那条 NaN 记录导致程序一启动就崩溃的原因）。
-            # 因此在入口处用 is_finite() 显式拦掉，保证入库的金额一定可比较、可汇总。
+            # NaN/Infinity 可被 Decimal 解析，但 NaN 比较可能抛异常、Infinity 会污染汇总；
+            # 入口只接收有限金额，不能把能解析等同于业务合法。
             if not amount.is_finite():
                 raise ValueError
         except (ValueError, InvalidOperation):
@@ -294,15 +302,13 @@ class AccountKeeperApp(ctk.CTk):
             return
 
         # 根据支出/收入切换按钮，自动为金额加上正负号。
-        # 之所以把符号转换放在这里而不是控件里，是为了让 UI 层只关心"用户意图"，
+        # 之所以把符号转换放在提交入口而不是控件里，是为了让输入控件只表达"用户意图"，
         # 数据层始终按统一的"正数=收入、负数=支出"约定存储。
         amount_type = self.input_frame.amount_type_var.get()
         if amount_type == "支出":
             amount = -amount
 
-        # #58 Step 3a：标签改为多值，而且 0 个标签是合法的（§3.14.4 需答 Q2），
-        # 所以这里只留「金额不能为 0」这一条业务约束。
-        # 0 元记录在统计中没有意义，仍视为非法输入。
+        # §3.14.4 已确认 0 标签合法，可提交空元组；金额非零是独立约束，不能恢复标签必填。
         if amount == 0:
             messagebox.showerror(
                 "输入错误",
@@ -311,7 +317,7 @@ class AccountKeeperApp(ctk.CTk):
             return
         # 标签在这里一次取全：collect_tags 会把输入框里残留的文字也冲刷成 chip，
         # 用户打完字直接点「添加」不会漏掉那个词；0 个标签时返回空元组。
-        # 直接交给 store，绝不能漏传字符串——那会被逐字符拆成标签（"餐饮" → "餐"、"饮"）。
+        # 保持 tuple 传给 store；裸字符串会被数据层拒绝，不能把整个摘要当成一个标签。
         tags = self.input_frame.collect_tags()
         # store.add 内部还会再校验一次金额（数据层最后防线）。正常流程下这里不会触发，
         # 但万一上层校验被改动绕过，也只会弹出提示而不会让程序崩溃。
@@ -327,8 +333,7 @@ class AccountKeeperApp(ctk.CTk):
         # 否则下一次提交会把上一次的金额重复带进去。
         self.amount_entry.delete(0, "end")
         # 标签归 InputFrame 管，主窗口只让它自己复位（连带清掉输入框里的残留文字）。
-        # #58 Step 3a 之前这里写的是 self.category_var.set("")——主窗口直接改输入区的
-        # 控件状态；改成调 clear_tags() 之后，主窗口不再持有输入区内部状态。
+        # 清空已选 chips 与待提交文本是同一动作，不能在主窗口绕过接口直接改内部 _tags。
         self.input_frame.clear_tags()
         self.note_var.set("")
         # 需求 3.13：这里不再需要「重新查历史标签 + 刷新候选」。
@@ -374,7 +379,7 @@ class AccountKeeperApp(ctk.CTk):
 
     def _edit_record_by_id(self, record_id: int) -> None:
         """按钮和双击共用预填、取消与保存流程，防止业务口径分叉。"""
-        # 从内存缓存里找到对应的完整记录，用于给编辑框预填当前值。
+        # 从完整缓存按主键取记录预填，不能读取 Treeview 的摘要或 Canvas 可复用槽位。
         record = next(
             (item for item in self.store.records if item.record_id == record_id),
             None,
@@ -387,8 +392,7 @@ class AccountKeeperApp(ctk.CTk):
         edited_values = dialogs.ask_edit_record(self, record)
         if edited_values is None:
             return
-        # #58 Step 3a：编辑框返回的第三项已经是标签元组（它自己按顿号拆好、允许为空），
-        # 所以这里原样透传，不再包 (category,)。
+        # 编辑提交入口已转换收支符号并收集完整标签元组；原样透传，不二次取负或包装标签。
         record_date, amount, tags, note = edited_values
         # 主键不参与修改，编辑只更新内容字段（需求 3.5.1）。
         if not self.store.update(record_id, record_date, amount, tags, note):

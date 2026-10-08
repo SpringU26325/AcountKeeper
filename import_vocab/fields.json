@@ -1,0 +1,536 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "value": "交易时间",
+      "roles": [
+        "date"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "微信个人账单实测",
+        "支付宝个人账单实测",
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "记账时间",
+      "roles": [
+        "date"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "交易日期",
+      "roles": [
+        "date"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "记账日期",
+      "roles": [
+        "date"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "支付时间",
+      "roles": [
+        "date"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "入账时间",
+      "roles": [
+        "date"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "金额",
+      "roles": [
+        "amount"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "支付宝个人账单实测"
+      ]
+    },
+    {
+      "value": "金额(元)",
+      "roles": [
+        "amount"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "微信个人账单实测"
+      ]
+    },
+    {
+      "value": "收支金额(元)",
+      "roles": [
+        "amount"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "应结订单金额",
+      "roles": [
+        "amount"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "交易金额",
+      "roles": [
+        "amount"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "发生金额",
+      "roles": [
+        "amount"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "收/支",
+      "roles": [
+        "direction"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "微信个人账单实测",
+        "支付宝个人账单实测"
+      ]
+    },
+    {
+      "value": "收支类型",
+      "roles": [
+        "direction"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "收支",
+      "roles": [
+        "direction"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "收入/支出",
+      "roles": [
+        "direction"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "当前状态",
+      "roles": [
+        "status"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "微信个人账单实测"
+      ]
+    },
+    {
+      "value": "交易状态",
+      "roles": [
+        "status"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "支付宝个人账单实测",
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "状态",
+      "roles": [
+        "status"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "订单状态",
+      "roles": [
+        "status"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "退款状态",
+      "roles": [
+        "status"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "微信商户文档",
+        "支付宝开放平台文档"
+      ]
+    },
+    {
+      "value": "交易类型",
+      "roles": [
+        "trade_type"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "微信个人账单实测",
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "交易分类",
+      "roles": [
+        "trade_type",
+        "category"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "支付宝个人账单实测"
+      ]
+    },
+    {
+      "value": "业务名称",
+      "roles": [
+        "trade_type"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "类型",
+      "roles": [
+        "trade_type"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "业务类型",
+      "roles": [
+        "trade_type"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章",
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "交易对方",
+      "roles": [
+        "counterparty"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "微信个人账单实测",
+        "支付宝个人账单实测"
+      ]
+    },
+    {
+      "value": "商户名称",
+      "roles": [
+        "counterparty"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "收款方",
+      "roles": [
+        "counterparty"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "付款方",
+      "roles": [
+        "counterparty"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "商品",
+      "roles": [
+        "product"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "微信个人账单实测"
+      ]
+    },
+    {
+      "value": "商品说明",
+      "roles": [
+        "product"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "支付宝个人账单实测"
+      ]
+    },
+    {
+      "value": "商品名称",
+      "roles": [
+        "product"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "交易说明",
+      "roles": [
+        "product"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "用途",
+      "roles": [
+        "product"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "备注",
+      "roles": [
+        "original_note"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "微信个人账单实测",
+        "支付宝个人账单实测",
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "交易备注",
+      "roles": [
+        "original_note"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "附言",
+      "roles": [
+        "original_note"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "支付方式",
+      "roles": [
+        "payment"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "微信个人账单实测"
+      ]
+    },
+    {
+      "value": "收/付款方式",
+      "roles": [
+        "payment"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "支付宝个人账单实测"
+      ]
+    },
+    {
+      "value": "付款银行",
+      "roles": [
+        "payment"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "交易单号",
+      "roles": [
+        "order_id"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "微信个人账单实测"
+      ]
+    },
+    {
+      "value": "交易订单号",
+      "roles": [
+        "order_id"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "支付宝个人账单实测"
+      ]
+    },
+    {
+      "value": "微信订单号",
+      "roles": [
+        "order_id"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "微信支付业务单号",
+      "roles": [
+        "order_id"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "流水号",
+      "roles": [
+        "order_id"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "商户单号",
+      "roles": [
+        "secondary_order_id"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "微信个人账单实测"
+      ]
+    },
+    {
+      "value": "商家订单号",
+      "roles": [
+        "secondary_order_id"
+      ],
+      "source": "真实样例",
+      "provenance": [
+        "支付宝个人账单实测"
+      ]
+    },
+    {
+      "value": "商户订单号",
+      "roles": [
+        "secondary_order_id"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "资金流水单号",
+      "roles": [
+        "secondary_order_id"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "微信商户文档"
+      ]
+    },
+    {
+      "value": "消费分类",
+      "roles": [
+        "category"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "分类",
+      "roles": [
+        "category"
+      ],
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    }
+  ]
+}

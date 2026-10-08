@@ -1,4 +1,11 @@
-"""Dialog windows used by AccountKeeper."""
+"""主页面的月份入口、编辑表单与删除确认；只返回决定，不执行账本写入。
+
+编辑采用一个缓存 _EditWindow 加每次独立 _EditSession，普通取消/确认只隐藏并唤醒 wait_variable。
+编辑会话拒绝重入，公共调用退栈后才释放登记；构建或父窗退出交给 ManagedToplevel 真正销毁。
+日期/标签子选择器可以处理嵌套事件，返回后必须验证原编辑会话身份再回填或恢复 grab。
+删除确认每次新建并销毁，等待 wait_window；不能把编辑的隐藏复用收尾照搬到此流程。
+金额大小与方向在编辑确认入口合成一次，完整标签原样返回给 ui，再由 store 持久化。
+"""
 
 from __future__ import annotations
 
@@ -139,7 +146,7 @@ def _apply_app_icon(window: tk.Tk | tk.Toplevel) -> None:
 
 
 def _edit_dialog_max_height(dialog: ctk.CTkToplevel) -> int:
-    """返回扣除屏幕留白后的编辑弹窗最大逻辑高度。"""
+    """构建期按主屏工作区给初始逻辑高度上限；会话布局另按当前父窗屏幕重新钳制。"""
     try:
         work_area = wintypes.RECT()
         # SPI_GETWORKAREA 排除任务栏；Windows API 返回物理像素，需换成 CTk 逻辑尺寸。
@@ -187,22 +194,23 @@ def ask_month(
 
 @dataclass
 class _EditSession:
+    """单次编辑的记录快照、结束信号和清理清单；不随缓存窗口一起跨次保留。"""
     parent: tk.Misc
     record: Account
     dialog: _EditWindow | None = None
-    signal: tk.BooleanVar | None = None
-    result: tuple[str, Decimal, tuple[str, ...], str] | None = None
+    signal: tk.BooleanVar | None = None  # 挂在本次 parent 上；隐藏缓存窗不会使等待结束，须显式设置信号。
+    result: tuple[str, Decimal, tuple[str, ...], str] | None = None  # 仅确认写结果；取消保持 None，不从控件临时值返回。
     previous_grab: tk.Misc | None = None
     open: bool = True
     ready: bool = False
-    tasks: dict[str, str] = field(default_factory=dict)
-    bindings: list[tuple[tk.Misc, str, str, str]] = field(default_factory=list)
-    child_context: dict[str, object] = field(default_factory=dict)
+    tasks: dict[str, str] = field(default_factory=dict)  # 功能键 → dialog 注册的 after/idle，同键重排只保留一份。
+    bindings: list[tuple[tk.Misc, str, str, str]] = field(default_factory=list)  # 注册控件/事件/命令 ID/守卫脚本均需收回。
+    child_context: dict[str, object] = field(default_factory=dict)  # 本次子调用结果；同会话 chips 重排不清它。
     layout_sample: tuple[int, int, int, int] | None = None
 
 
-_edit_window: _EditWindow | None = None
-_edit_session: _EditSession | None = None
+_edit_window: _EditWindow | None = None  # 控件树及用户拖动位置可复用，真正 Destroy 后清缓存。
+_edit_session: _EditSession | None = None  # 即使已 close，也等 ask_edit_record 的 finally 退栈才释放重入守卫。
 
 
 def _edit_alive(widget: tk.Misc | None) -> bool:
@@ -213,10 +221,12 @@ def _edit_alive(widget: tk.Misc | None) -> bool:
 
 
 def _edit_current(session: _EditSession) -> bool:
+    # 窗口存在不等于旧调用仍有回填权，必须同时匹配活动会话、open 和窗口寿命。
     return _edit_session is session and session.open and _edit_alive(session.dialog)
 
 
 class _EditWindow(ManagedToplevel):
+    """缓存表单及其窗口级回调；每次打开都由 _prefill_edit 完整覆盖输入状态。"""
     date_var: tk.StringVar
     amount_type_var: tk.StringVar
     amount_var: tk.StringVar
@@ -276,6 +286,7 @@ class _EditWindow(ManagedToplevel):
 
 
 def _edit_bind(session: _EditSession, widget: tk.Misc, sequence: str, callback: Callable[[tk.Event], None]) -> None:
+    # Python 校验会话身份，Tcl 校验命令存活；两层防护分别挡住串会话和解绑后仍在分发的旧脚本。
     def dispatch(event: tk.Event) -> None:
         if _edit_current(session):
             callback(event)  # 复用时已排队的旧事件不能改写新记录。
@@ -289,6 +300,7 @@ def _edit_bind(session: _EditSession, widget: tk.Misc, sequence: str, callback: 
 
 
 def _edit_schedule(session: _EditSession, key: str, callback: Callable[[], None], ms: int | None = None) -> str | None:
+    """合并本次会话的同键任务；ms=None 表示 idle，返回句柄只用于当前会话清理。"""
     if not _edit_current(session):
         return None
     dialog = session.dialog
@@ -307,6 +319,7 @@ def _edit_schedule(session: _EditSession, key: str, callback: Callable[[], None]
 
 
 def _close_edit_children(dialog: _EditWindow) -> None:
+    """先结束属于此编辑窗的内层等待，保留已建好的共享选择器缓存。"""
     calendar = calendar_picker._ses
     if calendar is not None and calendar.open and calendar.parent is dialog:
         calendar_picker._close()  # 只结束本编辑窗的子会话，不清主窗共享的日历缓存。
@@ -318,6 +331,7 @@ def _close_edit_children(dialog: _EditWindow) -> None:
 
 
 def _end_edit_session(session: _EditSession) -> None:
+    """幂等关闭当前编辑，撤任务/绑定、隐藏、按条件归还 grab，最后通知调用方。"""
     if not session.open:
         return
     session.open = False  # 先封住迟到回填；重入守卫到公共入口finally才释放。
@@ -356,6 +370,7 @@ def _end_edit_session(session: _EditSession) -> None:
 
 
 def _prefill_edit(dialog: _EditWindow, record: Account) -> None:
+    # 复用必须连空字段、错误、光标和滚动一起复位，不能只覆盖上次与本次不同的文本。
     dialog.date_var.set(record.record_date)  # 日期从本条记录覆盖，取消后的旧输入也不能留存。
     valid = record.amount.is_finite() and record.amount != 0
     dialog.amount_type_var.set("支出" if not valid or record.amount < 0 else "收入")  # 方向独立复位，不借主窗或上次编辑值。
@@ -372,6 +387,7 @@ def _prefill_edit(dialog: _EditWindow, record: Account) -> None:
 
 
 class _EditChips(TagChipsFrame):
+    """把通用 chips 的重排任务纳入编辑会话，子选择结果也仅交还仍有效的原会话。"""
     def _schedule_relayout(self) -> None:
         self.chips_view.grid()
         self.chips_frame.grid()
@@ -398,6 +414,7 @@ class _EditChips(TagChipsFrame):
 
 
 def _resize_edit(session: _EditSession) -> None:
+    # 请求高度/窗口边框是物理像素，geometry 接收逻辑尺寸；只在此换算一次，避免重复缩放。
     dialog = session.dialog
     assert dialog is not None
     scale = ctk.ScalingTracker.get_window_scaling(dialog)
@@ -463,10 +480,11 @@ def _chips_edit_height() -> None:
 
 
 def ask_edit_record(parent: ctk.CTk, record: Account) -> tuple[str, Decimal, tuple[str, ...], str] | None:
+    """返回规范化日期、带符号金额、完整标签、备注；取消、父窗失效或拒绝重入返回 None。"""
     global _edit_session, _edit_window
     if _edit_session is not None or not _edit_alive(parent):
         return None  # 模态编辑拒绝重入；不接管、不弹第二层提示、不丢未保存输入。
-    session = _EditSession(parent, replace(record))  # 保留调用瞬间记录快照，构造中Tk回调不能改掉本次预填来源。
+    session = _EditSession(parent, replace(record))  # 浅复制完整字段；tags 为不可变 tuple，无须从表格摘要重建。
     _edit_session = session  # 必须早于变量创建、建窗及所有Tk update登记守卫。
     try:
         session.signal = tk.BooleanVar(master=parent)
@@ -486,6 +504,7 @@ def ask_edit_record(parent: ctk.CTk, record: Account) -> tuple[str, Decimal, tup
         dialog.attributes("-alpha", 0.0)
         dialog.withdraw()
         if str(dialog.transient()) != str(parent):
+            # transient 可随本次调用更新，创建 master 仍属原父窗；缓存寿命不能脱离创建父窗。
             dialog.transient(parent)
         _close_edit_children(dialog)
         session.child_context.clear()  # 只在编辑会话开始清一次；同会话反复点▼不清上下文，也不销毁共享选择器缓存。
@@ -498,6 +517,7 @@ def ask_edit_record(parent: ctk.CTk, record: Account) -> tuple[str, Decimal, tup
             parent.wait_variable(signal)  # 缓存窗口不销毁，等待的是本次独立结束信号。
         return session.result
     except BaseException:
+        # 构建失败走永久销毁并重抛原异常，不能留一个已登记但永远不完成 setup 的半张表单。
         if session.dialog is not None and _edit_alive(session.dialog):
             session.dialog.finish_setup()
             session.dialog.destroy()  # 构建异常也释放#63半成品登记，不能永久占住父窗与缓存。
@@ -508,6 +528,7 @@ def ask_edit_record(parent: ctk.CTk, record: Account) -> tuple[str, Decimal, tup
 
 
 def _build_edit_controls(dialog: _EditWindow) -> None:
+    # 仅首次建控件；闭包可捕获缓存字段，但确认/取消必须在执行时现读 _edit_session。
     dialog.attributes("-alpha", 0.0)  # 隐藏初始布局和定位过程，避免先在系统默认位置闪现。
     dialog.title("编辑记录")
     dialog.minsize(460, 360)
@@ -697,9 +718,8 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
             ).date()
             # 与添加区同链：手输负号也只表示金额大小，最终方向由本窗按钮决定。
             parsed_amount = abs(Decimal(amount_var.get().strip()))
-            # Decimal("nan") / Decimal("Infinity") 解析本身不会报错，但入库后任何金额大小比较
-            # 都会抛 InvalidOperation，所以和新增记录一样在入口处就拒收非有限数。
-            # 这一层同时还承担"自我纠错"：用户编辑那条历史 NaN 记录时，必须先改成合法数字。
+            # NaN/Infinity 可被 Decimal 解析，但 NaN 比较可能抛异常、Infinity 会污染汇总；
+            # 与新增入口同样拒收非有限数，历史脏值也须先改成有限金额才允许确认。
             if not parsed_amount.is_finite():
                 raise ValueError
         except (ValueError, InvalidOperation):
@@ -708,9 +728,7 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
         # 仅在提交逻辑赋符号，保持调用方和数据层只接收统一的带符号 Decimal。
         if amount_type_var.get() == "支出":
             parsed_amount = -parsed_amount
-        # #58 Step 3a：标签改为多值，而且 0 个标签是合法的（§3.14.4 需答 Q2），
-        # 所以「标签非空」这条校验连同提示里的那半句一起删除；留下的
-        # 「金额不能为 0」是数据层也认的业务约束。
+        # §3.14.4 已确认 0 标签合法，collect_tags 可返回空元组；金额非零是独立约束。
         if parsed_amount == 0:
             error_var.set("金额不能为0，收支由按钮决定")
             return
@@ -755,7 +773,7 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
 
 
 def confirm_delete(parent: ctk.CTk) -> bool:
-    """显示不带系统快捷键标记的删除确认框。"""
+    """返回是否确认删除；本窗只收决定，调用方据此执行删除，关闭即销毁而不缓存。"""
     # 不用 messagebox.askyesno，是因为系统弹窗无法定制文字与配色，
     # 也无法明确哪个按钮是"危险"操作。
     dialog = ManagedToplevel(parent)
@@ -827,7 +845,7 @@ def confirm_delete(parent: ctk.CTk) -> bool:
     if dialog.closing or not center_dialog_on_parent(parent, dialog):
         return False  # 关闭请求优先，保持删除确认的取消语义。
     # grab_set 阻止用户在删除确认期间操作主窗口；
-    # wait_window 阻塞调用方直到对话框关闭，保证返回值一定是最终决定。
+    # wait_window 暂停本次调用但仍处理 Tk 事件，故按钮须检查 closing，不能假设等待期间无重入。
     dialog.grab_set()
     parent.wait_window(dialog)
     return result[0]

@@ -1,4 +1,11 @@
-"""SQLite persistence for AccountKeeper."""
+"""账本持久化与内存缓存：只管理 SQLite，不依赖 UI 或偏好文件。
+
+初始化顺序为建基础表、迁移标签到版本 2、迁移导入批次到版本 3、load 完整缓存。
+金额按带符号 Decimal 接收、以两位小数 TEXT 写入；数据层不再根据收支按钮赋符号。
+record_tags 是记录标签来源，accounts.category 仅供历史迁移；常用候选由 tag_prefs 管理。
+单笔 add/delete/update 提交后自行 load；批次导入/撤销只提交，由调用方另行 load 并刷新 UI。
+缓存读取顺序按记录 ID，界面日期排序、标签摘要及筛选由表现层处理。
+"""
 
 import csv
 from contextlib import closing, contextmanager
@@ -20,7 +27,7 @@ _SCHEMA_USER_VERSION = 3
 
 @dataclass
 class Account:
-    """A single expense record."""
+    """完整收支记录；tags 不可原地增删，但 Account 自身并非冻结对象。"""
 
     # 金额使用 Decimal 而不是 float，避免 0.1 + 0.2 这类浮点误差导致账目对不上。
     record_id: int
@@ -29,13 +36,9 @@ class Account:
     # 标签用 tuple 而不是 list（§3.14.2）：records 是全局内存缓存、UI 多处直接读同一批
     # Account 对象，list 允许某处 append() 静默改掉内存里这条记录而数据库没变；
     # tuple 使这种误改直接抛 AttributeError，第一时间暴露不一致。
-    # tuple 不可变可哈希、能当 set/dict 键（Step 4 聚合会用到），而 Account 自身在
-    # dataclass(eq=True) 下不可哈希，所以这层好处只是 tags 这一项的。
+    # tags 元组可以作值比较或集合键，但不代表 Account 自身可哈希或已冻结。
     # 顺序有语义（就是展示顺序），tuple 有序正好承载；具体顺序见 _group_tags 的说明。
-    # 【已删除的 shim】Step 2a 曾挂一个 Account.category property 把 tags 拼成单类别字符串，
-    # 供 UI 的 6 处 record.category 读取点过渡使用；Step 2c-2 已把那些读取点全改成
-    # "、".join(record.tags)，兼容层随之删除。拼展示串的口径只有一句「顿号连接」（§3.14.4），
-    # 各处就地拼即可，不再需要数据层额外提供一个属性（少一层就少一处不一致的可能）。
+    # 此处始终保存完整标签，不挂 category 展示属性；表格可做摘要，CSV 另按竖线连接。
     tags: tuple[str, ...]
     note: str
 
@@ -62,7 +65,7 @@ class ImportBatch:
 
 
 class AccountStore:
-    """Persist account records in a local SQLite database."""
+    """管理一个账本及其完整缓存；调用方不可把修改缓存当成已经写库。"""
 
     def __init__(self, path: Path = DB_PATH) -> None:
         # 数据库位置固定为 config.DB_PATH，不再接受配置覆盖；
@@ -74,7 +77,7 @@ class AccountStore:
         # 旧 CSV 迁移逻辑已在 #40 中整体删除（项目还没有真实用户从旧版本升级，迁移属于纯负债）。
         self._initialize_database()
         # 建表之后才迁移：迁移语句要往 record_tags 里写，表必须先存在。
-        # 放在 load() 之前，等 Step 2 让 load() 开始读 record_tags 时就不用再调整顺序。
+        # 放在 load() 之前，保证第一次读缓存时历史标签已按关联表口径迁移。
         # 「迁移前要不要先备份」不再靠「库文件本来就存在」这个布尔值判断——那个判据必须在
         # 建表之前问，而 _connect() 本身就会把新库凭空创建出来，时机太脆；改由迁移内部按
         # 「是否真有记录缺标签」决定（Step 2c-1）：全新库 / 无待补数据的库根本不进备份分支。
@@ -85,6 +88,7 @@ class AccountStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
+        """每次新建连接，成功提交写事务、异常回滚，最后关闭；不提供嵌套共享事务。"""
         # 目录可能被用户删掉或首次运行不存在，写库前先补建，防止 sqlite3.connect 直接报错。
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path)
@@ -139,6 +143,7 @@ class AccountStore:
                     Path(str(destination) + suffix).unlink(missing_ok=True)
 
     def _initialize_database(self) -> None:
+        # IF NOT EXISTS 只补基础表，不提升版本；数据迁移及批次列由后续专门入口负责。
         with self._connect() as connection:
             # amount 故意用 TEXT 存储，是为了原样保留 Decimal 的精度，读出时再转回 Decimal。
             connection.execute(
@@ -176,11 +181,11 @@ class AccountStore:
     def _backup_database(self) -> Path | None:
         """迁移前把库原样复制一份到同目录的 account.db.bak，失败返回 None。
 
-        用文件级复制而不是 SQLite 的备份 API：单文件库在连接关闭后直接 copy 最稳，
-        而且留下的是一份「迁移前那一刻」的完整字节快照，出问题直接用 .bak 覆盖回去。
+        此旧迁移路径在自己的读取连接关闭后复制主库文件，不包含 WAL 等伴随文件；
+        它不是在线一致性快照，不应复用为常规备份，常规备份由 snapshot_database 提供。
         备份路径基于 self.path、不是 config.DB_PATH：测试注入临时库时备份也该落在
         临时目录里，绝不能写到真实数据目录去。每次覆盖同一份、不带时间戳，
-        一份最新备份足够，避免在用户目录里堆文件（§3.14.6 待定项 b 的倾向）。
+        这是迁移副本的固定命名约定，不影响常规 ZIP 备份的命名与保留规则。
         调用门槛由 _migrate_to_multi_tag 把着：**只有「确有记录缺标签」时才轮到本方法**，
         所以全新库与无待补数据的库都不会在用户目录里留下一个空的 .bak。
         """
@@ -220,8 +225,7 @@ class AccountStore:
         """
         try:
             # 第一段（只读，连接用完即关）：先读版本判断要不要跑，再数一遍待补条数。
-            # 版本与条数都在关连接之前读完，因为文件级备份要读一份「静止」的库，
-            # 不能跟尚未落盘的 journal 状态纠缠。
+            # 读完即关闭本连接再复制，避免本轮连接跨过备份阶段；这并不锁住外部写入者。
             with self._connect() as connection:
                 version_row = connection.execute("PRAGMA user_version").fetchone()
                 # PRAGMA 一定返回一行，这里仍做兜底，避免脏库返回空结果时下标报错。
@@ -318,6 +322,7 @@ class AccountStore:
 
     @staticmethod
     def _validate_import_schema(connection: sqlite3.Connection) -> None:
+        """在迁移事务内检查必需列及批次引用；版本号正确也不能代表结构一定完整。"""
         batch_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(import_batches)")
         }
@@ -335,6 +340,7 @@ class AccountStore:
             row[2:5] == ("import_batches", "import_batch_id", "id")
             for row in foreign_keys
         )
+        # table_info 第 4 项是 NOT NULL 标记，必须允许为空以兼容手动/历史记录；仅有同名列不够。
         if (
             not required <= batch_columns or column is None
             or column[3] or not valid_reference
@@ -342,10 +348,12 @@ class AccountStore:
             raise sqlite3.DatabaseError("导入批次 schema 不完整，不能启用导入。")
 
     def _require_import_batches(self) -> None:
+        # 缓存可读不代表批次表已就绪，所有批次入口都先过这个门槛，防止降级后继续写入。
         if not self.import_batches_available:
             raise sqlite3.DatabaseError("导入批次数据库尚未就绪。")
 
     def list_import_batches(self) -> list[ImportBatch]:
+        """现读批次原始数量快照，按批次 ID 倒序；不从当前记录数反推导入笔数。"""
         self._require_import_batches()
         with self._connect() as connection:
             rows = connection.execute(
@@ -360,11 +368,12 @@ class AccountStore:
     ) -> ImportBatch | None:
         """一次事务导入；调用者在提交成功后单独 load/刷新，避免把显示失败当回滚。"""
         self._require_import_batches()
+        # bool 是 int 的子类，计数这里要求真实整数，不能把 True 当作一笔跳过记录。
         if any(type(count) is not int or count < 0 for count in (
             skipped_count, non_transaction_count,
         )):
             raise ValueError("跳过笔数及非交易行数必须为非负整数。")
-        values = []
+        values = []  # 全批先校验再开写事务，末笔非法也不能留下已写入的前几笔。
         for record in records:
             date = datetime.strptime(record.record_date, "%Y-%m-%d").date().isoformat()
             if not self._is_valid_amount(record.amount):
@@ -375,7 +384,7 @@ class AccountStore:
             values.append((date, f"{record.amount:.2f}", "", record.note.strip()))
         if not values:
             return None  # 零笔不创建批次，也不产生空事务。
-        name = Path(file_name).name
+        name = Path(file_name).name  # 批次仅留文件名，不持久化用户机器上的完整来源路径。
         if not name:
             raise ValueError("导入文件名不能为空。")
         imported_at = datetime.now().isoformat(timespec="seconds")
@@ -412,6 +421,7 @@ class AccountStore:
             ).fetchone()
             if exists is None:
                 return False
+            # 编辑不改 import_batch_id，故撤销含已编辑记录；单笔已删的记录无需再恢复或删除。
             # 导入后可能被编辑并加标签，必须先按当前批次记录清理全部关联，再删主记录。
             connection.execute(
                 "DELETE FROM record_tags WHERE record_id IN "
@@ -448,10 +458,9 @@ class AccountStore:
         return {record_id: tuple(tags) for record_id, tags in grouped.items()}
 
     def load(self) -> None:
-        """Read all records from SQLite."""
+        """重建完整缓存，不写回数据库；金额无法解析的行仅从本轮缓存排除。"""
         with self._connect() as connection:
-            # 两条 SELECT 走同一个连接 = 同一个事务快照，不会出现「读完 accounts 再去读
-            # record_tags 时库已被改动」的错位，也省掉一次开文件。
+            # 两条 SELECT 复用连接减少开关成本；这里未显式 BEGIN，不能承诺并发写入下的共同快照。
             # category 列已从 SELECT 里去掉（#58 Step 2c-2）：标签的真源只有 record_tags，
             # 旧列不再参与任何读取，少一列就少一次「到底以哪边为准」的歧义。
             account_rows = connection.execute(
@@ -479,6 +488,7 @@ class AccountStore:
                     f"警告：记录 ID {record_id} 的金额无法解析（{amount!r}），已跳过该行：{error}"
                 )
                 continue
+            # 能解析的 NaN/Infinity 仍会进入缓存；此方法不做有限性筛除，写入及聚合另有护栏。
             records.append(
                 Account(
                     record_id,
@@ -489,7 +499,7 @@ class AccountStore:
                     note,
                 )
             )
-        self.records = records
+        self.records = records  # 全部构造完才替换列表；持有旧列表的调用方须重新读取本属性。
 
     def get_tags(self) -> list[str]:
         """返回库里所有用过的标签（去重、按字典序）。
@@ -510,7 +520,8 @@ class AccountStore:
         return [row[0] for row in rows]
 
     def next_id(self) -> int:
-        # 取当前最大 ID 加一；空表时 default=0 返回 1，避免 max() 在空序列上报错。
+        """按当前缓存估算下一编号，不预留主键，也不读取 SQLite 的自增序列。"""
+        # 真正插入以 lastrowid 为准；缓存可能跳过脏行或尚未刷新，不能把估算值当数据库 ID。
         return max((record.record_id for record in self.records), default=0) + 1
 
     @staticmethod
@@ -518,13 +529,13 @@ class AccountStore:
         """金额必须是可比较、可汇总的有限数，且不能为 0。
 
         这一层是数据层的最后一道防线：Decimal("nan") / Decimal("Infinity")
-        解析时不会报错，一旦入库，之后所有「金额 > 0」这类大小比较和求和
-        都会抛 InvalidOperation 或静默变成 NaN，直接把界面渲染炸掉。
+        可被解析，但 NaN 比较可能抛 InvalidOperation，Infinity 会污染汇总；
+        不能把解析成功等同于可用的记账金额。
         因此无论多少条调用链，写入前都必须在这里被拦下。
         """
         if not isinstance(amount, Decimal):
             return False
-        return amount.is_finite() and amount != 0
+        return amount.is_finite() and amount != 0  # 先判有限性再比较，避免 NaN 比较触发异常。
 
     @staticmethod
     def _normalize_tags(raw_tags: Iterable[str]) -> tuple[str, ...]:
@@ -544,7 +555,7 @@ class AccountStore:
         # 护栏（#58 Step 2c-2）：str 自己也是 Iterable[str]，若放行，迭代 "餐饮" 会得到
         # "餐"、"饮" 两个单字标签——不抛异常、界面还显示得像正常数据，属于最难发现的
         # 一类静默损坏（Step 2b 正是靠「store 内部不肯直接迭代字符串」躲开了它）。
-        # 形参既然已经改成序列，就在入口把这条错误用法喊出来：调用方应传 (category,)。
+        # 调用方应传完整标签序列（单标签也是一项元组），不能把展示摘要送入数据库。
         if isinstance(raw_tags, str):
             raise TypeError(
                 f"tags 必须是标签序列，不能传裸字符串（0 个标签请传 ()）：{raw_tags!r}"
@@ -588,11 +599,11 @@ class AccountStore:
     def add(
         self, record_date: str, amount: Decimal, tags: tuple[str, ...], note: str
     ) -> None:
+        """写主记录及完整标签，提交后重载缓存；日期和金额方向由提交入口先处理。"""
         # 入库前先校验金额，非法金额直接拒绝写入，绝不允许 NaN / Infinity 污染账本。
         if not self._is_valid_amount(amount):
             raise ValueError(f"非法金额：{amount!r}")
-        # 形参从「单个 category 字符串」改成 tags 元组（#58 Step 2c-2），UI 侧同步改成传
-        # (category,) —— 数据层从此只认序列，裸字符串会被 _normalize_tags 的护栏直接拒绝。
+        # 标签按完整序列清理，空元组合法；清理保留输入顺序，重载后才按字典序展示。
         tags = self._normalize_tags(tags)
         # 金额统一格式化为两位小数后再入库，避免出现 "5.0" 与 "5.00" 混用的情况。
         # 两条写语句共用一个 _connect() 事务：只 commit 一次、中途异常整体回滚，
@@ -617,6 +628,7 @@ class AccountStore:
         self.load()
 
     def delete(self, record_id: int) -> bool:
+        """按主键原子删除记录及标签；找不到返回 False，成功后重载缓存。"""
         with self._connect() as connection:
             cursor = connection.execute("DELETE FROM accounts WHERE id = ?", (record_id,))
             # rowcount 为 0 说明该 ID 不存在，交由调用方提示「找不到该记录」。
@@ -643,7 +655,7 @@ class AccountStore:
         tags: tuple[str, ...],
         note: str,
     ) -> bool:
-        """更新指定记录，记录不存在或数据库操作失败时返回 False。"""
+        """整份更新记录及标签，保留主键/批次归属；金额非法、缺记录或写库失败返回 False。"""
         # 与 add 同源：金额非法一律按「更新失败」处理，返回 False 让 UI 弹提示而不是崩溃。
         if not self._is_valid_amount(amount):
             return False
@@ -674,11 +686,12 @@ class AccountStore:
             return False
         if not updated:
             return False
+        # 写事务已提交；load 的读取异常仍向外传播，不能把后续缓存失败说成数据库已回滚。
         self.load()
         return True
 
     def export_month_csv(self, month: str, save_path: Path) -> Path:
-        """Export one month's records to the provided save path and return it."""
+        """现读指定月份导出 CSV，不依赖筛选后的表格或缓存，路径及失败提示由调用方管理。"""
         # 用 "YYYY-MM-%" 做 LIKE 前缀匹配，可精确命中该月所有日期，且不会误伤其它月份。
         with self._connect() as connection:
             # category 列已从 SELECT 里去掉（#58 Step 2c-2）：标签只认 record_tags。
@@ -692,14 +705,12 @@ class AccountStore:
             tag_rows = connection.execute(
                 "SELECT record_id, tag FROM record_tags ORDER BY record_id, tag"
             ).fetchall()
-        # 与 load() 共用同一份归并规则，保证导出内容与界面显示一致。
+        # 与 load() 共用标签归并；金额按库内 TEXT 原值导出，不经过 load 的脏金额跳过逻辑。
         tags_by_id = self._group_tags(tag_rows)
 
         # 表头直接取 config.CSV_FIELDS（#58 Step 2c-2）：该常量的第 4 项已从 category 改成 tags，
         # 不再需要函数内做运行时改名；列序与名字都只有一个真源。
-        # 多标签用竖线连接（§3.14.4）：若用逗号，csv.writer 会给该字段自动加双引号
-        # （"日用,家庭"）——虽然合法，但用户拿 Excel「文本分列」或脚本 split(',') 时会踩坑；
-        # 竖线在标签名里极罕见，整行仍是规整的逗号分隔。
+        # CSV 标签字段按 §3.14.4 用竖线连接，与表格的顿号前缀/计数徽标分开，不能导出摘要。
         # 0 标签时 "|".join(()) 天然得到空串，正好对应「0 标签写空串」，无需特判。
         rows = [
             (

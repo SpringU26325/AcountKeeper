@@ -1,4 +1,10 @@
-"""文件操作菜单：共用三角入口与定位，隐藏复用三项操作列表。"""
+"""工具栏文件菜单：隐藏复用三项操作列表，业务动作仍交给 ToolbarFrame 的回调。
+
+FileMenu 拥有缓存 _FileWindow；不持 grab、不阻塞等待，只有展开期间监听外点/ESC/几何事件。
+close 撤销所属任务和本次绑定、恢复三角并隐藏；destroy 才销毁缓存窗，均不得清除其他订阅。
+原生 Destroy 也要通知菜单收尾；ManagedToplevel 另外保护构建中的父子销毁。
+圆角裁剪的 GDI 区域成功移交系统后不再自行释放，失败区域由本模块回收。
+"""
 
 from collections.abc import Callable
 import ctypes
@@ -26,7 +32,9 @@ _gdi32.DeleteObject.restype = wintypes.BOOL
 
 
 class _FileWindow(ManagedToplevel):
-    _rounded_target: tuple[int, int, int, int] | None = None
+    """无标题栏缓存菜单窗；实际创建父控件是 FileMenu，寿命与入口控件一起结束。"""
+
+    _rounded_target: tuple[int, int, int, int] | None = None  # 原生句柄/物理宽高/圆角半径，换尺寸或缩放须重新裁剪。
 
     def round_corners(self, event: tk.Event | None = None) -> None:
         if self.closing or (event is not None and event.widget is not self):
@@ -65,13 +73,15 @@ class _FileWindow(ManagedToplevel):
 
 
 class FileMenu(ctk.CTkFrame):
+    """维护入口、缓存窗和展开状态；动作名由调用方传入，不在这里实现导出/备份。"""
+
     def __init__(self, master: ctk.CTkBaseClass, actions: tuple[str, ...],
                  command: Callable[[str], None]) -> None:
         super().__init__(master, width=92, height=32, corner_radius=8, fg_color="#E3EAF2")
         self._actions, self._command = actions, command
         self._popup: _FileWindow | None = None
-        self._open = False
-        self._bindings: list[tuple[tk.Misc, str, str, str, str]] = []
+        self._open = False  # 会话守卫，不等于缓存窗是否存在；隐藏后窗口仍可复用。
+        self._bindings: list[tuple[tk.Misc, str, str, str, str]] = []  # 登记 owner/tag/事件/命令 ID/守卫脚本，收尾两端都清。
         self._target: tuple[int, int, int, int] | None = None
         # 固定92×32入口，文字和32px三角都可点击，工具栏布局不随选择项变宽。
         self.grid_propagate(False)
@@ -87,6 +97,7 @@ class FileMenu(ctk.CTkFrame):
         self.bind("<Destroy>", self._on_destroy, add=True)  # CTkFrame用布尔追加绑定，匹配参数类型并保留内部回调。
 
     def _ensure_window(self) -> _FileWindow:
+        """懒建或复用控件树；真正销毁后的旧 Python 引用不能当作仍可使用的缓存。"""
         if self._popup is not None and self._popup.winfo_exists():
             return self._popup
         window = _FileWindow(self)
@@ -112,7 +123,7 @@ class FileMenu(ctk.CTkFrame):
                 background_corner_colors=corner_colors,  # type: ignore[reportArgumentType] # 库注解误写为单元素tuple，实际绘制依次读取四角。
                 font=("Microsoft YaHei UI", 11), fg_color="#FFFFFF",
                 hover_color="#D2DEE9", text_color="#455A64",
-                command=lambda chosen=action: self._choose(chosen),
+                command=lambda chosen=action: self._choose(chosen),  # 钉住本行名称，避免循环闭包让三项都调用最后一项。
             ).pack(fill="x", pady=(0, 4 if index < len(self._actions) - 1 else 0))
         window.protocol("WM_DELETE_WINDOW", self.close)
         window.finish_setup()
@@ -120,6 +131,7 @@ class FileMenu(ctk.CTkFrame):
 
     def _listen(self, owner: tk.Misc, tag: str, sequence: str,
                 callback: Callable) -> None:
+        # all 脚本共享整份订阅，记录本次追加片段才能精确撤销；不能用 unbind_all 清整条事件。
         before = owner.tk.call("bind", tag, sequence)
         # 用原生绑定入口按owner注册，关闭时才能同时摘脚本与对应Tcl命令。
         funcid = (tk.Misc.bind_all(owner, sequence, callback, add="+") if tag == "all"
@@ -163,6 +175,7 @@ class FileMenu(ctk.CTkFrame):
             raise
 
     def _reanchor(self, _event: tk.Event | None = None) -> None:
+        # 共用公式按屏幕总宽高定位，不读监视器工作区；位置已是物理像素，逻辑宽高只缩放一次。
         window = self._popup
         if not self._open or window is None:
             return
@@ -183,6 +196,7 @@ class FileMenu(ctk.CTkFrame):
 
     @staticmethod
     def _contains(widget: tk.Misc, ancestor: tk.Misc) -> bool:
+        # CTk 点击常落在内部 Canvas/Label，须沿 master 链认整个入口，不能只比按钮对象。
         node: tk.Misc | None = widget
         while node is not None:
             if node is ancestor:
@@ -212,8 +226,9 @@ class FileMenu(ctk.CTkFrame):
         self._command(action)  # 回调可能打开模态对话框，必须在隐藏和解绑之后调用。
 
     def close(self) -> None:
+        """幂等结束展开状态并保留窗口；精确撤脚本/命令，普通隐藏不走永久 destroy。"""
         self._open = False  # 先设身份守卫，清理中的Configure/点击不再续开旧菜单。
-        _cancel_owned_tasks(self)  # 点击动画及缓存窗的CTk延期任务归本入口，隐藏后不续画旧会话。
+        _cancel_owned_tasks(self)  # 缓存窗是本入口的子控件，扫描入口树可同时取消按钮动画和窗内延期任务。
         for owner, tag, sequence, funcid, script in self._bindings:
             try:
                 current = owner.tk.call("bind", tag, sequence)
@@ -234,6 +249,7 @@ class FileMenu(ctk.CTkFrame):
             self.close()  # 原生父窗连带销毁也须摘掉根窗持有的外点/ESC监听。
 
     def destroy(self) -> None:
+        # 先关闭共享 all/root 绑定再销毁窗口，避免外部控件后续事件仍调用已退出的菜单。
         self.close()
         if self._popup is not None:
             self._popup.destroy()  # 退出才真正销毁缓存，沿用ManagedToplevel所属任务清理。

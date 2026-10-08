@@ -1,4 +1,8 @@
-"""Chart window rendering for AccountKeeper."""
+"""文件菜单的按月图表入口：从 store 完整缓存筛选，由 tag_aggregation 统一聚合。
+
+每次调用创建独立原生 tk.Toplevel，不复用、不给主窗 grab，也不接入 CTk 弹窗生命周期。
+图表是创建时的汇总结果，不跟随主窗搜索或后续写入刷新；matplotlib 仅在确需绘图时导入。
+"""
 
 from __future__ import annotations
 
@@ -28,14 +32,14 @@ def _apply_app_icon(window: tk.Tk | tk.Toplevel) -> None:
 
 
 def show_chart_window(app: AccountKeeperApp) -> None:
-    """按月份汇总各标签收入和支出并显示图表。"""
+    """月份取消或无记录即返回；聚合完整 tags，绘图失败由渲染入口向用户提示。"""
     # 复用主窗口的月份选择器，保持交互方式一致（需求 3.10：图表按月份汇总）。
     # issues #3.2 后月份改为月历点选，弹窗内不再有 prompt 说明文字，故只传标题。
     month = app.ask_month("查看图表")
     if month is None:
         return
 
-    # 日期带前导零，所以按月前缀匹配即可精确筛选该月记录。
+    # 日期带前导零，按月前缀筛选完整缓存；不能取 Treeview 当前行，否则搜索会缩小月报。
     month_records = [
         record
         for record in app.store.records
@@ -44,7 +48,7 @@ def show_chart_window(app: AccountKeeperApp) -> None:
     if not month_records:
         messagebox.showinfo("无法生成图表", "该月没有记录，无法生成图表")
         return
-    totals = aggregate_records_by_tag(month_records)
+    totals = aggregate_records_by_tag(month_records)  # 多标签各计整笔、无标签入虚拟桶，图表不另写统计口径。
     _render_chart_window(app, month, totals)
 
 
@@ -72,7 +76,8 @@ def _render_chart_window(
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
         from matplotlib.figure import Figure
 
-        # 指定中文字体并关闭 unicode 负号，否则标题、分类名会显示成方块，负号也会缺字。
+        # 首选 Windows 中文字体并用普通连字符画负号；字体是否实际安装仍由运行环境决定。
+        # rcParams 属于 matplotlib 全局设置，后续新图也会沿用，不能当作仅对本窗口生效。
         plt.rcParams["font.sans-serif"] = ["Microsoft YaHei"]
         plt.rcParams["axes.unicode_minus"] = False
 
@@ -84,24 +89,25 @@ def _render_chart_window(
         # 图表同时画收入和支出两组柱子，标题必须体现"收入与支出"，与图内标题保持一致。
         chart_window.title(f"{month} 收入与支出统计")
         width, height = 700, 550
-        # 按屏幕分辨率计算居中坐标，避免图表窗口出现在屏幕角落。
+        # 原生 Tk geometry 使用物理像素，按屏幕总尺寸居中；这里不查询主窗所在监视器工作区。
         screen_width = chart_window.winfo_screenwidth()
         screen_height = chart_window.winfo_screenheight()
         position_x = (screen_width - width) // 2
         position_y = (screen_height - height) // 2
         chart_window.geometry(f"{width}x{height}+{position_x}+{position_y}")
 
-        keys = list(totals.by_tag)
-        # 图表内部只接受 float，这里把 Decimal 转成 float；展示用途下精度损失可以接受。
+        keys = list(totals.by_tag)  # 保留聚合结果的首次出现顺序，与统计入口一致，不在绘图时重排。
+        # 仅在柱形显示边界将 Decimal 转 float，近似值不能写回账本或用作业务汇总。
         income_values = [
             float(totals.by_tag[key].income)
             for key in keys
         ]
+        # 聚合支出保存正数大小，取负只为让柱形向下；不是添加/编辑的账本符号转换。
         expense_values = [
             -float(totals.by_tag[key].expense)
             for key in keys
         ]
-        # 用 Figure 对象而不是 plt.show()，这样才能把图表真正嵌进 Tkinter 窗口。
+        # 直接创建 Figure 嵌入 Tk，不通过 pyplot 的图窗管理器另开一个窗口。
         fig = Figure(figsize=(7, 5))
         ax = fig.add_subplot(111)
         positions = list(range(len(keys)))
@@ -159,16 +165,18 @@ def _render_chart_window(
         #
         # 这里不复用下面的 close_chart：它定义在画布创建成功之后，此刻名字可能还没绑定；
         # 它依赖 canvas/fig/plt 三个值，导入失败时连 plt 都不存在，调用它只会变成二次异常。
-        # 异常路径下唯一要做的是销毁可能已建出的窗口，避免屏幕上留下一个半残的空窗。
+        # 异常路径销毁可能已建出的 Tk 窗口；未安装下方正常关闭回调，不保证执行相同 Figure 收尾。
         if chart_window is not None:
             chart_window.destroy()
         messagebox.showerror("无法生成图表", "图表渲染失败，请检查 matplotlib 安装或重启程序")
         return
 
     def close_chart() -> None:
-        # 关闭窗口时必须手动释放画布并关闭 Figure，否则 matplotlib 会持续占用内存。
+        # 用户点关闭时先销毁 Tk 画布，再交 pyplot 关闭 Figure，最后销毁窗口。
+        # Figure 直接构造，plt.close 不等于立即回收全部 Python 引用；最终回收仍取决于引用释放。
         canvas.get_tk_widget().destroy()
         plt.close(fig)
         chart_window.destroy()
 
+    # 只覆盖用户关闭协议；父窗销毁和程序直接 destroy 不经过此回调，不能声称所有路径都手动收尾。
     chart_window.protocol("WM_DELETE_WINDOW", close_chart)

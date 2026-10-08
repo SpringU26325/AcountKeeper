@@ -2,6 +2,8 @@
 
 偏好单独存文件而不并入 settings.json：settings 写入时会整份覆盖，混放标签会被
 导出路径更新洗掉。旧版 categories.json 只在首次初始化时读取，不修改、不删除。
+这里的顺序是常用候选的用户顺序，不是账本重载后的标签字典序；不查库，也不缓存候选。
+保存、删除、置顶只改变常用列表，不修改已记账记录；手输文本拆分也不自动保存候选。
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ def _clean_list(value: object, field: str) -> list[str]:
     cleaned: list[str] = []
     dropped = 0
     for item in value:
+        # JSON 脏项只从本次返回结果排除，读取本身不修写文件；保留其余可用候选。
         if not isinstance(item, str) or not item.strip():
             dropped += 1
             continue
@@ -40,15 +43,13 @@ def _clean_list(value: object, field: str) -> list[str]:
 
 
 def split_tag_input(text: str) -> tuple[str, ...]:
-    """把一行手输文本按顿号拆成有序去重的标签元组（#58 Step 3a 新增）。
+    """新增区和编辑区共用的纯拆分，返回按首次出现去重的完整标签元组，不读写文件。
 
-    「顿号连接」是标签唯一的展示口径（§3.14.4：表格单元格、CSV、图表都用它），
-    所以用户在一个输入框里写多个标签时也用同一个分隔符。清理规则与偏好层的
-    _clean_list 保持一致（strip、丢弃空项、按首次出现顺序去重），但刻意不发警告：
-    用户输入「餐饮、」这类以分隔符结尾的写法是常态，不是数据故障，不该打印警告。
-    放在偏好层是为了让新增区与编辑弹窗共用一份实现，两处口径不会各自漂开。
+    手输多标签按顿号分隔；CSV 标签字段另用竖线，本函数不用于导出回读或解析表格摘要。
+    清理规则与候选列表一致，但输入尾部多一个顿号是正常操作，不按文件脏项发警告。
     """
     cleaned: list[str] = []
+    # 先去空再判重，允许 0 标签；不截断名称，结果供 chips 收集完整输入。
     for part in (text or "").split("、"):
         tag = part.strip()
         if tag and tag not in cleaned:
@@ -57,20 +58,21 @@ def split_tag_input(text: str) -> tuple[str, ...]:
 
 
 def _read_tags_document() -> dict | None:
-    """读取 tags.json；损坏或格式不符时返回 None，写操作可随后恢复标准结构。"""
+    """只读 tags.json；缺失或结构不可读返回 None，是否重写交给显式变更入口。"""
     if not TAG_PREFS_PATH.exists():
         return None
     try:
         with TAG_PREFS_PATH.open("r", encoding="utf-8") as handle:
             raw = json.load(handle)
     except (OSError, ValueError) as error:
+        # 候选读取故障降为空列表，不让可选的常用标签功能阻断记账；这里不覆盖原文件。
         _warn(f"{TAG_PREFS_PATH.name} 读取或解析失败（{error}），本次按空列表处理。")
         return None
     if not isinstance(raw, dict):
         _warn(f"{TAG_PREFS_PATH.name} 根节点不是对象，本次按空列表处理。")
         return None
     if raw.get("version") != _SCHEMA_VERSION:
-        # 版本号只写不校验；只要 tags 列表结构仍可读，就不因版本字段阻断候选。
+        # 版本不匹配只警告；只要 tags 列表结构仍可读，就不因版本字段阻断候选。
         _warn(f"{TAG_PREFS_PATH.name} 格式版本为 {raw.get('version')!r}，仍尝试读取标签列表。")
     if not isinstance(raw.get("tags"), list):
         _warn(f"{TAG_PREFS_PATH.name} 格式不合法，本次按空列表处理。")
@@ -107,14 +109,14 @@ def _tags_list(document: dict) -> list[str]:
 
 def build_tag_candidates() -> list[str]:
     """返回 tags.json 当前列表；每次现读，确保弹窗内修改立即反映。"""
-    document = _read_tags_document()
+    document = _read_tags_document()  # 每次从唯一偏好列表取值，不再合并历史标签复活用户已删候选。
     if document is None:
         return []
     return _tags_list(document)
 
 
 def _write_document(document: dict) -> bool:
-    """将标准化后的单段结构写回 tags.json。"""
+    """只写 version/tags 标准结构；直接整份覆盖，未采用导入映射的临时文件原子替换。"""
     payload = {"version": _SCHEMA_VERSION, "tags": _tags_list(document)}
     try:
         # 用户可能移动或删除数据目录，写入前补建目录以便偏好功能自行恢复。
@@ -122,13 +124,14 @@ def _write_document(document: dict) -> bool:
         with TAG_PREFS_PATH.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
     except OSError as error:
+        # 返回 False 只表示未能保存，直接写入失败并不承诺原文件仍完整；由调用方反馈结果。
         _warn(f"{TAG_PREFS_PATH.name} 写入失败（{error}），本次操作未保存。")
         return False
     return True
 
 
 def _apply(name: str, change: Callable[[str, list[str]], bool]) -> bool:
-    """读单段列表、执行变更并写回；目标状态未改变时跳过无意义的文件重写。"""
+    """对现读列表应用变更；True 表示成功或无需变更，不保证本次实际写过文件。"""
     cleaned = (name or "").strip()
     if not cleaned:
         _warn("标签名为空，本次操作未保存。")
@@ -136,6 +139,7 @@ def _apply(name: str, change: Callable[[str, list[str]], bool]) -> bool:
 
     document = _read_tags_document()
     tags = [] if document is None else _tags_list(document)
+    # change 的 False 表示列表未变，不是操作失败；只有有效变更才重写标准结构。
     if not change(cleaned, tags):
         return True
     return _write_document({"tags": tags})
@@ -153,7 +157,7 @@ def save_tag(name: str) -> bool:
 
 
 def delete_tag(name: str) -> bool:
-    """真删除标签；标签本已不存在时幂等成功且不重写文件。"""
+    """从常用候选真删除，不删除账本标签；本已不存在时幂等成功且不重写文件。"""
     def change(tag: str, tags: list[str]) -> bool:
         if tag not in tags:
             return False
@@ -183,6 +187,7 @@ def ensure_tags_initialized(history: Iterable[str] | None) -> bool:
     expense 全段，再按原序追加 income 中的新项；旧文件非法时视作不存在，转用预置与
     调用方传入的历史标签。此处只接收历史参数，不导入 store，保持偏好层无数据库依赖。
     """
+    # 存在即跳过，即使文件损坏或用户清空也不重新播种，以免常用列表被静默恢复。
     if TAG_PREFS_PATH.exists():
         return False
 
@@ -190,6 +195,7 @@ def ensure_tags_initialized(history: Iterable[str] | None) -> bool:
     if CATEGORY_PREFS_PATH.exists():
         legacy = _read_legacy_categories()
     if legacy is not None:
+        # 合法但两段都空的旧文件也代表用户选择，不能以空列表为由改用默认标签。
         expense, income = legacy
         # expense 保留完整原序；income 只补未出现的名字，合并结果不排序。
         tags = _clean_list(expense + income, "legacy.tags")

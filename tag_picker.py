@@ -1,38 +1,13 @@
-"""标签选择弹窗（需求 3.13）。
+"""标签多选弹窗（需求 3.13）：一个缓存窗口，每次调用有独立选择与结束信号。
 
-对外只暴露 ask_tags()：给「添加记录」输入区和「编辑记录」弹窗的标签字段
-提供一个可点击的候选列表，降低手打标签的成本，也避免同一个开销被记成
-「餐饮 / 吃饭 / 午饭」多种写法，让 3.4 统计和 3.10 图表里的标签维度能真正聚合。
-
-实现上刻意不用 CTkComboBox（上一版的做法），原因有两个：
-
-1. 视觉不统一。CTkComboBox 的箭头是画在控件内部右上角的一个小折角，
-   而日期字段用的是「输入框 + 独立 ▼ 按钮」；两者并排放在同一张卡片里风格对不上。
-2. 下拉列表位置压不住（用户反馈：左边缘比输入框左边缘还偏左）。
-   它的下拉是 Tk 原生 tkinter.Menu（见 customtkinter 的 dropdown_menu.py）：
-   弹出位置由 Tk 的菜单定位逻辑决定，还在 y 方向额外叠加了一段固定偏移，
-   Windows 下这个菜单窗口自带一圈 borderwidth，会向请求坐标之外再扩出去；
-   更麻烦的是 post() 之后窗口尚未映射，此时查询 winfo_rootx()/winfo_width()
-   只会拿到 0/1（实测 viewable=0），代码里根本没有可校正的时机。
-
-本模块改用 CTkToplevel 自己画一列标签项：位置、宽度、配色全部由我们控制，
-既不经过 Tk 原生菜单，也就不需要去改 CustomTkinter 的下拉实现。
-布局与提交流程对齐 calendar_picker.py，保证两个弹窗看起来是一家人。
-
-交互上本弹窗刻意**不** grab_set，这一点与 calendar_picker 相反，原因是需求要求
-「再点一次同一个 ▼ 就把列表关掉」和「点弹窗外的别处也关掉」：只要 grab 住，
-弹窗外的一切鼠标事件都会被 Tk 直接丢掉，第二次点 ▼ 根本进不来，toggle 永远做不到。
-放弃 grab 的代价是弹窗不再模态——关掉它的那一次外部点击会同时作用到被点的控件上
-（点「添加」就真的会添一条记录）。这一点无法两全，只能选 toggle。
-
-弹窗底部是一条操作区（footer，见下方 _FOOTER_* 常量与「底部操作区」那一段）：
-第一行是「新标签输入框 + 「+ 保存」按钮」，第二行是一行提示语；列表里每一项右侧
-有「顶」和「×」两个按钮：「顶」把该标签移到候选列表最前（tag_prefs.move_tag_to_top），
-「×」把它从候选里**真删掉**（tag_prefs.delete_tag）。
-这些动作全部交给 tag_prefs 落盘，本模块通过 _render_list 同步候选，保留未变化的行。
-
-footer 里那个输入框是**弹窗自己的**，不绑主窗口的 tag_input_var：存什么完全以它
-里面的文字为准，调用方只在「完成」时通过返回值收取本次有序选择。
+ask_tags 同步等待 wait_variable，但不持 grab；应用内外点可关闭并继续作用于所点控件。
+同锚点再次调用是 toggle 取消，不同锚点先结束旧会话再接管；旧栈只返回自己的 result。
+_win 缓存控件/候选行，_active_picker 持本次 parent、anchor、选择、任务及绑定；不能串用。
+创建 master 不变，transient 可换本次父窗；创建父窗退出会毁窗，本次父窗退出须结束会话。
+普通结束取消本次任务、精确解绑、隐藏；真正销毁交给 ManagedToplevel，并清窗口缓存。
+「完成」返回完整选择元组，取消返回 None；自定义已选标签可不在常用候选列表中。
+保存/删除/置顶通过 tag_prefs 立即改常用列表，取消本次选择不会回滚这些偏好，也不改历史账本。
+footer 是本窗独立输入：current 仅预填保存框，selected_tags 才预填已选集合，二者不能混为一谈。
 """
 
 from __future__ import annotations
@@ -122,13 +97,14 @@ _POLL_INTERVAL_MS = 50  # 复查锚点位置的轮询间隔（Windows 下窗口�
 
 @dataclass
 class _Session:
+    """本次调用的独立状态；缓存窗可复用，信号、结果和任务清单不可跨次复用。"""
     dialog: _TagWindow
     parent: tk.Tk | tk.Toplevel
     anchor: tk.Misc
     toggle: ctk.CTkButton | None
     signal: tk.BooleanVar
-    selected_order: list[str]
-    selected_set: set[str]
+    selected_order: list[str]  # 返回值保留选择顺序，不能用 set 的遍历顺序提交。
+    selected_set: set[str]  # 与 order 同步增删，只负责成员判断和行高亮。
     candidates: list[str]
     previous_grab: tk.Misc | None = None
     result: tuple[str, ...] | None = None
@@ -136,8 +112,8 @@ class _Session:
     ready: bool = False
     height: int = 1
     last_target: tuple[int, int, int, int] | None = None
-    tasks: dict[str, str] = field(default_factory=dict)
-    bindings: list[tuple[tk.Misc, str, str, str]] = field(default_factory=list)
+    tasks: dict[str, str] = field(default_factory=dict)  # 功能键 → dialog 注册的 after/idle，结束时逐个取消。
+    bindings: list[tuple[tk.Misc, str, str, str]] = field(default_factory=list)  # 原控件/事件/命令 ID/守卫脚本必须成套解绑。
 
     def close(self) -> None:
         _end_session(self)  # 活动登记保存会话身份，旧调用的收尾不得误关新会话。
@@ -145,6 +121,7 @@ class _Session:
 
 @dataclass
 class _Row:
+    """窗口级候选行及上次绘制状态；selected 仅是高亮缓存，本次选择以 Session 为准。"""
     frame: ctk.CTkFrame
     name_button: ctk.CTkButton
     pin_button: ctk.CTkButton
@@ -159,6 +136,7 @@ _click_monitor_root: tk.Misc | None = None
 
 
 class _TagWindow(ManagedToplevel):
+    """缓存 footer 和按名称复用的候选行；永久退出仍遵守 #63 的构建保护。"""
     def __init__(self, parent: tk.Tk | tk.Toplevel) -> None:
         self._tag_built = False
         self._hidden_titlebar = False
@@ -270,21 +248,15 @@ def _apply_app_icon(window: tk.Tk | tk.Toplevel) -> None:
 
 
 def _window_scaling(widget: tk.Misc) -> float:
-    """取控件所在窗口的 DPI 缩放系数（1.0 表示 96 DPI）。
+    """取窗口缩放系数，仅用于把逻辑尺寸预算转为物理像素。
 
-    需要它是因为两套坐标口径不一致：CTkToplevel.geometry()、控件的 width/height
-    都按「逻辑像素」解释、由 CTk 乘上缩放系数变成物理像素，而 winfo_* 系列
-    （winfo_width / winfo_rootx）返回的全是物理像素。本模块要把输入框的物理宽度
-    换算回逻辑宽度交给 geometry()，否则在 125% 缩放下弹窗会宽出四分之一。
-
-    ScalingTracker 是 customtkinter 包顶层公开导出的类（ctk.ScalingTracker），
-    不是内部私有实现；万一取不到（例如控件还没挂到已注册的窗口上），退回 1.0，
-    最坏结果只是弹窗宽度不合身，功能不受影响。
+    winfo_* 和 _reanchor 的 wm_geometry 均按物理像素使用，不能把测得的锚点宽度再乘一次。
+    未注册或查询失败退回 1.0，不让可选的尺寸优化阻断选择；不等同完整的混合 DPI 支持。
     """
     try:
         scaling = float(ctk.ScalingTracker.get_window_scaling(widget))
     except Exception:
-        return 1.0
+        return 1.0  # 尚未挂到有效 CTk 窗口时仍可继续打开，不把缩放查询失败当取消。
     # 缩放系数理论上不可能为 0，这里只是防止除零。
     return scaling if scaling > 0 else 1.0
 
@@ -382,10 +354,12 @@ def _alive(widget: tk.Misc | None) -> bool:
 
 
 def _current(session: _Session) -> bool:
+    # 窗口可被不同调用接管，存活检查不能替代这三个身份条件。
     return session.open and _active_picker is session and _win is session.dialog
 
 
 def _end_session(session: _Session) -> None:
+    """幂等收尾本次任务/绑定；仅当前拥有者可隐藏共享窗并归还焦点/grab，最后唤醒旧栈。"""
     global _active_picker
     if not session.open:
         return
@@ -444,6 +418,7 @@ def _on_window_destroy(event: tk.Event) -> None:
 
 
 def _ensure_window(parent: tk.Tk | tk.Toplevel) -> _TagWindow:
+    # 活动父窗可变化，创建父窗仍决定缓存寿命；不能复用 master 已退出的窗口。
     global _win
     if _win is not None:
         if _alive(_win) and _alive(_win.master):
@@ -467,6 +442,7 @@ def _ensure_window(parent: tk.Tk | tk.Toplevel) -> _TagWindow:
 
 
 def _schedule(session: _Session, key: str, callback: Callable[[], None], ms: int | None = None) -> str | None:
+    """同会话同键只保留一个任务，回调消费句柄后再次验证身份；ms=None 走 idle。"""
     if not _current(session) or session.dialog.closing:
         return None  # 同步准备期间也可能已取消，不能在结束后重新登记旧会话便条。
     previous = session.tasks.pop(key, None)
@@ -570,6 +546,7 @@ def _scroll_list(fraction: float) -> None:
 
 
 def _save_current() -> None:
+    # 保存只扩充常用候选，不自动选中；该偏好已落盘，即使稍后取消选择也不能假装回滚。
     session = _active_picker
     if session is None:
         return
@@ -585,6 +562,7 @@ def _save_current() -> None:
 
 
 def _delete_tag(name: str) -> None:
+    # 同步移除本次选中项及常用候选，账本中的历史标签不在本窗修改范围内。
     session = _active_picker
     if session is None:
         return
@@ -636,10 +614,11 @@ def _build_row(window: _TagWindow, name: str, first: bool) -> _Row:
 
 
 def _render_list() -> None:
+    """现读候选并增量同步窗口行；选择顺序归会话，不随常用列表置顶重排。"""
     session, window = _active_picker, _win
     if session is None or window is None:
         return
-    session.candidates = build_tag_candidates()
+    session.candidates = build_tag_candidates()  # 未出现在候选的自定义已选标签仍保留在 selected_order。
     names = set(session.candidates)
     for name in tuple(window.rows):
         if name not in names:
@@ -710,6 +689,7 @@ def _reanchor(_event: tk.Event | None = None) -> None:
 
 
 def _poll() -> None:
+    # 补充异步移动的锚点检查，每次续期仍须属于原会话；结束后不能产生新的 50ms 心跳。
     session = _active_picker
     if session is not None:
         _reanchor()
@@ -773,10 +753,11 @@ def ask_tags(
     *,
     selected_tags: tuple[str, ...] = (),
 ) -> tuple[str, ...] | None:
-    """在锚点下打开多选候选，完成返回选中顺序元组，其他关闭返回None。"""
+    """在锚点下同步等待多选结果；完成可返回空元组，取消/toggle/无效父窗返回 None。"""
     global _active_picker
     existing = _active_picker
     if existing is not None:
+        # 与编辑拒绝重入不同：同锚点取消，不同锚点允许接管；旧 finally 只能收自己的会话。
         same_anchor = existing.anchor is anchor
         _end_session(existing)
         if same_anchor:
@@ -820,7 +801,7 @@ def ask_tags(
             window.deiconify()
             _schedule_reveal(session)  # 隐藏同步完成后透明映射，再在稳定布局后显现。
             if not session.signal.get():
-                window.wait_variable(session.signal)
+                window.wait_variable(session.signal)  # 窗口隐藏复用，不能 wait_window；等待期间 Tk 仍会处理外点/新调用。
     except BaseException:
         _end_session(session)
         if _win is window and _active_picker is None:

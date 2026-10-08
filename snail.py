@@ -1,4 +1,9 @@
-"""Interactive snail animation and speech bubbles for AccountKeeper."""
+"""主窗标题区的蜗牛装饰：UI 建好标题后 start，主窗退出时 stop，无账本读写。
+
+管理器持有图片、标签、气泡和自身任务/绑定；暂停只停止位移，stop 才清任务与控件。
+图片显示尺寸交 CTk 缩放，路线与原生 Canvas 坐标用物理像素，不接入弹窗生命周期。
+当前模块导入即加载 Windows user32/gdi32；裁剪失败可降级，但不提供非 Windows 导入兜底。
+"""
 
 from __future__ import annotations
 
@@ -58,7 +63,7 @@ def _rounded_bubble_points(width: int, height: int, top: int, radius: int) -> li
 
 
 def _clip_bubble_canvas(canvas: tk.Canvas, contours: tuple[list[tuple[int, int]], ...]) -> bool:
-    """仅保留主体与尾巴，让控件矩形四角露出其下真实界面。"""
+    """调用方提供非空的主体/尾巴轮廓；移交合并区域，返回是否成功裁剪控件形状。"""
     regions: list[int] = []
     try:
         for contour in contours:
@@ -124,7 +129,7 @@ def _wrap_message_by_width(
 
 
 class SnailManager:
-    """Manage the decorative snail, animation, and speech bubbles."""
+    """一个主窗对应一个管理器；外部只负责启停，内部事件统一维护动画和气泡状态。"""
 
     def __init__(self, master: ctk.CTk, title_block: ctk.CTkFrame) -> None:
         self.master = master
@@ -132,8 +137,8 @@ class SnailManager:
         self.title_block = title_block
         # after() 返回的定时器句柄，用于暂停/取消动画，避免留下野定时器。
         self.snail_animation_id: str | None = None
-        self.snail_x = 0
-        self.snail_started = False
+        self.snail_x = 0  # 主窗客户区内的物理横坐标，入场时可在右边界外，不能按逻辑尺寸再次缩放。
+        self.snail_started = False  # 本次启动是否已摆过入场位置；不能与管理器正在运行混为一谈。
         # 弹出气泡或用户点击时置为 True，让蜗牛原地等待，不遮挡正在阅读的气泡。
         self.snail_paused = False
         # 窗口是否持有焦点：失焦期间即便气泡自动关闭，也不该让蜗牛"恢复"爬行。
@@ -146,18 +151,19 @@ class SnailManager:
         self._bubble_after_id: str | None = None
         # 保留原文才能在窗口变窄时重新折行，不能把上一次的自动折行当成显式换行。
         self._bubble_message: str | None = None
-        self._bubble_view: tk.Canvas | None = None
+        self._bubble_view: tk.Canvas | None = None  # 长文时才有的子视口，重排可替换，外层气泡保持。
+        # 几何/焦点 idle 与动画/气泡 after 均登记在 master；共四个句柄，由 stop 逐项取消。
         self._geometry_after_id: str | None = None
-        self._geometry_signature: tuple[int, ...] | None = None
+        self._geometry_signature: tuple[int, ...] | None = None  # 尺寸与标题边界签名，排除单纯拖窗和自身移动。
         self._focus_after_id: str | None = None
         # 运行状态与入场状态分开，才能让 start/stop 幂等并准确管理一条动画链。
         self._running = False
-        self._bindings: list[tuple[tk.Misc, str, str]] = []
+        self._bindings: list[tuple[tk.Misc, str, str]] = []  # 控件、事件、绑定 ID；只记录管理器的原生订阅。
         self.snail_label: ctk.CTkLabel | None = None
         self.snail_photo: ctk.CTkImage | None = None
 
     def start(self) -> None:
-        """Load the snail image, create its label, and start its animation."""
+        """已有活动组件则不重复创建；资源失败只放弃装饰，成功后建立一条动画链。"""
         if self._running:
             if self._is_active():
                 return  # 重复启动不能重建图片、覆盖位置或再开一条动画链。
@@ -173,6 +179,7 @@ class SnailManager:
                 max(1, round(image.width * scale)),
                 max(1, round(image.height * scale)),
             )
+            # CTkImage 保留源 PIL 图和按尺寸生成的 PhotoImage；管理器持引用以供后续 DPI 重绘。
             self.snail_photo = ctk.CTkImage(
                 light_image=image,
                 dark_image=image,
@@ -263,7 +270,7 @@ class SnailManager:
         label, self.snail_label = self.snail_label, None
         if label is not None and self._widget_exists(label):
             label.destroy()
-        self.snail_photo = None
+        self.snail_photo = None  # 先销毁标签再放开图像引用；源文件早在读取上下文退出时关闭。
         self.snail_x = 0
         self.snail_started = False
         self.snail_paused = False
@@ -341,6 +348,7 @@ class SnailManager:
             )
         except (tk.TclError, KeyError):
             self._window_focused = False  # 外部窗口或销毁中的焦点对象无法解析时视作失焦。
+        # 按顶层窗口判定：主窗内输入框换焦不暂停，编辑/图表等子顶层持焦仍按主窗失焦处理。
         # 只有主窗口实际持焦且没有活动气泡时才恢复，切回窗口不能让气泡与蜗牛错位。
         self.snail_paused = not self._window_focused or self._bubble_canvas is not None
 
@@ -354,7 +362,7 @@ class SnailManager:
             self._enter_from_right(self.master.winfo_width())
 
     def _enter_from_right(self, window_width: int) -> None:
-        """把蜗牛放到窗口最右侧，让它"从屏幕外爬进来"。"""
+        """把蜗牛放在主窗客户区右边界外，再逐帧进入；不涉及屏幕间移动。"""
         if window_width <= 1:
             # 几何信息还没生效，留给下一帧动画重试。
             return
@@ -412,9 +420,8 @@ class SnailManager:
             return
         # 窗口尚未真正显示时 winfo_width() 会谎报 Tk 默认的 200（不是 1），
         # 据此摆放会让蜗牛从窗口偏左处冒出来，所以必须先等 <Map> 事件把 _window_shown 置位。
-        # 这里刻意不再判断 winfo_ismapped()：按下 Alt 键会让 Tk 短暂认为窗口未映射，
-        # 而动画定时器一旦据此提前 return，蜗牛就会永远停在原地（表现为卡死），
-        # 所以改用"只在启动阶段判一次"的 _window_shown，它与 Alt 无关。
+        # 曾有按 Alt 后动画停住的现象，这里保留首次 Map 门槛，不把瞬时映射结果当作停止条件。
+        # _window_shown 只记录本次启动曾显示；最小化/失焦后的暂停仍依赖焦点同步，不靠它判断。
         if not self._window_shown or self.master.winfo_width() <= 1:
             self.snail_animation_id = self.master.after(100, self._animate_snail)
             return
@@ -425,7 +432,7 @@ class SnailManager:
             self._enter_from_right(window_width)
             self.snail_animation_id = self.master.after(30, self._animate_snail)
             return
-        # 每次左移 2 像素，配合 30ms 的定时器形成匀速爬行动画。
+        # 每次左移 2 物理像素，30ms 是预约间隔而非实时帧率；忙碌事件循环可延迟，速度未按时间补偿。
         self.snail_x -= 2
         # 当蜗牛身体与标题文字产生重叠时，直接"传送"到标题左侧，模拟从标题后面钻过去。
         if self.snail_x <= text_right and self.snail_x + snail_width > text_left:
@@ -495,6 +502,7 @@ class SnailManager:
         self._bubble_view = None
         canvas.delete("all")
 
+        # 原生 Tk 的正字号按点解析；测量与绘制共享描述符，但不能把字号当作物理像素常量。
         bubble_font = ("Microsoft YaHei UI", 11)
         # 用临时字体对象量出文字宽度，据此决定气泡尺寸，实现"气泡大小跟着文字走"。
         # 这里直接用 bubble_font 这个字体描述来构造：保证"量出来的宽度"和"画出来的文字"
@@ -614,6 +622,7 @@ class SnailManager:
             )
             view.configure(yscrollcommand=scrollbar.set)
             view.yview_moveto(scroll_fraction)
+            # 子视口/滚动条绑定随子控件销毁，无需加入主窗订阅清单，也不使用 bind_all。
             view.bind("<MouseWheel>", self._wheel_bubble)
             scrollbar.bind("<MouseWheel>", self._wheel_bubble)
             view.bind("<ButtonRelease-1>", lambda _event: self._destroy_active_bubble())
@@ -653,6 +662,7 @@ class SnailManager:
         self.snail_paused = True
         message = DEFAULT_SNAIL_MESSAGE
         try:
+            # 每次左键重新读文案以支持资源更新，不缓存；只读此文件，不保存选择或用户偏好。
             with SNAIL_MESSAGES_PATH.open("r", encoding="utf-8") as file:
                 messages = json.load(file)
             # 文件被用户改坏时（非列表或空列表）也要能用默认文案兜底。
@@ -714,6 +724,6 @@ class SnailManager:
         self.snail_started = True
         # 彩蛋也走同一定位入口，传送后的下一帧不会因 CTk 缓存跳回入场位置。
         self._place_snail()
-        # 强制刷新一次几何信息：place 不会立刻更新 winfo_x()，
-        # 不刷新的话紧接着创建的气泡仍会按蜗牛传送前的位置去定位。
+        # 刷新当前标签布局；气泡横坐标以 snail_x 为准，不能重新依赖可能滞后的 winfo_x。
+        # update_idletasks 可能重入销毁，外层随后创建气泡仍须由 _is_active 拦住旧点击链。
         self.master.update_idletasks()

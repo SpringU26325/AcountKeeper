@@ -1,21 +1,10 @@
-"""记住「上次导出路径」的读写模块（对应需求 3.11）。
+"""导出起始目录偏好（需求 3.11）：只读写 settings.json 的 last_export_dir。
 
-职责边界（刻意收窄，便于单测和被不同入口复用）：
-- 只负责读写 settings.json 里的 last_export_dir，并把它整理成可直接使用的 Path。
-- 不含任何 UI 代码、不 import customtkinter、不接触数据库（不 import sqlite3 / store）。
-  因此它既能被启动流程调用，也能被导出流程调用，且无需 GUI 环境即可测试。
-- 数据库路径固定为 config.DB_PATH，本模块完全不涉及，也不读写任何数据库路径字段。
-
-与旧方案（用户自定义 csv_dir + 启动回退弹窗）的关键差别：
-last_export_dir 只是「另存为」对话框的便利起始目录，属于锦上添花的小功能。
-因此任何异常（文件缺失、解析失败、字段非法、目录已删除或不可写）都只做**静默回退**——
-回退到 DEFAULT_EXPORT_DIR 并在控制台打一句警告，不再向调用方抛「需要弹窗告诉用户配置错了」的信号。
-没有「用户配置错了」这个概念，自然也不需要 is_fallback / is_first_run 两个布尔量。
-
-对外只暴露三个函数：
-- load_settings()              读配置 → (last_export_dir, has_saved_dir)，任何异常都回退默认值，绝不抛出
-- save_settings(last_export_dir) 写配置 → bool，表示是否真的写成功
-- get_last_export_dir()        拿到本次可用的起始目录，并确认它当前确实可写
+不管理账本路径、标签或导入映射，不依赖 GUI；路径常量由 config 提供。
+load_settings 只解析字段，返回（目录，是否读到合法配置），不验证目录当前是否可用。
+get_last_export_dir 才检查已记住目录的存在及可写性；默认回退目录不在此处验证或补建。
+save_settings 规范化/准备用户目录后整份写文件，返回保存结果，不影响已完成的 CSV 导出。
+文件读取、解析及保存中已捕获的错误只打控制台警告，不弹窗；此模块不承诺吞掉所有异常。
 """
 
 import json
@@ -74,6 +63,7 @@ def _is_usable(directory: Path) -> bool:
     而且本方案失败时是静默回退，用户根本无从察觉，等于偷偷在磁盘上造目录。
     需求 3.11 要求兜住 U 盘拔出、网络盘断开、无权限这类情况，所以必须真去问一次文件系统。
     """
+    # 这是当前时刻的权限探测，不锁定目录；真正导出时仍可能遇到权限变化或磁盘故障。
     return directory.is_dir() and os.access(directory, os.W_OK)
 
 
@@ -106,7 +96,7 @@ def load_settings() -> tuple[Path, bool]:
 
     本函数只负责「读 + 判定」，不做任何写操作（写入一律走 save_settings）。
 
-    容错策略（逐级降级，绝不抛异常给调用方）：
+    已处理的配置故障（逐级降级）：
     - 文件不存在     → 返回默认值（用户还没导出过，属正常情况，不警告）；
     - 内容解析失败   → 打印警告，返回默认值；
     - 根节点不是对象 → 打印警告，返回默认值；
@@ -135,7 +125,7 @@ def load_settings() -> tuple[Path, bool]:
     if directory is None:
         return DEFAULT_EXPORT_DIR, False
 
-    return directory, True
+    return directory, True  # True 只代表字段合法，尚未检查目录存在及可写性。
 
 
 def save_settings(last_export_dir: Path) -> bool:
@@ -166,6 +156,7 @@ def save_settings(last_export_dir: Path) -> bool:
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         # ensure_ascii=False 让中文路径以原文保存，便于用户手工查看；
         # indent=2 让文件易读、Git diff 友好。
+        # 只持久化一个字段并整份覆盖，因此标签/导入映射必须独立存放；这里没有原子替换。
         with SETTINGS_PATH.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
     except OSError as error:
@@ -176,18 +167,17 @@ def save_settings(last_export_dir: Path) -> bool:
 
 
 def get_last_export_dir() -> tuple[Path, bool]:
-    """返回本次可用的 (起始目录, 是否用上了记住的目录)，并顺带校验该目录当前可写。
+    """返回（起始目录，是否用上已记住目录），供另存为对话框使用。
 
-    返回的 Path 一定可以直接塞进 filedialog 的 initialdir：
-    - 记住了且现在确实可用 → 原样返回，第二个元素为 True；
-    - 没记住、或记录读不出来、或目录已被删除/不可写 → 返回 DEFAULT_EXPORT_DIR，第二个元素为 False。
-    调用方不需要（也不应该）自己再判断一次可用性，否则两层逻辑容易走偏。
+    字段合法且当前目录可用才返回 True；配置故障或目录不可用按已有分支回退默认值。
+    默认目录不在此处验证，路径 resolve/探测也未用统一异常捕获包裹；不保证所有路径错误均回退。
     """
     directory, has_saved_dir = load_settings()
 
     if not has_saved_dir:
         return DEFAULT_EXPORT_DIR, False
 
+    # 仅检查已保存的候选目录，不顺手创建已删除目录或改写失效的偏好文件。
     directory = directory.resolve()
 
     if not _is_usable(directory):

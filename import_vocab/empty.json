@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "value": "",
+      "field_scope": null,
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "/",
+      "field_scope": null,
+      "source": "真实样例",
+      "provenance": [
+        "微信个人账单实测"
+      ]
+    },
+    {
+      "value": "-",
+      "field_scope": null,
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "--",
+      "field_scope": null,
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "—",
+      "field_scope": null,
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "无",
+      "field_scope": null,
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    },
+    {
+      "value": "N/A",
+      "field_scope": null,
+      "source": "公开资料",
+      "provenance": [
+        "公开文章"
+      ]
+    }
+  ]
+}
