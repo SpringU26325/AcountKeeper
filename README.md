@@ -53,7 +53,7 @@
 - Pillow (图片处理)
 - platformdirs (用户数据目录管理)
 
-## 📝 运行源码
+## 📝 运行源码.\.venv\Scripts\python.exe -B .\launch_import_preview.py "账单文件路径.xlsx"
 
 如果你有 Python 环境，也可以克隆本仓库，安装依赖后直接运行：
 

@@ -19,6 +19,7 @@ class PreviewSelect(ctk.CTkFrame):
                          fg_color="#F8FAFC", border_color="#D8E1EA", border_width=1)
         self.values, self.command, self.font = tuple(values), command, font
         self.value, self.state, self.popup = self.values[0], "normal", None
+        self._entry_pressed = False
         self.grid_columnconfigure(0, weight=1)
         self.label = ctk.CTkButton(self, text=self.value, command=self.open, font=font,
             width=max(60, width - 36), height=32, anchor="w", fg_color="transparent",
@@ -79,6 +80,7 @@ class PreviewSelect(ctk.CTkFrame):
         popup.bind("<Return>", lambda event: self._pick(self.active))
         popup.bind("<Escape>", lambda event: self.close())
         popup.bind("<ButtonPress-1>", self._outside, add="+")
+        popup.bind("<ButtonRelease-1>", self._entry_released, add="+")
         popup.bind("<FocusOut>", lambda event: popup.after_idle(self._focus_left), add="+")
         popup.finish_setup()
         popup.update_idletasks()
@@ -108,19 +110,33 @@ class PreviewSelect(ctk.CTkFrame):
         self.command(value)
         return "break"
 
+    @staticmethod
+    def _inside(widget, event):
+        return (widget.winfo_rootx() <= event.x_root < widget.winfo_rootx() + widget.winfo_width()
+                and widget.winfo_rooty() <= event.y_root < widget.winfo_rooty() + widget.winfo_height())
+
     def _outside(self, event):
         popup = self.popup
-        if popup and not (popup.winfo_rootx() <= event.x_root < popup.winfo_rootx() + popup.winfo_width()
-                          and popup.winfo_rooty() <= event.y_root < popup.winfo_rooty() + popup.winfo_height()):
+        if popup and self._inside(self, event):
+            # CTk 在松开时执行按钮命令；按下入口不能先收起，否则同一点击会重新展开。
+            self._entry_pressed = True
+            return "break"
+        if popup and not self._inside(popup, event):
             self.close()
             return "break"
 
+    def _entry_released(self, event):
+        if self.popup is not None and self._entry_pressed:
+            # grab 若把松开也送到弹层，由此完成收起；按钮已处理时 popup 为 None，不重复切换。
+            return self.close()
+
     def _focus_left(self):
-        if self.popup and (self.focus_get() is None or self.focus_get().winfo_toplevel() is not self.popup):
+        if self.popup and not self._entry_pressed and (self.focus_get() is None or self.focus_get().winfo_toplevel() is not self.popup):
             self.close()
 
     def close(self):
         popup, self.popup = self.popup, None
+        self._entry_pressed = False  # 收尾同时结束手势，不能把旧按下状态带到下次展开。
         if popup is not None:
             # 只释放本弹层的 grab，恢复原先仍存活的父弹窗；销毁时也走同一收尾。
             if self.grab_current() is popup:
@@ -152,6 +168,8 @@ class ImportDialog(ManagedToplevel):
         self.minsize(980, 660)
         self.font = ("Microsoft YaHei UI", 12)
         self._poll_job = self._render_job = None
+        self.help_popup = None
+        self._wheel_remainder = 0.0
         self._render_id = self._mapping_key = 0
         self._ending, self._more = False, False
         self.row_locations, self.group_controls, self.pair_controls = {}, {}, {}
@@ -206,11 +224,21 @@ class ImportDialog(ManagedToplevel):
         heading.grid(row=0, column=0, sticky="ew", padx=20, pady=(10, 0))
         heading.grid_columnconfigure(0, weight=1)
         self._label(heading, self.session.bill.file_name, anchor="w").grid(row=0, column=0, sticky="ew")
-        self._label(heading, "① 核对字段对应  →  ② 处理待确认记录  →  ③ 确认导入", anchor="e").grid(row=0, column=1, sticky="e")
-        self.guide = self._label(heading, "正在分析账单，请稍候", anchor="w")
-        self.guide.grid(row=1, column=0, sticky="ew")
-        self.guide_button = self._button(heading, "去处理", lambda: self.switch_view("待确认"), width=80)
-        self.guide_button.grid(row=1, column=1, sticky="e", padx=8)
+        # 说明只由显式按钮打开，避免初次弹窗打断字段核对。
+        self.help_button = self._button(heading, "使用说明", self.show_help, width=110,
+            height=36, border_width=1, border_color="#8CB6ED", fg_color="#DCEAFE",
+            hover_color="#CFE0F8", text_color="#245D9F")
+        self.help_button.grid(row=0, column=1, sticky="e")
+        # 当前步骤与下一步动作集中显示；说明放独立窗口，避免挤占长列表的浏览空间。
+        guide_area = ctk.CTkFrame(heading, fg_color="#E8F1FC", border_color="#BED6F5", border_width=1, corner_radius=8)
+        guide_area.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        guide_area.grid_columnconfigure(1, weight=1)
+        self.guide_step = self._label(guide_area, "① 核对字段", text_color="#1D5CA8", width=125)
+        self.guide_step.grid(row=0, column=0, sticky="w", padx=8, pady=8)
+        self.guide = self._label(guide_area, "正在分析账单，请稍候", anchor="w", wraplength=650, justify="left")
+        self.guide.grid(row=0, column=1, sticky="ew", padx=8)
+        self.guide_button = self._button(guide_area, "去处理", lambda: self.switch_view("待确认"), width=100, height=32, primary=True)
+        self.guide_button.grid(row=0, column=2, sticky="e", padx=8, pady=6)
         self.cards = {}
         card_area = ctk.CTkFrame(self, fg_color="transparent")
         card_area.grid(row=1, column=0, sticky="ew", padx=18, pady=8)
@@ -271,6 +299,9 @@ class ImportDialog(ManagedToplevel):
         self.details = ctk.CTkScrollableFrame(right, fg_color="white")
         self.details.grid(row=4, column=0, sticky="nsew", padx=8, pady=4)
         self.details.grid_columnconfigure(0, weight=1)
+        # 明细内统一路由；其他区域保留原滚动行为，不注册全局滚轮绑定。
+        self.details._parent_canvas.configure(yscrollincrement=1)
+        self.bind("<MouseWheel>", self._wheel, add="+")
         inspect = ctk.CTkFrame(right, fg_color="#F8FAFC", corner_radius=8)
         inspect.grid(row=5, column=0, sticky="ew", padx=10)
         self.inspect_title = self._label(inspect, "单笔核对 · 点击上方记录查看", anchor="w")
@@ -470,6 +501,9 @@ class ImportDialog(ManagedToplevel):
             next_step = ("请先选择" + "、".join(missing) + "列" if missing else
                          f"还有 {remaining} 笔需要你处理，点击「去处理」逐笔或整组决定" if remaining else
                          "核对日期、金额与备注后，可确认导入" if session.can_submit else "请核对高亮字段及待确认记录")
+        missing_required = not session.mapping or any(not session.mapping.columns.get(role) for role in ("date", "amount"))
+        step = "① 核对字段" if missing_required or session.result is None else "② 处理待确认" if remaining else "③ 确认导入"
+        self.guide_step.configure(text=step)
         self.guide.configure(text=next_step)
         self._button_state(self.guide_button, session.result and remaining and not session.busy)
         self.footer.configure(text="预览尚未写入账本 · " + next_step)
@@ -503,6 +537,7 @@ class ImportDialog(ManagedToplevel):
         self.inspect_title.configure(text="单笔核对 · 点击上方记录查看")
         self._set_raw("选择一笔记录查看日期、金额、备注和原始内容。\n需要批量处理时，请使用对应组标题处的操作。")
         self._set_row_state(None, historical)
+        self._show_inspection(False)
         rows = self.session.visible_rows(historical=historical)
         full = self.session.visible_rows(historical=historical, summary=False)
         suffix = " · 历史回看（已作废）" if historical else ""
@@ -696,6 +731,7 @@ class ImportDialog(ManagedToplevel):
             return  # 跨视图/搜索保留候选，但不把别处的批量核对内容填入当前详情。
         # 最终内容在只读核对区呈现，原确认按钮就是明确决定，不额外再弹确认框。
         rows = [row for row in self.session.preview.rows if row.row_number in ids]
+        self._show_inspection(True)
         self.inspect_title.configure(text=f"正在处理：原始第 {target} 行" if kind == "row" else f"最终处理预览 · {'本对' if kind == 'pair' else '本组'}共 {len(ids)} 笔")
         self._set_raw(self._inspection_text(rows, final=True))
         self.row_hint.configure(text="核对入账后内容，再点「此笔入账」；不记这笔可点「跳过此笔」。" if kind == "row" else
@@ -734,6 +770,7 @@ class ImportDialog(ManagedToplevel):
         self.session.located_row = number
         historical = self.session.result is None
         notice = "已作废（映射已变，决定不能应用）\n" if historical else ""
+        self._show_inspection(True)
         self.inspect_title.configure(text=f"{'历史回看' if historical else '正在处理'}：原始第 {number} 行")
         self._set_raw(notice + self._inspection_text((row,)))
         self._set_row_state(row, historical)
@@ -754,6 +791,15 @@ class ImportDialog(ManagedToplevel):
         self.raw_text.delete("1.0", "end")
         self.raw_text.insert("1.0", text)
         self.raw_text.configure(state="disabled")
+
+    def _show_inspection(self, expanded):
+        # 无记录待核对时只留提示标题，避免空详情挤占小窗口；有内容时完整展开。
+        for widget, padding in ((self.raw_text, 4), (self.row_hint, 8)):
+            if expanded:
+                if not widget.winfo_manager():
+                    widget.pack(fill="x", padx=padding)
+            else:
+                widget.pack_forget()
 
     def _set_row_state(self, row, historical):
         enabled = row is not None and not historical and not self.session.busy
@@ -779,8 +825,61 @@ class ImportDialog(ManagedToplevel):
             self._run(lambda: self.session.release_duplicate(number, self.duplicate_var.get()))
 
     def _wheel(self, event):
-        self.details._parent_canvas.yview_scroll(-int(event.delta / 120), "units")
+        if self._ending or event.widget.winfo_toplevel() is not self:
+            return
+        widget = event.widget
+        while widget is not None and widget is not self.details._parent_frame:
+            widget = getattr(widget, "master", None)
+        if widget is None:
+            return  # 字段区、备注文本、下拉弹层不借用明细的滚动速度。
+        row_height = int(ttk.Style(self).lookup("ImportPreview.Treeview", "rowheight"))
+        distance = self._wheel_remainder - event.delta * row_height * 3 / 120
+        pixels = int(distance)
+        self._wheel_remainder = distance - pixels  # 小幅连续滚动累积，不因取整而丢失。
+        self.details._parent_canvas.yview_scroll(pixels, "units")
         return "break"
+
+    def show_help(self):
+        if self._ending:
+            return
+        if self.help_popup is not None:
+            self.help_popup.lift()
+            self.help_popup.focus_force()
+            return
+        popup = self.help_popup = self._popup("导入预览 · 使用说明")
+        popup.geometry("680x440")
+        self._label(popup, "三步完成核对，预览中的选择尚未写入账本", anchor="w").pack(fill="x", padx=18, pady=(12, 6))
+        steps = (
+            ("① 核对字段对应", "看左侧日期、金额对应哪一列，并核对样例值。需要时修改下拉。\n修改字段会重算，并作废本轮已作出的决定。"),
+            ("② 处理待确认记录", "「未知状态」不代表交易失败，请核对原始状态和收支方向。\n逐笔：点记录，看入账后内容，再选「此笔入账」或「跳过此笔」。\n整组：选择处理方式，核对结果，再点「确认处理本组」。\n整组包含筛选隐藏的记录；退款对的两笔需要一起决定。"),
+            ("③ 确认导入", "待确认处理完、必需字段满足后，核对将导入笔数，再点底部确认。\n只选择处理方式尚未生效；关闭说明不会处理或跳过任何记录。"),
+        )
+        for title, body in steps:
+            card = ctk.CTkFrame(popup, fg_color="white", corner_radius=8)
+            card.pack(fill="x", padx=14, pady=4)
+            self._label(card, title, anchor="w", text_color="#1D5CA8").pack(fill="x", padx=10, pady=(5, 0))
+            self._label(card, body, anchor="w", justify="left", wraplength=625).pack(fill="x", padx=10, pady=(0, 6))
+        self.help_close_button = self._button(popup, "开始核对", popup.destroy, primary=True)
+        self.help_close_button.pack(pady=10)
+        popup.bind("<Escape>", lambda event: popup.destroy())
+        popup.bind("<Destroy>", self._help_closed, add="+")
+        # 显式说明不保存偏好，也不处理记录；关掉后可随时由按钮重看。
+        popup.finish_setup()
+        if not popup.closing:
+            # 按实际尺寸居中并先完成映射，键盘关闭才能立即作用于说明窗。
+            popup.update_idletasks()
+            width, height = popup.winfo_width(), popup.winfo_height()
+            x = max(8, min(self.winfo_rootx() + (self.winfo_width() - width) // 2, self.winfo_screenwidth() - width - 8))
+            y = max(8, min(self.winfo_rooty() + (self.winfo_height() - height) // 2, self.winfo_screenheight() - height - 8))
+            popup.wm_geometry(f"{width}x{height}+{x}+{y}")
+            popup.lift()
+            popup.focus_force()
+            # CTk 在 Windows 建窗后约 10ms 恢复旧焦点；该恢复结束后说明再接收键盘。
+            popup.after(20, popup.focus_force)
+
+    def _help_closed(self, event):
+        if event.widget is self.help_popup:
+            self.help_popup = None
 
     def switch_view(self, view):
         self.session.set_view(view)
@@ -888,8 +987,8 @@ class ImportDialog(ManagedToplevel):
             self.footer.configure(text=str(error))
             return
         # 没有回调也可作为独立预览使用；这里绝不执行 store 的任何操作。
-        if self.on_confirm:
-            self.on_confirm(result)
+        if self.on_confirm and self.on_confirm(result) is False:
+            return  # 写入失败的回调保留原预览和决定，供用户修正或重试。
         self.accepted_result = result
         self.destroy()
 
@@ -909,6 +1008,8 @@ class ImportDialog(ManagedToplevel):
                 except tk.TclError:
                     pass  # 原生父窗先销毁时任务可能已被所属窗口清理。
         self._poll_job = self._render_job = None
+        if self.help_popup is not None:
+            self.help_popup.destroy()
         if hasattr(self, "_search_trace"):
             try:
                 self.search_var.trace_remove("write", self._search_trace)

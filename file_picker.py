@@ -1,4 +1,4 @@
-"""工具栏文件菜单：隐藏复用三项操作列表，业务动作仍交给 ToolbarFrame 的回调。
+"""工具栏文件菜单：隐藏复用操作列表，业务动作仍交给 ToolbarFrame 的回调。
 
 FileMenu 拥有缓存 _FileWindow；不持 grab、不阻塞等待，只有展开期间监听外点/ESC/几何事件。
 close 撤销所属任务和本次绑定、恢复三角并隐藏；destroy 才销毁缓存窗，均不得清除其他订阅。
@@ -109,7 +109,7 @@ class FileMenu(ctk.CTkFrame):
         window.resizable(False, False)
         window.title("文件操作")
         window.bind("<Configure>", window.round_corners, add="+")
-        # 三项32px、两道4px行距、上下各10px，菜单逻辑高124px。
+        # 每项32px、相邻4px行距、上下各10px；高度随实际文件操作数计算。
         card = ctk.CTkFrame(window, corner_radius=8, fg_color="#FFFFFF")
         card.pack(fill="both", expand=True, padx=10, pady=10)
         for index, action in enumerate(self._actions):
@@ -123,7 +123,7 @@ class FileMenu(ctk.CTkFrame):
                 background_corner_colors=corner_colors,  # type: ignore[reportArgumentType] # 库注解误写为单元素tuple，实际绘制依次读取四角。
                 font=("Microsoft YaHei UI", 11), fg_color="#FFFFFF",
                 hover_color="#D2DEE9", text_color="#455A64",
-                command=lambda chosen=action: self._choose(chosen),  # 钉住本行名称，避免循环闭包让三项都调用最后一项。
+                command=lambda chosen=action: self._choose(chosen),  # 钉住本行名称，避免循环闭包全部调用末项。
             ).pack(fill="x", pady=(0, 4 if index < len(self._actions) - 1 else 0))
         window.protocol("WM_DELETE_WINDOW", self.close)
         window.finish_setup()
@@ -180,7 +180,8 @@ class FileMenu(ctk.CTkFrame):
         if not self._open or window is None:
             return
         scale = ctk.ScalingTracker.get_window_scaling(window)
-        width, height = round(180 * scale), round(124 * scale)
+        logical_height = 20 + 32 * len(self._actions) + 4 * max(0, len(self._actions) - 1)
+        width, height = round(180 * scale), round(logical_height * scale)
         # winfo坐标与wm_geometry都是物理像素，只把逻辑宽高缩放一次。
         x, y = anchored_position(
             (self.winfo_rootx(), self.winfo_rooty(), self.winfo_height()),
@@ -189,7 +190,7 @@ class FileMenu(ctk.CTkFrame):
         target = (width, height, x, y)
         if target != self._target:
             self._target = target  # Configure可再次进入，只提交变化的几何避免无限重排。
-            # CTk换缩放会暂时锁定旧尺寸；原生边界按本次物理尺寸更新，避免124px被截成123px。
+            # CTk换缩放会暂时锁定旧尺寸；原生边界按本次物理尺寸更新，避免缩放后截掉末项。
             tk.Wm.minsize(window, width, height)
             tk.Wm.maxsize(window, width, height)
             window.wm_geometry(f"{width}x{height}+{x}+{y}")

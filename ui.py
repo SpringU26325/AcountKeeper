@@ -51,6 +51,7 @@ class AccountKeeperApp(ctk.CTk):
         self._calendar_closing = False
         self._calendar_destroyed = False
         self._backup_running = False  # 模态对话框会处理事件，禁止嵌套触发同一次备份。
+        self.import_workflow = None  # 延迟加载导入依赖，主页面启动不读取外部账单。
         # store 由外部注入，方便测试时替换成临时数据库，避免测试污染真实账本。
         self.store = store
         # last_export_dir 由启动流程注入，带默认值保证单独构造窗口时仍可用：
@@ -106,6 +107,8 @@ class AccountKeeperApp(ctk.CTk):
         if self._calendar_destroyed:
             return
         self._calendar_closing = True
+        if self.import_workflow is not None:
+            self.import_workflow.close()  # 文件读取结果与轮询不得回到已关闭的主窗。
         if self._calendar_start_job is not None:
             self.after_cancel(self._calendar_start_job)
             self._calendar_start_job = None
@@ -186,6 +189,8 @@ class AccountKeeperApp(ctk.CTk):
             # 图表依赖 matplotlib，用 lambda 延迟到实际点击时才导入，加快启动速度。
             chart_callback=lambda: show_chart_window(self),
             open_folder_callback=self.open_data_folder,
+            import_callback=self.import_bill,
+            batches_callback=self.show_import_batches,
         )
         self.toolbar.pack(fill="x", padx=24, pady=(0, 10))
         self.search_entry = self.toolbar.search_entry
@@ -197,6 +202,18 @@ class AccountKeeperApp(ctk.CTk):
         # 单选、取消选择及重建列表都同步按钮，避免操作上一轮筛选留下的记录。
         self.tree.bind("<<TreeviewSelect>>", self._sync_record_actions, add="+")
         self._sync_record_actions()
+
+    def _get_import_workflow(self):
+        if self.import_workflow is None:
+            from import_workflow import ImportWorkflow
+            self.import_workflow = ImportWorkflow(self)
+        return self.import_workflow
+
+    def import_bill(self) -> None:
+        self._get_import_workflow().choose_file()
+
+    def show_import_batches(self) -> None:
+        self._get_import_workflow().show_batches()
 
     def refresh_records(self) -> None:
         """按当前搜索词重绘缓存，不重新读库，也不清空筛选条件。"""

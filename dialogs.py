@@ -772,6 +772,46 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
     dialog.confirm = confirm
 
 
+def confirm_undo_import(parent: tk.Misc, batch) -> bool:
+    """批次撤销危险确认；只返回决定，不连接数据库。"""
+    dialog = ManagedToplevel(parent, fg_color="#F0F4F8")
+    dialog.title("确认撤销导入")
+    dialog.geometry("520x245")
+    dialog.attributes("-alpha", 0)
+    dialog.transient(parent)
+    _apply_app_icon(dialog)
+    result = [False]
+    # 导入笔数是原始快照，不承诺被单笔删除过的记录仍全部存在。
+    ctk.CTkLabel(dialog, text=f"撤销 {batch.file_name} 的导入？", wraplength=465,
+                 font=("Microsoft YaHei UI", 14, "bold"), text_color="#243447").pack(padx=22, pady=(20, 8))
+    ctk.CTkLabel(dialog, text=f"该批次原导入 {batch.imported_count} 笔。\n将删除其全部现存记录，包括已编辑或添加标签的记录。\n手动记录、其他批次和标签配置不受影响。",
+                 wraplength=465, justify="left", font=("Microsoft YaHei UI", 12),
+                 text_color="#475569").pack(padx=22, pady=8)
+    actions = ctk.CTkFrame(dialog, fg_color="transparent")
+    actions.pack(pady=12)
+
+    def finish(confirmed):
+        if not dialog.closing:
+            result[0] = confirmed
+            dialog.destroy()
+
+    # 红色操作需明确点击；回车不默认执行整批删除，关闭/Esc均为取消。
+    ctk.CTkButton(actions, text="取消", command=lambda: finish(False), width=140,
+                 fg_color="#E8EEF5", hover_color="#DDE7F2", text_color="#475569",
+                 corner_radius=8, font=("Microsoft YaHei UI", 12)).pack(side="left", padx=8)
+    ctk.CTkButton(actions, text="确认撤销", command=lambda: finish(True), width=140,
+                 fg_color="#B84035", hover_color="#A3342B", corner_radius=8,
+                 font=("Microsoft YaHei UI", 12)).pack(side="left", padx=8)
+    dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+    dialog.bind("<Escape>", lambda _event: finish(False))
+    dialog.finish_setup()
+    if dialog.closing or not center_dialog_on_parent(parent, dialog):
+        return False
+    dialog.grab_set()
+    parent.wait_window(dialog)
+    return result[0]
+
+
 def confirm_delete(parent: ctk.CTk) -> bool:
     """返回是否确认删除；本窗只收决定，调用方据此执行删除，关闭即销毁而不缓存。"""
     # 不用 messagebox.askyesno，是因为系统弹窗无法定制文字与配色，

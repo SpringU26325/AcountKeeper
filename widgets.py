@@ -362,6 +362,8 @@ class ToolbarFrame(ctk.CTkFrame):
         stats_callback: Callable[[], None], export_callback: Callable[[], None],
         backup_callback: Callable[[], None], chart_callback: Callable[[], None],
         open_folder_callback: Callable[[], None], edit_callback: Callable[[], None],
+        import_callback: Callable[[], None] | None = None,
+        batches_callback: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master, fg_color="transparent")
         self.columnconfigure(0, weight=1)
@@ -384,6 +386,11 @@ class ToolbarFrame(ctk.CTkFrame):
             "导出 CSV": export_callback, "备份数据": backup_callback,
             "打开数据目录": open_folder_callback,
         }
+        # 账单与批次共用文件菜单；隔离组件宿主不传业务回调时不显示无效入口。
+        if import_callback is not None:
+            self._file_callbacks["导入外部账单"] = import_callback
+        if batches_callback is not None:
+            self._file_callbacks["导入批次"] = batches_callback
         # 文件入口与日期/标签共用三角及定位；业务仍只通过原有回调执行。
         self.file_menu = FileMenu(heading, tuple(self._file_callbacks), self._run_file_action)
         self.file_menu.configure(fg_color="#E8EEF5")
