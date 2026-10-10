@@ -21,7 +21,7 @@ def _cancel_owned_tasks(window: tk.Misc) -> None:
         widget = pending.pop()
         # 使用 Python 控件树：Destroy 事件期间，部分子窗口已无法通过 winfo 查询。
         pending.extend(widget.children.values())
-        for command in widget._tclCommands or ():
+        for command in widget._tclCommands or ():  # type: ignore[reportAttributeAccessIssue] # Tk 运行时提供私有 _tclCommands，类型声明遗漏；仅用来识别本控件树注册的任务。
             owners[command] = widget
     # after info 列出整个解释器的任务；只取消首个命令属于此控件树的项，不能全局扫掉其他弹窗。
     for timer in window.tk.splitlist(window.tk.call("after", "info")):
@@ -63,7 +63,7 @@ class ManagedToplevel(ctk.CTkToplevel):
     def after(self, ms, func=None, *args):
         # func=None 保留 Tk 等待语义；有回调时只保护可识别的绑定控件目标，不代替会话身份校验。
         if func is None:
-            return super().after(ms)
+            return super().after(ms)  # type: ignore[reportCallIssue] # Tk 支持无回调的等待语义，存根签名要求 func。
         target = getattr(func, "__self__", None)
 
         def call_when_alive():

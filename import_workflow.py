@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
+from typing import TypeGuard, TypeVar
 
 import customtkinter as ctk
 
@@ -22,7 +23,10 @@ def _read_import(path):
     return read_bill_file(path), load_vocabulary(RESOURCE_DIR / "import_vocab")
 
 
-def _alive(window):
+_WindowT = TypeVar("_WindowT", bound=ManagedToplevel)
+
+
+def _alive(window: _WindowT | None) -> TypeGuard[_WindowT]:
     return window is not None and not window.closing
 
 
@@ -170,7 +174,7 @@ class ImportWorkflow:
             self.preview.lift()
             return
         if self.future is not None:
-            self.loading.lift()
+            self.loading.lift()  # type: ignore[reportOptionalMemberAccess] # 读取在途时 loading 必已创建。
             return
         path = filedialog.askopenfilename(parent=self.app, title="选择外部账单",
             filetypes=(("账单文件", "*.csv *.xlsx"), ("CSV 账单", "*.csv"), ("Excel 账单", "*.xlsx")))
@@ -245,7 +249,7 @@ class ImportWorkflow:
             try:
                 if not result.can_confirm:
                     raise ValueError("仍有待确认记录或必需字段缺失，不能导入。")
-                batch = self.store.import_batch(records, self.preview.session.bill.file_name,
+                batch = self.store.import_batch(records, self.preview.session.bill.file_name,  # type: ignore[reportOptionalMemberAccess] # submit 只由预览窗回调，preview 必存在。
                     result.counts["规则跳过"], result.counts["非交易行"])
             except Exception as error:
                 self.last_error = str(error)
@@ -256,7 +260,7 @@ class ImportWorkflow:
             # 此边界以后绝不重试写入；报告建窗异常也不能让原预览再次提交。
             try:
                 if not self.closed:
-                    report = ImportReport(self, self.preview.session.bill.file_name, result.counts, batch, error)
+                    report = ImportReport(self, self.preview.session.bill.file_name, result.counts, batch, error)  # type: ignore[reportOptionalMemberAccess] # submit 只由预览窗回调，preview 必存在。
                     self.reports = [item for item in self.reports if _alive(item)]
                     self.reports.append(report)
             except Exception as display_error:

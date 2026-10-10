@@ -9,7 +9,7 @@ from threading import get_ident
 from types import MappingProxyType
 
 from import_reader import BillFile, RawCell, RawRow
-from import_rules import FieldMapping, NoteOptions, analyze_bill, apply_decisions
+from import_rules import AnalysisResult, FieldMapping, NoteOptions, analyze_bill, apply_decisions
 
 
 def frozen_map(values):
@@ -33,7 +33,7 @@ class Selection:
 @dataclass(frozen=True)
 class ObsoleteSnapshot:
     version: int
-    result: object
+    result: AnalysisResult
     groups: object
     pairs: object
     row_actions: object
@@ -383,7 +383,7 @@ class ImportSession:
         if result is None:
             return ()
         groups = source.groups if source else self.groups
-        origins = {n for ids in groups.values() for n in ids}
+        origins = {n for ids in groups.values() for n in ids}  # type: ignore[reportAttributeAccessIssue] # groups 由 frozen_map 生成，语法上取值为 object。
         view = self.current_view
         rows = [r for r in result.rows if (r.row_number in origins if view == "待确认" else r.category == view)]
         if view == "待确认" and self.only_unhandled and not historical:
@@ -416,7 +416,7 @@ class ImportSession:
             ranks = {g: i for i, g in enumerate(("规则冲突", "疑似退款对", "已识别退款", "未知状态"))}
             def order(row):
                 return ranks.get(row.group, 9), min(row.pair_key or (row.row_number,)), row.row_number
-            origin = next((r for r in self.result.rows if r.row_number == self.located_row), None)
+            origin = next((r for r in self.result.rows if r.row_number == self.located_row), None)  # type: ignore[reportOptionalMemberAccess] # 调用前的可见行与待处理计数已保证结果存在。
             following = [r.row_number for r in self.visible_rows(summary=False)
                          if r.row_number in numbers and origin and order(r) > order(origin)]
             index = numbers.index(following[0]) if following else 0

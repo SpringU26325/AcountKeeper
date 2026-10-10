@@ -7,6 +7,7 @@ from tkinter import ttk
 import customtkinter as ctk
 
 from dialog_lifecycle import ManagedToplevel
+from import_pagination import ImportPagination
 from import_session import Selection
 from popup_common import anchored_position, make_toggle_button
 
@@ -27,7 +28,7 @@ class PreviewSelect(ctk.CTkFrame):
         self.label.grid(row=0, column=0, sticky="ew", padx=(1, 0), pady=1)
         self.toggle = make_toggle_button(self, self.open, height=32)
         self.toggle.grid(row=0, column=1, padx=1, pady=1)
-        self.bind("<Destroy>", self._destroyed, add="+")
+        self.bind("<Destroy>", self._destroyed, add="+")  # type: ignore[reportArgumentType] # Tk 的 add 实际接受 "+"，CTk 存根标成 bool。
         # 单个键盘焦点覆盖整个选择框，回车/空格展开，上下键在弹层内移动。
         self.label._canvas.configure(takefocus=1)
         for sequence in ("<Return>", "<space>", "<Down>"):
@@ -40,7 +41,7 @@ class PreviewSelect(ctk.CTkFrame):
     def get(self):
         return self.value
 
-    def configure(self, **options):
+    def configure(self, **options):  # type: ignore[reportIncompatibleMethodOverride] # 有意放宽签名以接管 state 并联动子控件，运行时兼容父类。
         state = options.pop("state", None)
         super().configure(**options)
         if state is not None:
@@ -50,7 +51,7 @@ class PreviewSelect(ctk.CTkFrame):
             if state == "disabled":
                 self.close()
 
-    def cget(self, name):
+    def cget(self, name):  # type: ignore[reportIncompatibleMethodOverride] # 有意放宽签名以拦截 state，运行时兼容父类。
         return self.state if name == "state" else super().cget(name)
 
     def open(self):
@@ -131,7 +132,8 @@ class PreviewSelect(ctk.CTkFrame):
             return self.close()
 
     def _focus_left(self):
-        if self.popup and not self._entry_pressed and (self.focus_get() is None or self.focus_get().winfo_toplevel() is not self.popup):
+        focused = self.focus_get()  # 只查一次焦点，避免两次调用之间焦点变化使判断不一致。
+        if self.popup and not self._entry_pressed and (focused is None or focused.winfo_toplevel() is not self.popup):
             self.close()
 
     def close(self):
@@ -176,6 +178,8 @@ class ImportDialog(ManagedToplevel):
         self._sections, self._trees, self._row_controls = {}, {}, []
         self._preview_target = self._preview_ready = None
         self._preview_result = None
+        self.pagination = ImportPagination()
+        self._preview_meta = None
         self._selection_number = None
         self._scroll_reset = False
         self._advance_after_render = False
@@ -208,7 +212,7 @@ class ImportDialog(ManagedToplevel):
         options.setdefault("text_color", "white" if primary else "#243447")
         button = ctk.CTkButton(parent, text=text, command=command, font=self.font,
                               corner_radius=8, **options)
-        button.enabled_color = options["fg_color"]
+        button.enabled_color = options["fg_color"]  # type: ignore[reportAttributeAccessIssue] # 运行时附加的禁用底色，供 _button_state 切换。
         return button
 
     def _button_state(self, button, enabled):
@@ -270,7 +274,7 @@ class ImportDialog(ManagedToplevel):
         right = ctk.CTkFrame(middle, fg_color="white", corner_radius=14)
         right.grid(row=0, column=1, sticky="nsew")
         right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(4, weight=1)
+        right.grid_rowconfigure(5, weight=1)
         toolbar = ctk.CTkFrame(right, fg_color="white")
         toolbar.grid(row=0, column=0, sticky="ew", padx=10, pady=4)
         toolbar.grid_columnconfigure(0, weight=1)
@@ -295,15 +299,16 @@ class ImportDialog(ManagedToplevel):
         self.all_button = self._button(filters, "查看全部", self._show_all, width=80)
         self.all_button.pack(side="right")
         self.progress_label = self._label(right, "", anchor="w")
-        self.progress_label.grid(row=3, column=0, sticky="ew", padx=12)
+        self._build_pager(right)
+        self.progress_label.grid(row=4, column=0, sticky="ew", padx=12)
         self.details = ctk.CTkScrollableFrame(right, fg_color="white")
-        self.details.grid(row=4, column=0, sticky="nsew", padx=8, pady=4)
+        self.details.grid(row=5, column=0, sticky="nsew", padx=8, pady=4)
         self.details.grid_columnconfigure(0, weight=1)
         # 明细内统一路由；其他区域保留原滚动行为，不注册全局滚轮绑定。
         self.details._parent_canvas.configure(yscrollincrement=1)
         self.bind("<MouseWheel>", self._wheel, add="+")
         inspect = ctk.CTkFrame(right, fg_color="#F8FAFC", corner_radius=8)
-        inspect.grid(row=5, column=0, sticky="ew", padx=10)
+        inspect.grid(row=6, column=0, sticky="ew", padx=10)
         self.inspect_title = self._label(inspect, "单笔核对 · 点击上方记录查看", anchor="w")
         self.inspect_title.pack(fill="x", padx=8)
         self.raw_text = ctk.CTkTextbox(inspect, height=64, font=self.font, fg_color="#F8FAFC", text_color="#243447")
@@ -311,7 +316,7 @@ class ImportDialog(ManagedToplevel):
         self.row_hint = self._label(inspect, "选择记录后，可查看原值和可用操作。", anchor="w", wraplength=590)
         self.row_hint.pack(fill="x", padx=8)
         row_bar = ctk.CTkFrame(right, fg_color="white")
-        row_bar.grid(row=6, column=0, sticky="ew", padx=10, pady=6)
+        row_bar.grid(row=7, column=0, sticky="ew", padx=10, pady=6)
         self.income_button = self._button(row_bar, "此笔入账", lambda: self._row_action("入账"), width=80, primary=True)
         self.skip_button = self._button(row_bar, "跳过此笔", lambda: self._row_action("跳过"), width=80)
         self.income_button.pack(side="left")
@@ -445,9 +450,83 @@ class ImportDialog(ManagedToplevel):
         self._ensure_poll()
         return True
 
+    def _build_pager(self, parent):
+        # 分页入口固定在筛选栏下方，不放入随明细滚动的容器。
+        self.pager = ctk.CTkFrame(parent, fg_color="white")
+        self.pager.grid(row=3, column=0, sticky="ew", padx=10, pady=3)
+        self.pager.grid_columnconfigure(0, weight=1)
+        self.page_label = self._label(self.pager, "", anchor="w")
+        self.page_label.grid(row=0, column=0, sticky="w")
+        self.previous_page = self._button(self.pager, "上一页", lambda: self._change_page(
+            self.pagination.page - 1), width=65)
+        self.previous_page.grid(row=0, column=1, padx=3)
+        self.next_page = self._button(self.pager, "下一页", lambda: self._change_page(
+            self.pagination.page + 1), width=65)
+        self.next_page.grid(row=0, column=2, padx=3)
+        self.page_var = tk.StringVar(master=self, value="1")
+        self.page_entry = ctk.CTkEntry(self.pager, textvariable=self.page_var, width=55, font=self.font)
+        self.page_entry.grid(row=0, column=3, padx=3)
+        self.page_entry.bind("<Return>", lambda event: self._change_page(self.page_var.get()))
+        self.jump_page = self._button(self.pager, "跳页", lambda: self._change_page(
+            self.page_var.get()), width=50)
+        self.jump_page.grid(row=0, column=4)
+
+    def _update_pager(self):
+        pages = self.pagination
+        self.pager.grid_remove() if pages.summary else self.pager.grid()
+        self.page_label.configure(text=f"第 {pages.page} / {pages.total_pages} 页 · 匹配 {len(pages.rows)} 笔")
+        self.page_var.set(str(pages.page))
+        self._button_state(self.previous_page, pages.page > 1)
+        self._button_state(self.next_page, pages.page < pages.total_pages)
+        self._button_state(self.jump_page, bool(pages.rows))
+        self.page_entry.configure(state="normal" if pages.rows else "disabled")
+
+    def _change_page(self, page, *, target=None):
+        if self._ending:
+            return
+        try:
+            if self._selection_number is not None:
+                self.pagination.remember(self._selection_number)
+            self.pagination.move(page)
+        except ValueError as error:
+            self.footer.configure(text=str(error))
+            return
+        self.pagination.target = target
+        self._preview_ready = None  # 就绪资格只属于已核对过的当前页，业务候选继续保留。
+        self._scroll_reset = True
+        self._render(self.session.result is None and self.session.obsolete is not None)
+
+    def _preview_choice(self):
+        kind, target, _version = self._preview_target  # type: ignore[reportGeneralTypeIssues] # 调用方与 _candidate_valid 已保证 _preview_target 非空。
+        choices = self.session.pair_choices if kind == "pair" else self.session.group_choices
+        return choices.get(target, Selection("两笔都跳过" if kind == "pair" else None)).value if kind != "row" else "入账"
+
+    def _request_preview(self, operation):
+        def request():
+            operation()
+            # 请求号与源结果共同保护同代次内的异步试算；页号仅保护展示，不废弃业务结果。
+            self._preview_meta = (self.session, self.session.version, self.session.request_id,
+                self.session.result, self._preview_target, self._preview_choice(),
+                (self.pagination.epoch, self.pagination.page))
+        return self._run(request)
+
+    def _candidate_valid(self):
+        meta = self._preview_meta
+        return bool(meta and self._preview_target and meta[:3] == (
+            self.session, self.session.version, self.session.request_id) and
+            meta[3] is self.session.result and meta[4] == self._preview_target and
+            meta[5] == self._preview_choice())
+
+    def _bind_preview_page(self):
+        if self._candidate_valid():
+            self._preview_meta = (*self._preview_meta[:-1], (self.pagination.epoch, self.pagination.page))  # type: ignore[reportOptionalSubscript] # 仅当 _candidate_valid() 为真（meta 非空）时才进入。
+
+    def _preview_current(self):
+        return self._candidate_valid() and self._preview_meta[-1] == (self.pagination.epoch, self.pagination.page)  # type: ignore[reportOptionalSubscript] # 左值 _candidate_valid() 已保证 meta 非空。
+
     def _ensure_poll(self):
         if not self._ending and self.session.busy and self._poll_job is None:
-            self._poll_job = self.after(50, self._poll)
+            self._poll_job = self.after(50, self._poll)  # type: ignore[reportArgumentType] # Tk 接受无参回调，存根对回调类型标注过窄。
 
     def _poll(self):
         self._poll_job = None
@@ -466,6 +545,7 @@ class ImportDialog(ManagedToplevel):
         if self._preview_result is not session.result:
             # 规则结果/决定生效后，旧试算不再代表当前选择；筛选切换仍保留有效候选。
             self._preview_target = self._preview_ready = None
+            self._preview_meta = None
             self._preview_result = session.result
         historical = session.result is None and session.obsolete is not None
         if session.busy and session.result is None:
@@ -485,7 +565,7 @@ class ImportDialog(ManagedToplevel):
         total, done, remaining = session.progress
         progress = f"本轮总量 {total} 笔 · 已处理 {done} 笔 · 剩余 {remaining} 笔" if total > 50 else ""
         if historical:
-            old_total, old_done, old_remaining = session.obsolete.progress
+            old_total, old_done, old_remaining = session.obsolete.progress  # type: ignore[reportOptionalMemberAccess] # historical 分支保证 obsolete 非空。
             progress = f"历史回看：总量 {old_total} 笔 · 原已处理 {old_done} 笔 · 原剩余 {old_remaining} 笔（已作废）"
         self.progress_label.configure(text=progress)
         self.progress_label.grid() if progress else self.progress_label.grid_remove()
@@ -520,7 +600,14 @@ class ImportDialog(ManagedToplevel):
 
     def _render(self, historical):
         # 每次筛选生成独立渲染编号；销毁旧表后旧批次不能继续插入。
-        self._render_id += 1
+        source = self.session.obsolete if historical else self.session.result
+        context = (id(self.session), self.session.version, historical, self.session.current_view,
+                   self.session.search_text, self.session.only_unhandled)
+        summary = (self.session.current_view in ("规则跳过", "非交易行") and
+                   self.session.current_view not in self.session.show_all and not self.session.search_text)
+        self.pagination.bind(context, source, lambda: self.session.visible_rows(
+            historical=historical, summary=False), summary)
+        self._render_id = self.pagination.new_render()
         token, version = self._render_id, self.session.version
         if self._render_job:
             self.after_cancel(self._render_job)
@@ -531,22 +618,21 @@ class ImportDialog(ManagedToplevel):
             child.destroy()
         self.row_locations, self.group_controls, self.pair_controls = {}, {}, {}
         self._sections, self._trees = {}, {}
-        old_selection = self._selection_number
         self._selection_number = None
-        self._restore_selection = old_selection
+        self._restore_selection = self.pagination.selections.get(self.pagination.page)
         self.inspect_title.configure(text="单笔核对 · 点击上方记录查看")
         self._set_raw("选择一笔记录查看日期、金额、备注和原始内容。\n需要批量处理时，请使用对应组标题处的操作。")
         self._set_row_state(None, historical)
         self._show_inspection(False)
-        rows = self.session.visible_rows(historical=historical)
-        full = self.session.visible_rows(historical=historical, summary=False)
+        rows, full = self.pagination.page_rows, self.pagination.rows
         suffix = " · 历史回看（已作废）" if historical else ""
         self.view_title.configure(text=f"{self.session.current_view} · 共 {len(full)} 笔{suffix}" +
-            (f"，当前展示前 5 笔" if len(rows) < len(full) else ""))
-        self.all_button.configure(state="normal" if len(rows) < len(full) else "disabled")
+            (f"，当前展示前 5 笔" if summary and len(full) > 5 else ""))
+        self.all_button.configure(state="normal" if summary and len(full) > 5 else "disabled")
+        self._update_pager()
         if not rows:
             self._label(self.details, "未找到匹配记录" if self.session.search_text else "当前视图无记录").grid(row=0, column=0)
-        self._render_job = self.after(0, lambda: self._render_batch(rows, 0, token, version, historical))
+        self._render_job = self.after(0, lambda: self._render_batch(rows, 0, token, version, historical))  # type: ignore[reportArgumentType] # Tk 接受无参回调，存根对回调类型标注过窄。
 
     def _render_batch(self, rows, start, token, version, historical):
         if self._ending or token != self._render_id or version != self.session.version:
@@ -567,26 +653,30 @@ class ImportDialog(ManagedToplevel):
             tree.configure(height=len(tree.get_children()))
             self.row_locations[row.row_number] = (tree, item, row)
         if start + 20 < len(rows):
-            self._render_job = self.after(1, lambda: self._render_batch(rows, start + 20, token, version, historical))
+            self._render_job = self.after(1, lambda: self._render_batch(rows, start + 20, token, version, historical))  # type: ignore[reportArgumentType] # Tk 接受无参回调，存根对回调类型标注过窄。
         else:
             self.details._parent_canvas.yview_moveto(self._scroll_fraction)
-            location = self.row_locations.get(self._restore_selection)
+            target, self.pagination.target = self.pagination.target, None
+            location = self.row_locations.get(target or self._restore_selection)
             if location and not self._advance_after_render:
-                location[0].selection_set(location[1])
-                self._selected(location[0])
+                self._highlight(target or self._restore_selection)
+                if token != self._render_id:
+                    return  # 选择触发试算及 refresh 后不能继续操作已销毁控件。
             if self._advance_after_render and not historical and not self.session.busy:
                 self._advance_after_render = False
                 if not self.session.error and self.session.current_view == "待确认" and self.session.only_unhandled:
                     self.locate_next()
             # 默认退款对也自动准备核对内容，不要求用户先猜到要点某笔明细。
             if not historical and not self.session.busy and not self._selection_number:
-                if self._preview_ready and self._preview_ready == self._preview_target and (
-                        self._preview_ready[1] in self.pair_controls if self._preview_ready[0] == "pair" else
-                        self._preview_ready[1] in self.group_controls if self._preview_ready[0] == "group" else False):
+                if self._candidate_valid() and self._preview_meta[-1] == (self.pagination.epoch, self.pagination.page):  # type: ignore[reportOptionalSubscript] # 左值 _candidate_valid() 已保证 meta 非空。
                     self._finish_preview()
-                elif self.pair_controls and self._preview_target is None:
+                elif self.pair_controls:
                     pair = next(iter(self.pair_controls))
-                    self._prepare_pair(pair)
+                    if self._preview_target == ("pair", pair, self.session.version) and self._candidate_valid():
+                        self._bind_preview_page()
+                        self._finish_preview()
+                    else:
+                        self._prepare_pair(pair)
 
     def _tree_for(self, row, historical):
         pending = self.session.current_view == "待确认"
@@ -603,16 +693,22 @@ class ImportDialog(ManagedToplevel):
             if pending:
                 source = self.session.obsolete if historical else self.session
                 ids = source.groups.get(group, ())
-                pairs = [k for k in source.pairs if set(k) <= set(ids)]
+                members = set(ids)  # 整组成员只建一次，不能为每个对重复扫完整组。
+                pairs = [k for k in source.pairs if set(k) <= members]
                 single = len(pairs) == 1 and len(ids) == 2
                 title = f"{group} · {len(ids)} 笔" + (f" / {len(pairs)} 对" if pairs else "")
+                if single:
+                    title += f" · 原始第 {pairs[0][0]}、{pairs[0][1]} 行"
+                    title += " · 续（本页继续核对）" if self.pagination.continuation(pairs[0]) else ""
                 self._processing_header(section, title, group, pairs[0] if single else None, historical)
             elif group == "用户选择跳过":
                 self._label(section, "用户选择跳过 · 由用户明确决定", anchor="w").pack(fill="x")
         section = self._sections[group]
         source = self.session.obsolete if historical else self.session
         if pair and not (len(source.groups.get(group, ())) == 2 and len(source.pairs) == 1):
-            self._processing_header(section, f"退款对 · 原始第 {pair[0]}、{pair[1]} 行", None, pair, historical)
+            title = f"退款对 · 原始第 {pair[0]}、{pair[1]} 行"
+            title += " · 续（本页继续核对）" if self.pagination.continuation(pair) else ""
+            self._processing_header(section, title, None, pair, historical)
         tree = ttk.Treeview(section, columns=("row", "date", "amount", "note", "result"),
                             show="headings", height=1, style="ImportPreview.Treeview", selectmode="browse")
         for key, title, width in zip(tree["columns"], ("原始行", "本地日期", "带符号金额", "备注", "处理结果"), (65, 95, 95, 160, 220)):
@@ -631,6 +727,8 @@ class ImportDialog(ManagedToplevel):
         frame.pack(fill="x", pady=3)
         frame.grid_columnconfigure(0, weight=1)
         caption = self._label(frame, title, anchor="w", wraplength=200, justify="left")
+        if "续（" in title:
+            caption.configure(text_color="#64748B")  # 续标题同时用文字与弱化颜色区分。
         caption.grid(row=0, column=0, sticky="w", padx=8, pady=3)
         action_area = ctk.CTkFrame(frame, fg_color="transparent")
         action_area.grid(row=0, column=1, sticky="e", padx=6, pady=3)
@@ -651,7 +749,7 @@ class ImportDialog(ManagedToplevel):
         status_label.grid(row=1, column=0, sticky="w", padx=8)
         enabled = not historical and not self.session.busy
         menu.configure(state="normal" if enabled else "disabled")
-        ready = self._preview_ready == ("pair" if pair else "group", pair or group, self.session.version)
+        ready = self._preview_current() and self._preview_ready == ("pair" if pair else "group", pair or group, self.session.version)
         self._button_state(confirm, enabled and (pair or ready and selection.value))
         confirm.configure(text="核对本对" if pair and not ready else "确认本对" if pair else "确认处理本组")
         hint = ("已作废，仅供回看" if historical else "✓ 已确认" if selection.state == "已确认" else
@@ -663,7 +761,8 @@ class ImportDialog(ManagedToplevel):
             clear = self._button(frame, "清除本组决定", lambda: self._run(lambda: self.session.clear_group(group)), width=115)
             clear.grid(row=1, column=1, sticky="e", padx=9, pady=2)
             clear.configure(state="normal" if enabled else "disabled")
-        controls = {"menu": menu, "confirm": confirm, "clear": clear, "status": status, "status_label": status_label}
+        controls = {"menu": menu, "confirm": confirm, "clear": clear, "status": status,
+                    "status_label": status_label, "caption": caption}
         (self.pair_controls if pair else self.group_controls)[pair or group] = controls
         if group:
             explanation = {"疑似退款对": "相似记录金额相反，请核对两笔", "规则冲突": "不同信息给出了不一致的处理结果，请核对原因",
@@ -676,6 +775,7 @@ class ImportDialog(ManagedToplevel):
         self._preview_target = ("pair" if pair else "group", pair or group, self.session.version)
         self._preview_ready = None
         self._selection_number = None  # 组核对不能被旧行的选择恢复回调抢占。
+        self.pagination.remember(None)
         def operation():
             if pair:
                 self.session.select_pair(pair, action)
@@ -683,11 +783,15 @@ class ImportDialog(ManagedToplevel):
             else:
                 self.session.select_group(group, action)
                 self.session.request_group_preview(group)
-        self._run(operation)
+        self._request_preview(operation)
 
     def _confirm_selection(self, group, pair):
-        if pair and self._preview_ready != ("pair", pair, self.session.version):
-            self._prepare_pair(pair)
+        ready = self._preview_ready == ("pair" if pair else "group", pair or group, self.session.version)
+        if not ready or not self._preview_current():
+            if pair:
+                self._prepare_pair(pair)
+            else:
+                self.footer.configure(text="请先选择处理方式并核对本组预览")
             return
         version = self.session.version
         self._advance_after_render = True
@@ -697,9 +801,10 @@ class ImportDialog(ManagedToplevel):
 
     def _prepare_pair(self, pair):
         self._selection_number = None
+        self.pagination.remember(None)
         self._preview_target, self._preview_ready = ("pair", pair, self.session.version), None
         action = self.session.pair_choices.get(pair, Selection("两笔都跳过")).value
-        self._run(lambda: self.session.request_preview(key=pair, action=action))
+        self._request_preview(lambda: self.session.request_preview(key=pair, action=action))
 
     def _row_action(self, action):
         number = self._selection_number
@@ -717,20 +822,23 @@ class ImportDialog(ManagedToplevel):
             self._run(lambda: self.session.confirm_row(number, action))
 
     def _finish_preview(self):
-        kind, target, version = self._preview_target
-        if version != self.session.version:
+        kind, target, version = self._preview_target  # type: ignore[reportGeneralTypeIssues] # 调用前已由 _candidate_valid 保证 _preview_target 非空。
+        if version != self.session.version or not self._candidate_valid():
             self._preview_target = self._preview_ready = None
             return
+        if self._preview_meta[-1] != (self.pagination.epoch, self.pagination.page):  # type: ignore[reportOptionalSubscript] # 上方 _candidate_valid() 已保证 meta 非空。
+            return  # 业务结果留在会话中；旧页回传不能填写当前核对区。
         if self.session.preview_error or self.session.preview is None:
             self.footer.configure(text=self.session.preview_error or "无法生成最终入账预览")
             self.row_hint.configure(text=self.session.preview_error or "无法生成结果，请核对字段或选择跳过。")
             return
         ids = (target,) if kind == "row" else target if kind == "pair" else self.session.groups[target]
         self._preview_ready = self._preview_target
-        if self.session.current_view != "待确认" or not any(row.row_number in ids for row in self.session.visible_rows(summary=False)):
+        if self.session.current_view != "待确认" or not any(number in self.row_locations for number in ids):
             return  # 跨视图/搜索保留候选，但不把别处的批量核对内容填入当前详情。
         # 最终内容在只读核对区呈现，原确认按钮就是明确决定，不额外再弹确认框。
-        rows = [row for row in self.session.preview.rows if row.row_number in ids]
+        members = set(ids)
+        rows = [row for row in self.session.preview.rows if row.row_number in members]
         self._show_inspection(True)
         self.inspect_title.configure(text=f"正在处理：原始第 {target} 行" if kind == "row" else f"最终处理预览 · {'本对' if kind == 'pair' else '本组'}共 {len(ids)} 笔")
         self._set_raw(self._inspection_text(rows, final=True))
@@ -767,6 +875,7 @@ class ImportDialog(ManagedToplevel):
             return
         number, row = match
         self._selection_number = number
+        self.pagination.remember(number)
         self.session.located_row = number
         historical = self.session.result is None
         notice = "已作废（映射已变，决定不能应用）\n" if historical else ""
@@ -777,13 +886,14 @@ class ImportDialog(ManagedToplevel):
         if not historical and not self.session.busy and self.session.current_view == "待确认" and row.row_number in {n for ids in self.session.groups.values() for n in ids}:
             if row.pair_key or row.can_import and row.group != "疑似退款对":
                 target = ("pair", row.pair_key, self.session.version) if row.pair_key else ("row", number, self.session.version)
-                if self._preview_ready == target and self.session.preview is not None:
+                if self._preview_target == target and self._candidate_valid() and self.session.preview is not None:
                     self._preview_target = target
+                    self._bind_preview_page()
                     self._finish_preview()
                 elif self._preview_target != target or self.session.preview is None:
                     self._preview_target, self._preview_ready = target, None
                     action = self.session.pair_choices.get(row.pair_key, Selection("两笔都跳过")).value
-                    self._run(lambda: self.session.request_preview(key=row.pair_key, action=action) if row.pair_key else
+                    self._request_preview(lambda: self.session.request_preview(key=row.pair_key, action=action) if row.pair_key else
                               self.session.request_preview(number=number))
 
     def _set_raw(self, text):
@@ -804,12 +914,12 @@ class ImportDialog(ManagedToplevel):
     def _set_row_state(self, row, historical):
         enabled = row is not None and not historical and not self.session.busy
         origins = {n for ids in self.session.groups.values() for n in ids}
-        ordinary = enabled and self.session.current_view == "待确认" and row.row_number in origins and row.pair_key is None
+        ordinary = enabled and self.session.current_view == "待确认" and row.row_number in origins and row.pair_key is None  # type: ignore[reportOptionalMemberAccess] # enabled 已包含 row is not None，静态无法从布尔别名推断。
         ready = row is not None and self._preview_ready == ("row", row.row_number, self.session.version)
-        self._button_state(self.income_button, ordinary and ready and row.can_import and row.group != "疑似退款对")
+        self._button_state(self.income_button, ordinary and ready and row.can_import and row.group != "疑似退款对")  # type: ignore[reportOptionalMemberAccess] # ordinary/ready 已隐含 row 非空。
         self._button_state(self.skip_button, ordinary)
         self.duplicate_var.set(bool(row and row.duplicate_released))
-        self.duplicate_check.configure(state="normal" if enabled and row.duplicate_of is not None else "disabled")
+        self.duplicate_check.configure(state="normal" if enabled and row.duplicate_of is not None else "disabled")  # type: ignore[reportOptionalMemberAccess] # enabled 已包含 row is not None。
         self.row_hint.configure(text="旧决定已作废，仅供回看；请修正字段重试或取消。" if historical else
             "点击上方一笔记录查看原值；批量处理请使用组标题处的操作。" if row is None else
             "正在生成结果预览，请稍候。" if self.session.busy else
@@ -875,29 +985,41 @@ class ImportDialog(ManagedToplevel):
             popup.lift()
             popup.focus_force()
             # CTk 在 Windows 建窗后约 10ms 恢复旧焦点；该恢复结束后说明再接收键盘。
-            popup.after(20, popup.focus_force)
+            popup.after(20, popup.focus_force)  # type: ignore[reportArgumentType] # Tk 接受无参回调，存根对回调类型标注过窄。
 
     def _help_closed(self, event):
         if event.widget is self.help_popup:
             self.help_popup = None
 
     def switch_view(self, view):
+        if view == self.session.current_view:
+            return
+        self.pagination.reset_context()
         self.session.set_view(view)
         self._scroll_reset = True
         self.refresh()
 
     def _search_changed(self, *_args):
         if not self._ending:
+            if self.search_var.get().strip() == self.session.search_text:
+                return
+            self.pagination.reset_context()
             self.session.set_search(self.search_var.get())
             self._scroll_reset = True
             self.refresh()
+            if self.session.search_text and self.pagination.rows:
+                self.pagination.target = self.pagination.rows[0].row_number
 
     def _filter_changed(self):
+        self.pagination.reset_context()
         self.session.set_only_unhandled(self.only_var.get())
+        self._scroll_reset = True
         self.refresh()
 
     def _show_all(self):
+        self.pagination.reset_context()
         self.session.show_all.add(self.session.current_view)
+        self._scroll_reset = True
         self.refresh()
 
     def locate_next(self):
@@ -905,11 +1027,23 @@ class ImportDialog(ManagedToplevel):
         if number is None:
             self.footer.configure(text="当前筛选无未处理记录")
             return
+        page = self.pagination.page_of(number)
+        if page is not None and page != self.pagination.page:
+            self._change_page(page, target=number)
+        elif number not in self.row_locations:
+            self.pagination.target = number  # 本页尚在插入时，将定位留给渲染完成回调兑现。
+        else:
+            self._highlight(number)
+
+    def _highlight(self, number):
         location = self.row_locations.get(number)
         if location is not None:
             tree, item, _row = location
             tree.selection_set(item)
             tree.focus(item)
+            self._selected(tree)
+            if not tree.winfo_exists():
+                return  # 行试算可能刷新当前页，位置由新渲染完成后恢复。
             tree.see(item)
             bounds = tree.bbox(item)
             if bounds:
@@ -971,7 +1105,7 @@ class ImportDialog(ManagedToplevel):
             except (ValueError, OSError) as error:
                 notice.configure(text=str(error))
                 if "同指纹" in str(error) and not overwrite:
-                    button.configure(text="确认覆盖此映射", command=lambda: save(True))
+                    button.configure(text="确认覆盖此映射", command=lambda: save(True))  # type: ignore[reportOptionalMemberAccess] # 本回调只经 button 的 command 触发，届时已绑定。
                 return
             self.footer.configure(text="映射已保存")
             self._saved_candidates()
@@ -1000,7 +1134,8 @@ class ImportDialog(ManagedToplevel):
         if self._ending:
             return
         self._ending = True
-        self._render_id += 1
+        self.pagination.close()
+        self._render_id = self.pagination.token
         for job in (self._poll_job, self._render_job):
             if job:
                 try:

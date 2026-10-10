@@ -778,7 +778,7 @@ def confirm_undo_import(parent: tk.Misc, batch) -> bool:
     dialog.title("确认撤销导入")
     dialog.geometry("520x245")
     dialog.attributes("-alpha", 0)
-    dialog.transient(parent)
+    dialog.transient(parent)  # type: ignore[reportCallIssue, reportArgumentType] # Tk 接受任意已映射父窗，typeshed 的 Wm/Tcl_Obj 重载过窄。
     _apply_app_icon(dialog)
     result = [False]
     # 导入笔数是原始快照，不承诺被单笔删除过的记录仍全部存在。

@@ -107,7 +107,7 @@ class AnalysisResult:
 
     @property
     def counts(self):
-        result = dict.fromkeys(_CATEGORIES, 0)
+        result: dict[str, int] = dict.fromkeys(_CATEGORIES, 0)  # 显式标注键类型，避免推断成 _CATEGORIES 的 Literal 键。
         for row in self.rows:
             result[row.category] += 1
         return result
@@ -282,10 +282,10 @@ def _infer_mapping(rows, vocab, cleaner):
             content = typed = relation = 0.0
             if role == "date":
                 content = sum(_date_value(c, cleaner)[0] is not None for c in cells) / max(1, len(cells))
-                typed = sum(c.kind == "d" or bool(re.search(r"[yd]", c.number_format.lower())) for c in cells) / max(1, len(cells))
+                typed = sum(c.kind == "d" or bool(re.search(r"[yd]", c.number_format.lower())) for c in cells) / max(1, len(cells))  # type: ignore[reportOptionalMemberAccess] # cells 已由 cleaner.text 过滤掉 None，静态看不见。
             elif role == "amount":
                 content = sum(_amount_value(c, cleaner) is not None for c in cells) / max(1, len(cells))
-                typed = sum(c.kind == "n" for c in cells) / max(1, len(cells))
+                typed = sum(c.kind == "n" for c in cells) / max(1, len(cells))  # type: ignore[reportOptionalMemberAccess] # cells 已由 cleaner.text 过滤掉 None，静态看不见。
                 directions = [i for i, h in enumerate(headers) if "direction" in aliases[h]]
                 related = [(r, _amount_value(_cell(r, index), cleaner)) for r in data]
                 comparable = [(r, a) for r, a in related if a is not None and a != 0
@@ -479,7 +479,7 @@ def analyze_bill(rows, vocab, mapping=None, *, options=None):
         amount = _amount_value(_cell(row, amount_index), cleaner) if amount_index is not None else None
         # 先验证日期和金额，避免残缺行的反向金额让同号交易列被误判为混合符号。
         if day is not None and _valid_amount(amount):
-            signs.add(amount > 0)
+            signs.add(amount > 0)  # type: ignore[reportOptionalOperand] # 上方 _valid_amount(amount) 已保证非 None。
     results = []
     for row in rows:
         text = tuple(_normal(c.value) for c in row.cells)

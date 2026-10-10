@@ -22,6 +22,7 @@ import calendar
 import tkinter as tk
 
 import customtkinter as ctk
+from PIL import Image, ImageDraw, ImageTk
 
 # config 是叶子模块（不导入任何项目模块），引用它的 RESOURCE_DIR 不会形成循环依赖。
 from config import RESOURCE_DIR
@@ -44,7 +45,7 @@ _TITLE_COLOR = "#243447"
 _TEXT_COLOR = "#455A64"
 _ACCENT_COLOR = "#2F80ED"
 _ACCENT_HOVER_COLOR = "#256AC4"
-# 星期表头与「今日」按钮用的浅灰底。
+# 星期表头与「回到今日」导航按钮用浅灰底，避免与已选日期的实底混淆。
 _SUBTLE_COLOR = "#E3EAF2"
 _SUBTLE_HOVER_COLOR = "#D2DEE9"
 
@@ -226,12 +227,80 @@ class _CalendarWindow(ManagedToplevel):
         super().destroy()
 
 
+class _DayButton(ctk.CTkButton):
+    """日期与今天标记共享原按钮命中区，文字直接画在固定尺寸的画布内。"""
+
+    def _draw(self, no_color_updates: bool = False) -> None:
+        text = self._text
+        self._text = ""
+        try:
+            super()._draw(no_color_updates)
+        finally:
+            self._text = text  # 保留CTk的text接口，但不让不透明Label撑高按钮或盖住底边。
+        self._draw_outline()
+        number, _separator, badge = text.partition("\n")
+        color = self._apply_appearance_mode(self._text_color)
+        width, height = self._current_width, self._current_height
+        for tag, value, y, font in (
+            ("day_number", number, height * .34 if badge else height / 2, self._font),
+            ("day_badge", badge, height * .74, ("Microsoft YaHei UI", 8, "bold")),
+        ):
+            if not value:
+                self._canvas.delete(tag)
+                continue
+            if not self._canvas.find_withtag(tag):
+                self._canvas.create_text(0, 0, tags=tag, anchor="center")
+            self._canvas.coords(tag, self._apply_widget_scaling(width / 2), self._apply_widget_scaling(y))
+            self._canvas.itemconfigure(tag, text=value, fill=color, font=self._apply_font_scaling(font))
+            self._canvas.tag_raise(tag)  # 缩放/重绘后文字留在填色上方；透明画布文本不会抹掉圆角描边。
+
+    def _draw_outline(self) -> None:
+        if not self._border_width:
+            self._canvas.delete("day_outline")
+            self._outline_image = None
+            self._outline_key = None  # 普通格/已选格不保留今天描边，避免控件复用后出现残影。
+            return
+        width = round(self._apply_widget_scaling(self._current_width))
+        height = round(self._apply_widget_scaling(self._current_height))
+        radius = min(self._apply_widget_scaling(self._corner_radius), width / 2, height / 2)
+        border = self._apply_widget_scaling(self._border_width)
+        fill = self._hover_color if self._mouse_inside and self._hover else self._fg_color
+        colors = tuple(self._apply_appearance_mode(c) for c in (self._bg_color, self._border_color, fill))
+        key = (width, height, radius, border, colors)
+        if key != getattr(self, "_outline_key", None):
+            # 内轮廓按同一厚度向内偏移，四角与直边共用几何尺寸；四倍采样消除圆弧锯齿。
+            image = Image.new("RGB", (width * 4, height * 4), colors[0])
+            drawing = ImageDraw.Draw(image)
+            drawing.rounded_rectangle((0, 0, width * 4 - 1, height * 4 - 1), radius=radius * 4, fill=colors[1])
+            inset = border * 4
+            drawing.rounded_rectangle((inset, inset, width * 4 - 1 - inset, height * 4 - 1 - inset),
+                                      radius=max(0, radius - border) * 4, fill=colors[2])
+            self._outline_image = ImageTk.PhotoImage(image.resize((width, height), Image.Resampling.LANCZOS), master=self)
+            self._outline_key = key  # 相同尺寸和颜色复用图像，避免布局刷新时重复采样。
+        if not self._canvas.find_withtag("day_outline"):
+            self._canvas.create_image(0, 0, anchor="nw", tags="day_outline")
+        self._canvas.itemconfigure("day_outline", image=self._outline_image)
+        self._canvas.tag_raise("day_outline")  # 覆盖字体圆角的旧轮廓，同时让日期文字保持在描边上方。
+        self._canvas.tag_raise("day_number")
+        self._canvas.tag_raise("day_badge")
+
+    def _on_enter(self, event=None) -> None:
+        super()._on_enter(event)
+        self._draw_outline()  # 悬停仍使用原按钮交互；描边内填色同步更新，不能盖住悬停反馈。
+
+    def _on_leave(self, event=None) -> None:
+        super()._on_leave(event)
+        self._draw_outline()  # 离开或点击后恢复底色，缓存图像不得停留在悬停态。
+
+
 @dataclass
 class _GridCell:
     """窗口级按钮与上次绘制状态；格子可复用，日期/月回填命令每次渲染重新赋值。"""
     button: ctk.CTkButton
+    font: tuple[str, int]
     text: str = ""
     selected: bool = False
+    today: bool = False
     visible: bool = False
 
 
@@ -242,31 +311,43 @@ class _GridChanges(TypedDict, total=False):
     hover_color: str
     text_color: str
     state: str
+    border_width: int
+    border_color: str
+    font: tuple[str, int] | tuple[str, int, str]
 
 
-def _append_grid_cell(grid: ctk.CTkFrame, cells: list[_GridCell], font: tuple[str, int]) -> None:
+def _append_grid_cell(grid: ctk.CTkFrame, cells: list[_GridCell], font: tuple[str, int], *, day: bool = False) -> None:
     # 预创建与正常渲染共用同一构造入口，提前点击可以直接补齐已创建的控件池。
-    cells.append(_GridCell(ctk.CTkButton(
-        grid, text="", state=tk.DISABLED, width=36, height=30,
+    button_class = _DayButton if day else ctk.CTkButton
+    button = button_class(
+        grid, text="", state=tk.DISABLED, width=36, height=32 if day else 30,
         corner_radius=8, font=font, fg_color="#FFFFFF",
         hover_color=_SUBTLE_HOVER_COLOR, text_color=_TEXT_COLOR,
-    )))
+    )
+    if day:
+        button._create_grid()  # 无Label时也要设置画布伸展权重，避免画布小于按钮而裁掉右侧圆角。
+        button.grid_propagate(False)  # 日期格固定同高，文字请求尺寸不得把单行或双行所在行撑大。
+    cells.append(_GridCell(button, font))
 
 
 def _update_grid_cell(
     cell: _GridCell, index: int, text: str, command: Callable[[], None] | None,
-    selected: bool, columns: int,
+    selected: bool, columns: int, *, today: bool = False,
 ) -> None:
     # 隐藏预创建与正式翻页共用更新逻辑，避免预创建布局和实际显示的控件状态漂移。
     visible = command is not None
+    today = today and visible  # 月外空格不得留有缓存的今天标记。
     changes: _GridChanges = {}
-    if cell.text != text:
-        changes["text"] = text  # 复用已有文字，首次点击也不必重新建立同一格子的Label。
-    if cell.selected != selected:
+    if cell.text != text or cell.today != today:
+        changes["text"] = f"{text}\n今" if today else text  # 两行由日期画布分别绘制，沿用同一按钮点击行为。
+    if cell.selected != selected or cell.today != today:
         changes.update(
             fg_color=_ACCENT_COLOR if selected else "#FFFFFF",
             hover_color=_ACCENT_HOVER_COLOR if selected else _SUBTLE_HOVER_COLOR,
-            text_color="#FFFFFF" if selected else _TEXT_COLOR,
+            text_color="#FFFFFF" if selected else (_ACCENT_COLOR if today else _TEXT_COLOR),
+            border_width=2 if today and not selected else 0,  # 今天描边需要清晰可辨，避免细线在缩放后显得发虚。
+            border_color=_ACCENT_COLOR,
+            font=(cell.font[0], cell.font[1], "bold") if today else cell.font,  # 今天数字加粗，复用普通格时恢复常规字体。
         )
     if cell.visible != visible:
         changes["state"] = tk.NORMAL if visible else tk.DISABLED
@@ -278,7 +359,7 @@ def _update_grid_cell(
             cell.button.grid(row=row, column=column, padx=1, pady=1, sticky="nsew")
         else:
             cell.button.grid_forget()  # 清除CTk缩放的布局记录，空格不会随缩放重新出现。
-    cell.text, cell.selected, cell.visible = text, selected, visible
+    cell.text, cell.selected, cell.today, cell.visible = text, selected, today, visible
 
 
 def _render_grid(
@@ -287,13 +368,14 @@ def _render_grid(
     items: list[tuple[str, Callable[[], None] | None, bool]],
     columns: int,
     font: tuple[str, int],
+    *, today_index: int | None = None,
 ) -> None:
     """日期与月份共用格子复用逻辑，只重绘有变化的内容。"""
     for index, (text, command, selected) in enumerate(items):
         if index == len(cells):
             # 控件属于外窗，首次使用才创建；翻页及重新打开只更新这份引用。
-            _append_grid_cell(grid, cells, font)
-        _update_grid_cell(cells[index], index, text, command, selected, columns)
+            _append_grid_cell(grid, cells, font, day=columns == 7)
+        _update_grid_cell(cells[index], index, text, command, selected, columns, today=index == today_index)
 
 
 def _render_month() -> None:
@@ -324,7 +406,8 @@ def _render_month() -> None:
             # 钉住格子显示的日号，年月由_choose读取当前会话；高亮仍比较完整日期。
             items.append((str(day), lambda picked=day: _choose(picked),
                           selected == date(year, month, day)))
-    _render_grid(win.day_grid, win.day_cells, items, 7, win.font)
+    today_index = days.index(ses.today.day) if (year, month) == (ses.today.year, ses.today.month) else None
+    _render_grid(win.day_grid, win.day_cells, items, 7, win.font, today_index=today_index)  # 今天独立于selected，浏览月份只影响标记是否可见。
 
 
 def _shift_month(delta: int) -> None:
@@ -352,15 +435,11 @@ def _choose(day: int) -> None:
 
 
 def _goto_today() -> None:
-    """「今日」按钮：跳回今天所在月份并高亮今天（不关闭弹窗，仍需点日期确认）。"""
+    """回到今天所在月份，只定位、不选择，仍需点日期才能确认。"""
     ses = _ses
     assert ses is not None  # 固定本次调用的会话引用，供静态检查收窄类型。
     today = ses.today
-    ses.state["year"], ses.state["month"], ses.state["selected"] = (
-        today.year,
-        today.month,
-        today,
-    )
+    ses.state["year"], ses.state["month"] = today.year, today.month  # 已选日期保留；导航不能把预填日期悄悄改成今天。
     _render_month()
 
 
@@ -514,9 +593,13 @@ def _apply_mode_chrome(mode: str) -> None:
             win.month_body.pack_forget()
         if win.date_body.winfo_manager() != "pack":
             win.date_body.pack(fill="both", expand=True, before=win.footer)
-    # 【底部左键】按钮是窗口级、只建一次，语义却按模式变（今日 / 本月），
+    if is_month:
+        win.selection_hint.grid_remove()
+    else:
+        win.selection_hint.grid()  # 日期提示不挤占月份网格，月份模式仍保持原有尺寸。
+    # 【底部左键】按钮是窗口级、只建一次，语义却按模式变（回到今日 / 本月），
     # 所以每次打开都要重设文字与命令；漏一次就会带着上一个模式的语义开着。
-    text = "本月" if is_month else "今日"
+    text = "本月" if is_month else "回到今日"
     if win.footer_left.cget("text") != text:
         # 同模式复用保留现有命令与布局，避免重绘底部并触发无效Configure。
         win.footer_left.configure(text=text, command=_goto_this_month if is_month else _goto_today)
@@ -771,7 +854,7 @@ def _build_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
     # 【为什么不把它放进 date_body】标题栏两种模式都要用：日期模式显示「2026 年 9 月」，
     # 月份模式显示「2026 年」，翻页/翻年也都靠它。如果塞进 date_body，切到月份模式时
     # pack_forget(date_body) 会连它一起藏掉，月份模式就得再建一份标题栏——那等于把
-    # 「一个标签 + 一对箭头」复制成两套，并让「今日/本月」这类语义要在两个地方同步。
+    # 「一个标签 + 一对箭头」复制成两套，并让「回到今日/本月」这类语义要在两个地方同步。
     # 所以它留在两个主体之外，切换模式只改文字与箭头语义：
     # 箭头统一走 _shift_cursor（按 _ses.mode 决定翻月还是翻年），文字走 _update_header_title。
     header = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -839,17 +922,20 @@ def _build_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
     for column in range(7):
         day_grid.grid_columnconfigure(column, weight=1, uniform="day")
 
-    # ---------- 底部：今日 / 本月 / 取消 ----------
+    # ---------- 底部：回到今日 / 本月 / 取消 ----------
     footer = ctk.CTkFrame(dialog, fg_color="transparent")
     footer.pack(fill="x", padx=16, pady=(8, 16))
     # 左右两列等宽，让两个按钮宽度一致、整体对称（沿用 dialogs.py 的按钮风格）。
     footer.grid_columnconfigure((0, 1), weight=1)
+    selection_hint = ctk.CTkLabel(footer, text="点击日期即可选定", height=20,
+                                  text_color=_TEXT_COLOR, font=("Microsoft YaHei UI", 10))
+    selection_hint.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))  # 导航与选定动作分开说明，不添加确认步骤。
 
-    # 左键留引用：文字与命令是按模式变的（日期模式「今日」/ 月份模式「本月」），
+    # 左键留引用：文字与命令是按模式变的（日期模式「回到今日」/ 月份模式「本月」），
     # 由 _apply_mode_chrome 每次打开重设；不留引用就只能把它拆成两个按钮。
     footer_left = ctk.CTkButton(
         footer,
-        text="今日",
+        text="回到今日",
         command=_goto_today,
         height=34,
         corner_radius=9,
@@ -858,7 +944,7 @@ def _build_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
         text_color=_TEXT_COLOR,
         font=dialog_font,
     )
-    footer_left.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    footer_left.grid(row=1, column=0, sticky="ew", padx=(0, 6))
     ctk.CTkButton(
         footer,
         text="取消",
@@ -868,7 +954,7 @@ def _build_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
         fg_color="#90A4AE",
         hover_color="#78909C",
         font=dialog_font,
-    ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+    ).grid(row=1, column=1, sticky="ew", padx=(6, 0))
 
     # 窗口级引用集中放进 _win，供上面的模块级回调「现读」（回调在调用时才解析名字，
     # 所以这里最后赋值也来得及）。
@@ -884,7 +970,8 @@ def _build_window(parent: tk.Tk | tk.Toplevel, mode: str) -> None:
         # 底部按钮栏的引用：月份主体是后建的，pack 时必须写成 pack(before=footer)
         # 才能排在按钮上方，否则会掉到按钮下面去。
         footer=footer,
-        # 底部左键（今日 / 本月）：文字与命令按模式变，见 _apply_mode_chrome。
+        selection_hint=selection_hint,
+        # 底部左键（回到今日 / 本月）：文字与命令按模式变，见 _apply_mode_chrome。
         # 不留引用的话就只剩「把它拆成两个按钮」这一条路。
         footer_left=footer_left,
         # 月份模式主体：懒创建（第一次切到月份模式才建），先在 _win 里占位 None；
@@ -1000,8 +1087,9 @@ def prewarm(parent: tk.Tk | tk.Toplevel) -> None:
                 else:
                     _cancel_prewarm()
                     return
-                _append_grid_cell(grid, cells, win.font)
-                _update_grid_cell(cells[-1], len(cells) - 1, text, command, selected, columns)
+                _append_grid_cell(grid, cells, win.font, day=grid is win.day_grid)
+                _update_grid_cell(cells[-1], len(cells) - 1, text, command, selected, columns,
+                                  today=grid is win.day_grid and day == today.day)  # type: ignore[reportPossiblyUnboundVariable] # 月格分支不赋值 day，但短路保证只在该分支不会读取它；隐藏准备也使用相同标记，正式会话再覆盖选择状态。
                 if perf_counter() >= deadline:
                     break  # 至少创建一个，单个控件/外壳构造不可拆分，预算是让出循环的阈值。
             warm.idle[0] = parent.after_idle(queue_batch)
@@ -1107,7 +1195,7 @@ def _begin_session(
         dialog.geometry(size)  # 保留跨模式/缩放尺寸校正，跳过同尺寸重布局。
 
     # 【模式外壳】必须早于下面的 deiconify：主体显隐与底部左键语义要在窗口显示前就位，
-    # 否则会先按上一个模式的样子闪一帧（比如月份模式下先闪出一片日期网格 + 「今日」）。
+    # 否则会先按上一个模式的样子闪一帧（比如月份模式下先闪出一片日期网格 + 「回到今日」）。
     _apply_mode_chrome(mode)
 
     # 应用图标只设置一次。若首次打开的idle还没跑就被关掉，_cleanup会取消它，
@@ -1209,7 +1297,7 @@ def ask_month(
     """弹出月历选择器（issues #3.2：月份字段从「手敲」改为「点选」）。
 
     与 ask_date 共用同一个复用弹窗：主体换成 4 列 × 3 行的月份格，顶部 ◀ ▶ 由
-    「翻月」改为「翻年」，底部左键由「今日」改为「本月」。
+    「翻月」改为「翻年」，底部左键由「回到今日」改为「本月」。
 
     Args:
         parent: 父窗口，弹窗会以 transient 方式挂在它上面。
