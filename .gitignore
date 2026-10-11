@@ -36,7 +36,6 @@ docs/audit.md
 docs/_last_report.md
 _probe/
 docs/PROJECT_RULES.md
-jpg_to_png.py
 
 # ---------- 临时文件 ----------
 temp.py
