@@ -10,11 +10,13 @@ echo ==========================================
 
 :: 用 python -m PyInstaller 替代直接调用 pyinstaller
 :: 这样可以确保使用的是当前 Python 环境下的打包工具
+:: 词表保留 import_vocab 子目录，与冻结环境的资源读取路径一致
 python -m PyInstaller --noconfirm --onefile --windowed ^
   --icon="image/app_icon.ico" ^
   --name="AccountKeeper_v0.1.8-alpha" ^
   --add-data "image;image" ^
   --add-data "snail_messages.json;." ^
+  --add-data "import_vocab;import_vocab" ^
   --collect-all customtkinter ^
   --collect-all matplotlib ^
   account_keeper.py 
