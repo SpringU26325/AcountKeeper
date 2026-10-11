@@ -2,7 +2,11 @@
 
 
 class ImportPagination:
-    def __init__(self):
+    def __init__(self, page_size=100):
+        # 产品保持 100 笔；候选配额只由隔离探针显式传入，不按耗时自动调整。
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
+            raise ValueError("每页笔数必须为正整数")
+        self.page_size = page_size
         self.context = self.source = None
         self.epoch = self.token = 0
         self.reset_context()
@@ -34,18 +38,18 @@ class ImportPagination:
 
     @property
     def total_pages(self):
-        return (len(self.rows) + 99) // 100
+        return (len(self.rows) + self.page_size - 1) // self.page_size
 
     @property
     def page_rows(self):
         if self.summary:
             return self.rows[:5]
-        start = max(0, self.page - 1) * 100
-        return self.rows[start:start + 100]
+        start = max(0, self.page - 1) * self.page_size
+        return self.rows[start:start + self.page_size]
 
     def page_of(self, number):
         index = self.indices.get(number)
-        return index // 100 + 1 if index is not None else None
+        return index // self.page_size + 1 if index is not None else None
 
     def move(self, value):
         # 输入无效时保持现场，不夹紧用户输入到另一页造成误定位。
@@ -64,7 +68,7 @@ class ImportPagination:
             self.selections[self.page] = number
 
     def continuation(self, pair):
-        return self.pair_starts.get(pair, len(self.rows)) < (self.page - 1) * 100
+        return self.pair_starts.get(pair, len(self.rows)) < (self.page - 1) * self.page_size
 
     def new_render(self):
         self.token += 1
