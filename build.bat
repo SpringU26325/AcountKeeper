@@ -5,21 +5,12 @@ chcp 65001 >nul
 :: 使用方式：在 PyCharm 终端里输入 .\build.bat 运行，或者直接双击本文件
 
 echo ==========================================
-echo   开始打包 AccountKeeper v0.1.8
+echo   开始打包 AccountKeeper
 echo ==========================================
 
-:: 用 python -m PyInstaller 替代直接调用 pyinstaller
-:: 这样可以确保使用的是当前 Python 环境下的打包工具
-:: 词表保留 import_vocab 子目录，与冻结环境的资源读取路径一致
-python -m PyInstaller --noconfirm --onefile --windowed ^
-  --icon="image/app_icon.ico" ^
-  --name="AccountKeeper_v0.1.8-alpha" ^
-  --add-data "image;image" ^
-  --add-data "snail_messages.json;." ^
-  --add-data "import_vocab;import_vocab" ^
-  --collect-all customtkinter ^
-  --collect-all matplotlib ^
-  account_keeper.py 
+:: 版本与构建参数统一交给 Python；失败时原样返回，不输出成功提示。
+"%~dp0.venv\Scripts\python.exe" -B -X utf8 "%~dp0build_release.py" %*
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 
 echo ==========================================
 echo   打包完成！exe 文件位于 dist/ 文件夹下

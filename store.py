@@ -12,6 +12,7 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from functools import wraps
 from pathlib import Path
 import shutil
 import sqlite3
@@ -23,6 +24,15 @@ from config import CSV_FIELDS, DB_PATH
 # 历史标签迁移固定到 2；不能把目标改成 3，否则已迁过的库会再次补 legacy 标签。
 _MULTI_TAG_USER_VERSION = 2
 _SCHEMA_USER_VERSION = 3
+
+
+def _business_write(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        if not self._business_ready:  # 更新初始化只准迁移；提交前禁止普通账目写入。
+            raise RuntimeError("更新尚未提交，禁止业务写入")
+        return method(self, *args, **kwargs)
+    return guarded
 
 
 @dataclass
@@ -67,10 +77,12 @@ class ImportBatch:
 class AccountStore:
     """管理一个账本及其完整缓存；调用方不可把修改缓存当成已经写库。"""
 
-    def __init__(self, path: Path = DB_PATH) -> None:
+    def __init__(self, path: Path = DB_PATH, *, strict_migrations: bool = False) -> None:
         # 数据库位置固定为 config.DB_PATH，不再接受配置覆盖；
         # 保留 path 参数仅是给测试留接口，便于注入临时库而不污染真实账本。
         self.path = path
+        self.strict_migrations = strict_migrations
+        self._business_ready = not strict_migrations
         # 内存缓存：UI 的筛选与汇总都读它，避免用户每敲一个字就查一次数据库。
         self.records: list[Account] = []
         # 先建表、再把数据读进内存，这个顺序不能颠倒。
@@ -84,7 +96,12 @@ class AccountStore:
         self._migrate_to_multi_tag()
         # 前一步失败时不跨级；基础账本仍可启动，批次接口通过就绪标记拒绝使用。
         self.import_batches_available = self._migrate_to_import_batches()
+        if strict_migrations and not self.import_batches_available:
+            raise sqlite3.DatabaseError("更新初始化要求全部迁移成功")
         self.load()
+
+    def enable_business_writes(self) -> None:
+        self._business_ready = True  # 仅由入口验证持久提交后放行，不以主窗出现代替。
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -145,6 +162,8 @@ class AccountStore:
     def _initialize_database(self) -> None:
         # IF NOT EXISTS 只补基础表，不提升版本；数据迁移及批次列由后续专门入口负责。
         with self._connect() as connection:
+            if self.strict_migrations:
+                connection.execute("BEGIN IMMEDIATE")  # 严格启动的基础DDL也必须成组回滚。
             # amount 故意用 TEXT 存储，是为了原样保留 Decimal 的精度，读出时再转回 Decimal。
             connection.execute(
                 """
@@ -195,6 +214,8 @@ class AccountStore:
         try:
             shutil.copy2(self.path, backup_path)
         except OSError as error:
+            if self.strict_migrations:
+                raise  # 严格更新不能带着迁移备份失败继续初始化。
             # 备份失败就中止迁移：宁可这次不迁，也不能在没有退路的情况下改用户的库。
             # 只打控制台警告、不抛异常——启动阶段抛出去会让整个程序起不来。
             print(f"警告：迁移前备份数据库失败（{backup_path}），本次跳过迁移：{error}")
@@ -249,6 +270,8 @@ class AccountStore:
             if pending > 0:
                 backup_path = self._backup_database()
                 if backup_path is None:
+                    if self.strict_migrations:
+                        raise sqlite3.DatabaseError("标签迁移备份未成功")
                     # 备份失败（警告已在上一步打出）：保持原版本号让下次启动重试，
                     # 绝不带着「没有退路」的状态去写用户的库。
                     return
@@ -276,6 +299,8 @@ class AccountStore:
                 connection.execute(f"PRAGMA user_version = {_MULTI_TAG_USER_VERSION}")
         except sqlite3.Error as error:
             # 覆盖「读版本 / 数待补条数」与「备份后写库」两条路径上的数据库错误。
+            if self.strict_migrations:
+                raise  # helper必须收到真实失败，不能被普通启动的降级策略掩盖。
             print(f"警告：标签迁移失败，本次跳过（下次启动重试）：{error}")
 
     def _migrate_to_import_batches(self) -> bool:
@@ -317,6 +342,8 @@ class AccountStore:
                     connection.execute(f"PRAGMA user_version = {_SCHEMA_USER_VERSION}")
             return True
         except sqlite3.Error as error:
+            if self.strict_migrations:
+                raise  # 扩展表DDL和结构校验失败同样禁止确认健康。
             print(f"警告：导入批次迁移未就绪，下次启动重试：{error}")
             return False
 
@@ -362,6 +389,7 @@ class AccountStore:
             ).fetchall()
         return [ImportBatch(*row) for row in rows]
 
+    @_business_write
     def import_batch(
         self, records: Iterable[ImportRecord], file_name: str,
         skipped_count: int = 0, non_transaction_count: int = 0,
@@ -411,6 +439,7 @@ class AccountStore:
             )
         return result  # 只有 commit 成功才返回；缓存及 UI 刷新不在写入事务里。
 
+    @_business_write
     def undo_import_batch(self, batch_id: int) -> bool:
         """原子撤销一个批次；不调用逐笔 delete，不触及任何偏好文件。"""
         self._require_import_batches()
@@ -596,6 +625,7 @@ class AccountStore:
             [(record_id, tag) for tag in tags],
         )
 
+    @_business_write
     def add(
         self, record_date: str, amount: Decimal, tags: tuple[str, ...], note: str
     ) -> None:
@@ -627,6 +657,7 @@ class AccountStore:
         # 写库成功后重新加载缓存，使内存数据与数据库立刻保持一致。
         self.load()
 
+    @_business_write
     def delete(self, record_id: int) -> bool:
         """按主键原子删除记录及标签；找不到返回 False，成功后重载缓存。"""
         with self._connect() as connection:
@@ -647,6 +678,7 @@ class AccountStore:
         self.load()
         return True
 
+    @_business_write
     def update(
         self,
         record_id: int,

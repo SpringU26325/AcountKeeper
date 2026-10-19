@@ -1,22 +1,31 @@
-"""应用启动入口：先准备显示环境与导出目录，再创建 store、主窗和图标。
+"""应用启动入口：先恢复派发，再加载配置、数据层与主窗。
 
 主窗由 UI 持有并使用 store 缓存；此处只负责组装，不读取 SQL 或启动探针。
-config 导入时会创建数据目录，发生在 main 的构造异常处理之前，不能把该 try 当成全启动兜底。
+恢复前只允许标准库与无导入副作用的helper接口，业务依赖在派发后加载。
 """
 
-import ctypes
-from tkinter import messagebox
-
-import customtkinter as ctk
-
-from config import RESOURCE_DIR
-from settings import get_last_export_dir
-from store import AccountStore
-from ui import AccountKeeperApp
-from window_icon import apply_window_icon_frames
+import sys
+from pathlib import Path
+from update_helper import bootstrap, native_notice, offer_manual_retry
 
 
-def main() -> None:
+def _run_app(context) -> None:
+    import ctypes
+    import platform
+    from tkinter import messagebox
+    import customtkinter as ctk
+    from config import APP_VERSION, DATA_DIR, RESOURCE_DIR
+    from settings import get_last_export_dir
+    from store import AccountStore
+    from ui import AccountKeeperApp
+    from window_icon import apply_window_icon_frames
+    if context is None and getattr(sys, "frozen", False):
+        arch = "arm64" if platform.machine().upper() == "ARM64" else "x64" if sys.maxsize > 2**32 else "x86"
+        try:
+            if not offer_manual_retry(Path(sys.executable).resolve(), APP_VERSION, arch, DATA_DIR):
+                return  # helper接管后当前主进程必须退出，不再打开数据库。
+        except Exception as error:
+            native_notice(f"自动更新保持暂停，原应用仍可使用：{error}")
     if hasattr(ctypes, "windll"):
         try:
             # 建窗前申请系统 DPI 感知；这里只声明一次，不处理运行中跨屏或混合 DPI。
@@ -37,10 +46,18 @@ def main() -> None:
     try:
         # 数据库位置固定为 config.DB_PATH，因此不传任何路径参数；
         # 旧 CSV 迁移逻辑已在 #40 中删除，store 不再接收 legacy_csv_path。
-        store = AccountStore()
+        store = AccountStore(strict_migrations=context is not None)
+        class PendingApp(AccountKeeperApp):
+            def _build_widgets(self):
+                self.withdraw()  # 控件/回调创建前隐藏，避免未提交时接到业务输入。
+                super()._build_widgets()
+        factory = PendingApp if context is not None else AccountKeeperApp
         # 把上次导出目录注入界面层，导出时作初始目录、成功后写回配置（界面层不重复读配置）。
-        app = AccountKeeperApp(store, last_export_dir=last_export_dir)
+        app = factory(store, last_export_dir=last_export_dir)
     except Exception as error:
+        if context is not None:
+            context.failed(error)  # 不弹阻塞确认框，由helper判失败并回退。
+            return
         # 覆盖 store 与主窗构造异常；提示文案统一，但不能据此断言实际原因必是数据库损坏。
         messagebox.showerror("启动失败", "数据库文件损坏，请检查数据目录。")
         print(f"启动失败：{error}")
@@ -60,7 +77,34 @@ def main() -> None:
         # 此处兜同步设置失败；延迟回调的异常不能靠这个 try 捕获。
         print(f"设置图标失败：{e}")
     # 新方案取消了「启动回退提示」：读不到上次导出目录只是便利功能失灵，不值得弹窗打扰用户。
+    if context is not None:
+        def await_commit():
+            try:
+                if not context.sent:
+                    context.healthy(APP_VERSION)  # 严格迁移、控件构造及事件循环均已到达。
+                if context.poll():
+                    store.enable_business_writes()
+                    app.deiconify()
+                    return
+                app.after(50, await_commit)
+            except Exception as error:
+                context.failed(error)  # 提交后failed不写失败，不能吞掉用户新账目。
+                app.destroy()
+        app.after_idle(await_commit)
     app.mainloop()
+
+
+def main() -> None:
+    context = None
+    try:
+        context = bootstrap()
+        if context is not False:
+            _run_app(context)
+    except Exception as error:
+        if context:
+            context.failed(error)
+        else:
+            native_notice(f"启动或恢复未完成，禁止打开账本：{error}")
 
 
 if __name__ == "__main__":

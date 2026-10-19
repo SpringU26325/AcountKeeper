@@ -35,7 +35,10 @@ docs/_提示词生成要求.txt
 docs/audit.md
 docs/_last_report.md
 _probe/
-docs/PROJECT_RULES.md
+docs/AGENTS.md
+docs/import_preview_ui.md
+docs/memory.md
+.workbuddy
 
 # ---------- 临时文件 ----------
 temp.py

@@ -3,3 +3,4 @@ Pillow
 matplotlib
 platformdirs
 openpyxl
+PyNaCl==1.6.2
