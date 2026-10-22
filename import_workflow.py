@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from typing import TypeGuard, TypeVar
@@ -159,6 +160,8 @@ class ImportWorkflow:
         self.future = self.poll_job = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bill-reader")
         self.last_batch, self.last_error = None, ""
+        self._shutdown_thread = None
+        self._shutdown_error = None
 
     def notice(self, title, message):
         window = FlowWindow(self.app, title, "620x230")
@@ -329,7 +332,24 @@ class ImportWorkflow:
             return
         self.closed = True
         self.cancel_read()
-        self.executor.shutdown(wait=False, cancel_futures=True)
         for window in (self.preview, self.batch_list, self.failure, *self.reports):
             if _alive(window):
                 window.destroy()
+        # cancel_read会丢弃future引用；必须等线程池真正排空，不能据此误判文件已释放。
+        def drain():
+            try:
+                self.executor.shutdown(wait=True, cancel_futures=True)
+            except Exception as error:
+                self._shutdown_error = error  # 失败必须交给退出协调者，不能伪报收尾完成。
+        self._shutdown_thread = threading.Thread(target=drain, name="bill-reader-shutdown", daemon=False)
+        try:
+            self._shutdown_thread.start()
+        except RuntimeError as error:
+            self._shutdown_error = error  # 未启动的线程也is_alive=False，必须阻止假收尾。
+
+    def shutdown_ready(self):
+        if self._shutdown_error is not None:
+            raise RuntimeError("导入线程池收尾失败") from self._shutdown_error
+        # is_alive为假才证明shutdown线程也已退出；主线程不join、不等文件读取。
+        return (self.closed and not self.writing and self._shutdown_thread is not None
+                and not self._shutdown_thread.is_alive())

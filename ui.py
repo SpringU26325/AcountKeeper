@@ -34,6 +34,7 @@ from snail import SnailManager
 from store import Account, AccountStore
 from tag_aggregation import MULTI_TAG_TOTALS_NOTE, aggregate_records_by_tag
 from widgets import InputFrame, RecordTableFrame, ToolbarFrame
+from update_ui import UpdateFlow, business_action
 
 
 class AccountKeeperApp(ctk.CTk):
@@ -45,6 +46,9 @@ class AccountKeeperApp(ctk.CTk):
         last_export_dir: Path = DEFAULT_EXPORT_DIR,
     ) -> None:
         super().__init__()
+        self.update_flow = None
+        self._business_depth = 0
+        self._update_exiting = False
         self._calendar_start_job: str | None = None
         self._calendar_map_binding: str | None = None
         self._calendar_building = 0
@@ -106,6 +110,9 @@ class AccountKeeperApp(ctk.CTk):
     def destroy(self) -> None:
         if self._calendar_destroyed:
             return
+        if self.update_flow is not None and not self.update_flow.exit_ready:
+            self.update_flow.close()  # 主窗关闭也先取消、结算并异步等线程退出。
+            return
         self._calendar_closing = True
         if self.import_workflow is not None:
             self.import_workflow.close()  # 文件读取结果与轮询不得回到已关闭的主窗。
@@ -125,6 +132,27 @@ class AccountKeeperApp(ctk.CTk):
         _cancel_owned_tasks(self)  # 根窗退出也清理所属CTk/预创建定时器，避免失效脚本留在解释器中。
         super().destroy()
         self._calendar_destroyed = True
+
+    def configure_updates(self, target, version, arch, data_dir):
+        self.update_flow = UpdateFlow(self, target, version, arch, data_dir)
+
+    def check_updates(self):
+        if self.update_flow is not None:
+            self.update_flow.check()
+
+    def prepare_update_exit(self):
+        workflow = self.import_workflow
+        if (self._business_depth or self._calendar_building or self._backup_running
+                or (workflow is not None and workflow.writing) or self.grab_current()):
+            return False  # 模态回调仍在Python栈上时不得快照或交出替换权。
+        if not self._update_exiting:
+            self._update_exiting = self._calendar_closing = True
+            if sys.platform == "win32":
+                self.attributes("-disabled", True)  # 排空期间阻止新业务输入，更新子窗仍能反馈。
+            if workflow is not None:
+                workflow.close()
+            calendar_picker.shutdown(self)
+        return workflow is None or workflow.shutdown_ready()
 
     def _build_widgets(self) -> None:
         """组装标题、输入区、工具栏和记录表格。"""
@@ -191,6 +219,7 @@ class AccountKeeperApp(ctk.CTk):
             open_folder_callback=self.open_data_folder,
             import_callback=self.import_bill,
             batches_callback=self.show_import_batches,
+            update_callback=self.check_updates,
         )
         self.toolbar.pack(fill="x", padx=24, pady=(0, 10))
         self.search_entry = self.toolbar.search_entry
@@ -209,9 +238,11 @@ class AccountKeeperApp(ctk.CTk):
             self.import_workflow = ImportWorkflow(self)
         return self.import_workflow
 
+    @business_action
     def import_bill(self) -> None:
         self._get_import_workflow().choose_file()
 
+    @business_action
     def show_import_batches(self) -> None:
         self._get_import_workflow().show_batches()
 
@@ -297,6 +328,7 @@ class AccountKeeperApp(ctk.CTk):
         self.toolbar.set_record_actions_enabled(record_id is not None)
         self.table_frame.set_selected_record(record_id)
 
+    @business_action
     def add_record(self) -> None:
         try:
             # 按年/月/日解析并在写入时用 isoformat 规范化；解析失败走统一输入提示。
@@ -359,6 +391,7 @@ class AccountKeeperApp(ctk.CTk):
         # 必守的「新增成功后记得刷新」约定，也就少一类「忘了刷新」的 bug。
         self.refresh_records()
 
+    @business_action
     def delete_record(self) -> None:
         record_id = self._selected_record_id()
         # 没有任何选中行时给出提示而不是静默忽略，避免用户以为按钮失效。
@@ -394,6 +427,7 @@ class AccountKeeperApp(ctk.CTk):
             return  # 表头/空白及非记录行不应打开编辑窗。
         self._edit_record_by_id(record_id)
 
+    @business_action
     def _edit_record_by_id(self, record_id: int) -> None:
         """按钮和双击共用预填、取消与保存流程，防止业务口径分叉。"""
         # 从完整缓存按主键取记录预填，不能读取 Treeview 的摘要或 Canvas 可复用槽位。
@@ -467,6 +501,7 @@ class AccountKeeperApp(ctk.CTk):
         self.wait_window(dialog)
         return result[0]
 
+    @business_action
     def backup_data(self) -> None:
         if self._backup_running or self._calendar_closing:
             return
@@ -499,6 +534,7 @@ class AccountKeeperApp(ctk.CTk):
         finally:
             self._backup_running = False  # 成功、取消、异常都归还入口，允许下一次重试。
 
+    @business_action
     def export_csv(self) -> None:
         # 月份由月历弹窗点选（issues #3.2，不再手输），用户取消时返回 None。
         # 第三个实参 prompt 已删：弹窗里不再有说明文字，标题栏 + 月历本身已自解释。
@@ -546,6 +582,7 @@ class AccountKeeperApp(ctk.CTk):
             f"导出成功！文件已保存到：\n{export_path}",
         )
 
+    @business_action
     def show_stats(self) -> None:
         # 与 export_csv 同一套口径：月份由月历弹窗点选（issues #3.2），取消返回 None。
         month = dialogs.ask_month(self, "选择统计月份")

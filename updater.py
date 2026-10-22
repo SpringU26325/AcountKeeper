@@ -13,18 +13,50 @@ import re
 import secrets
 import socket
 import ssl
+import sys
 import threading
 import time
 from urllib.parse import urljoin, urlsplit
+from nacl.bindings import crypto_core_ed25519_is_valid_point
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 
-# TEST ONLY：对应私钥仅在隔离探针；真实发布前必须更换公钥。
-PUBLIC_KEY = bytes.fromhex("27ddbc844141850e7b744205c52d232e0f24b0c4d072cc924495470e62f08b4f")
+# 信任列表：键为公钥指纹（SHA-256 前 8 位，形如 "B52A-0FD5"）。
+# TEST ONLY：当前是测试钥，真实发布前必须替换；轮换时追加新键，不要直接删旧键。
+PUBLIC_KEYS = {
+    "B52A-0FD5": bytes.fromhex("27ddbc844141850e7b744205c52d232e0f24b0c4d072cc924495470e62f08b4f"),
+}
+
+
+# 已知测试公钥：打包产物一旦命中即拒绝启动；源码态放行，否则当前测试钥阶段连探针都无法导入。
+_TEST_KEYS = {"27ddbc844141850e7b744205c52d232e0f24b0c4d072cc924495470e62f08b4f"}
+
+
+def key_id(public):
+    """公钥指纹：与签名脚本同算法，供人眼核对，并作为 ready.json 的验签留痕。"""
+    text = hashlib.sha256(public).hexdigest()[:8].upper()
+    return f"{text[:4]}-{text[4:]}"
+
+
+def _check_public_key():
+    # 种子与公钥同为 32 字节，无法确定判定；点校验能挡住约 94% 的误粘
+    # （实测随机 32 字节仅 11/200 通过），剩余漏网由签名脚本的三方比对兜住。
+    # 测试钥拦截放在验签期（见 verify_offer）：启动期拒绝会让依赖测试钥的夹具无法运行。
+    if not PUBLIC_KEYS:
+        raise RuntimeError("PUBLIC_KEYS 为空，任何更新都无法验证")
+    for name, public in PUBLIC_KEYS.items():
+        if name != key_id(public):
+            raise RuntimeError(f"PUBLIC_KEYS 的键 {name} 与公钥指纹不符")
+        if len(public) != 32 or not crypto_core_ed25519_is_valid_point(public):
+            raise RuntimeError(f"PUBLIC_KEYS[{name}] 不是合法的 Ed25519 公钥，疑似误粘私钥")
+
+
+_check_public_key()  # 导入即拒绝：宁可启动失败，也不能带着错误信任根发版。
 _API = "https://gitee.com/api/v5/repos/zhuo-chunyu/account-keeper/releases"
 _HOSTS = {"gitee.com", "foruda.gitee.com"}
 _FILES = {"candidate.exe.part", "candidate.exe", "manifest.json", "manifest.sig",
-          "ready.json.tmp", "owner.json"}
+          "ready.json.tmp", "ready.json", "owner.json", "update_helper.exe", "update_helper.exe.part",
+          "pending.json", "stop.json", "healthy.json", "failure.json", "commit.json"}
 
 
 class UpdateError(Exception):
@@ -33,6 +65,14 @@ class UpdateError(Exception):
 
 class Cancelled(UpdateError):
     """取消不能被当作可重试的网络故障。"""
+
+
+class _Transient(UpdateError):
+    """可重试的传输中断：断流或截断，不改变信任判断。"""
+
+
+class _Restart(Exception):
+    """服务端忽略 Range，调用方必须截断已下载部分后从头重下。"""
 
 
 class RateLimited(UpdateError):
@@ -45,7 +85,7 @@ class RateLimited(UpdateError):
 class Offer:
     release_id: int
     version: str
-    assets: tuple[str, str, str]
+    assets: tuple[str, str, str, str]
     manifest: bytes
     signature: bytes
     attempt: dict | None = None
@@ -88,7 +128,7 @@ def _json(raw):
 def verify_offer(offer, current_version, arch):
     if not isinstance(offer, Offer) or type(offer.release_id) is not int or offer.release_id < 1:
         raise UpdateError("候选快照非法")
-    if not isinstance(offer.assets, tuple) or len(offer.assets) != 3:
+    if not isinstance(offer.assets, tuple) or len(offer.assets) != 4 or len(set(offer.assets)) != 4:
         raise UpdateError("附件快照不完整")
     for url in offer.assets:
         _url(url)
@@ -96,14 +136,29 @@ def verify_offer(offer, current_version, arch):
         raise UpdateError("清单或签名越界")
     try:
         signature = base64.b64decode(offer.signature.rstrip(b"\r\n"), validate=True)
-        if len(signature) != 64 or len(PUBLIC_KEY) != 32:
-            raise ValueError("签名／公钥长度错误")
-        VerifyKey(PUBLIC_KEY).verify(offer.manifest, signature)
+        if len(signature) != 64:
+            raise ValueError("签名长度错误")
+        # 遍历信任列表：轮换期间新旧公钥并存，任一把验过即接受，未知钥自然被拒。
+        matched = None
+        for public in PUBLIC_KEYS.values():
+            try:
+                VerifyKey(public).verify(offer.manifest, signature)
+                matched = public
+                break
+            except BadSignatureError:
+                continue
+        if matched is None:
+            raise ValueError("信任列表内所有公钥均验签失败")
+        if matched.hex() in _TEST_KEYS:
+            # 验签期拦截：正式产物可以正常启动，但绝不接受测试钥签署的清单。
+            raise UpdateError("清单由内置测试公钥签署，正式产物拒绝该更新")
     except (BadSignatureError, ValueError, TypeError, binascii.Error) as error:  # 密码学失败绝不降级为哈希验证。
         raise UpdateError("Ed25519验签失败") from error
     m = _json(offer.manifest)
-    fields = {"schema", "app", "version", "channel", "arch", "size", "sha256", "url"}
-    if not isinstance(m, dict) or set(m) != fields or type(m["schema"]) is not int or m["schema"] != 1:
+    fields = {"schema", "app", "version", "channel", "arch", "size", "sha256", "url",
+              "helper_size", "helper_sha256", "helper_url"}
+    # 字段集合严格相等：清单里多出任何字段（例如自带公钥）都会被整份拒绝。
+    if not isinstance(m, dict) or set(m) != fields or type(m["schema"]) is not int or m["schema"] != 3:
         raise UpdateError("清单格式不受支持")
     if m["app"] != "AccountKeeper" or m["channel"] != "stable" or not isinstance(arch, str) or m["arch"] != arch:
         raise UpdateError("应用／渠道／架构不符")
@@ -113,6 +168,11 @@ def verify_offer(offer, current_version, arch):
         raise UpdateError("包大小非法")
     if not isinstance(m["sha256"], str) or not re.fullmatch("[0-9a-f]{64}", m["sha256"]) or m["url"] != offer.assets[2]:
         raise UpdateError("包哈希／同Release附件绑定不符")
+    if not isinstance(m["helper_sha256"], str) or not re.fullmatch("[0-9a-f]{64}", m["helper_sha256"]):
+        raise UpdateError("helper哈希不符")
+    if (type(m["helper_size"]) is not int or not 1 <= m["helper_size"] <= 256 * 1024 * 1024
+            or m["helper_url"] != offer.assets[3]):
+        raise UpdateError("helper大小／同Release附件绑定不符")  # 独立附件必须同时受签名与Release快照约束。
     return m
 
 
@@ -199,15 +259,17 @@ class _Budget:
                 self.check()
         raise last if "last" in locals() else UpdateError("DNS无可用地址")
 
-def _stream(url, limit, budget, sink, expected=None, progress=None):
+def _stream(url, limit, budget, sink, expected=None, progress=None, start=0, digest=None):
     for hop in range(4):
         p = _url(url)
         connection = http.client.HTTPSConnection(p.hostname, 443, timeout=budget.timeout())
         response = None
         try:
             connection.sock = budget.connect(p.hostname)
-            connection.request("GET", (p.path or "/") + ("?" + p.query if p.query else ""),
-                               headers={"User-Agent": "AccountKeeper", "Accept-Encoding": "identity"})
+            headers = {"User-Agent": "AccountKeeper", "Accept-Encoding": "identity"}
+            if start:
+                headers["Range"] = f"bytes={start}-"  # 续传只取剩余部分；服务端不回206即视为不支持。
+            connection.request("GET", (p.path or "/") + ("?" + p.query if p.query else ""), headers=headers)
             response = connection.getresponse()
             budget.check()
             if response.status in (301, 302, 303, 307, 308):
@@ -225,12 +287,27 @@ def _stream(url, limit, budget, sink, expected=None, progress=None):
                 raise RateLimited(time.time() + max(0, delay))
             if 500 <= response.status <= 599:
                 raise OSError("更新源暂时不可用")
-            if response.status != 200 or response.getheader("Content-Encoding", "identity").lower() != "identity":
+            if response.getheader("Content-Encoding", "identity").lower() != "identity":
+                raise UpdateError("HTTP状态或编码不受支持")
+            if response.status == 206 and start:
+                match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)",
+                                     (response.getheader("Content-Range") or "").strip())
+                # 续传必须精确衔接：起点等于已有字节数，终点是总长末字节，总长等于清单声明。
+                if (not match or int(match.group(1)) != start or int(match.group(3)) != expected
+                        or int(match.group(2)) != expected - 1):
+                    raise UpdateError("续传范围不符")
+                declared_expected = expected - start
+            elif response.status == 200:
+                if start:
+                    raise _Restart("服务端忽略 Range")
+                declared_expected = expected
+            else:
                 raise UpdateError("HTTP状态或编码不受支持")
             declared = response.getheader("Content-Length")
-            if declared is not None and (not declared.isascii() or not declared.isdigit() or int(declared) > limit or (expected is not None and int(declared) != expected)):
+            if declared is not None and (not declared.isascii() or not declared.isdigit() or int(declared) > limit
+                                         or (declared_expected is not None and int(declared) != declared_expected)):
                 raise UpdateError("声明长度不符")
-            total, digest = 0, hashlib.sha256()
+            received, digest = 0, digest or hashlib.sha256()
             while True:
                 budget.check()
                 if budget.sock is not None:
@@ -239,15 +316,15 @@ def _stream(url, limit, budget, sink, expected=None, progress=None):
                 budget.check()
                 if not chunk:
                     break
-                total += len(chunk)
-                if total > limit:
+                received += len(chunk)
+                if start + received > limit:
                     raise UpdateError("接收字节数越界")
                 sink(chunk)
                 digest.update(chunk)
                 if progress:
-                    progress(total, expected)
-            if (declared is not None and total != int(declared)) or (expected is not None and total != expected):
-                raise UpdateError("下载提前中断")
+                    progress(start + received, expected)
+            if (declared is not None and received != int(declared)) or (expected is not None and start + received != expected):
+                raise _Transient("下载提前中断")
             return digest.hexdigest()
         except (OSError, http.client.HTTPException):
             budget.check()  # 将监督任务唤醒的错误归为真正的超时／取消。
@@ -281,6 +358,10 @@ def check_updates(current_version, arch, cancel=None, *, target_exe=None, manual
     from update_helper import begin_attempt, settle_attempt
     if target_exe is None:
         raise UpdateError("检查需要明确的目标更新上下文")
+    try:
+        cleanup_stale(target_exe, current_version)  # 启动即自愈：上次崩溃留下的暂存材料在此回收。
+    except (OSError, UpdateError):
+        pass  # 清理是尽力而为，不能因为它挡住检查本身。
     attempt = begin_attempt(target_exe, manual)
     try:
         offer = _check_updates(current_version, arch, cancel)
@@ -289,7 +370,9 @@ def check_updates(current_version, arch, cancel=None, *, target_exe=None, manual
             return None
         return replace(offer, attempt=attempt)
     except Exception as error:  # 重试由网络层控制，只结算最外层的一次尝试。
-        settle_attempt(target_exe, attempt, "cancelled" if isinstance(error, Cancelled) else "failed", repr(error))
+        # 断网、限流、超时不是用户的错：记为 cancelled 不计失败次数，否则正常使用也会被暂停。
+        transient = isinstance(error, (Cancelled, RateLimited, OSError, http.client.HTTPException))
+        settle_attempt(target_exe, attempt, "cancelled" if transient else "failed", repr(error))
         raise
 
 
@@ -317,22 +400,33 @@ def _check_updates(current_version, arch, cancel=None):
                 continue  # API中的预发布／非法版本不是稳定升级候选。
         if not choices:
             return None
-        _, release, version = max(choices, key=lambda item: item[0])
-        assets = release.get("assets")
-        if not isinstance(assets, list):
-            raise UpdateError("缺少附件列表")
-        urls = []
-        for name in ("manifest.json", "manifest.sig", "AccountKeeper.exe"):
-            matches = [a for a in assets if isinstance(a, dict) and a.get("name") == name]
-            if len(matches) != 1:
-                raise UpdateError("同Release附件缺失或重名")
-            url = matches[0].get("browser_download_url")
-            _url(url)
-            urls.append(url)
-        offer = Offer(release.get("id"), version, tuple(urls),
-                      _fetch(urls[0], 65536, budget), _fetch(urls[1], 1024, budget))
-        verify_offer(offer, current_version, arch)
-        return offer
+        # 按版本降序最多试 3 个：最新 Release 畸形时退回次新，避免全量客户端一起卡死。
+        failure = None
+        for _, release, version in sorted(choices, key=lambda item: item[0], reverse=True)[:3]:
+            try:
+                return _offer_from(release, version, current_version, arch, budget)
+            except UpdateError as error:  # 只降级"该 Release 不可用"，网络故障不在此列。
+                failure = failure or error
+        raise failure
+
+
+def _offer_from(release, version, current_version, arch, budget):
+    """取指定 Release 的附件并验签；任何不符都抛 UpdateError 交给上层决定是否降级。"""
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        raise UpdateError("缺少附件列表")
+    urls = []
+    for name in ("manifest.json", "manifest.sig", "AccountKeeper.exe", "update_helper.exe"):
+        matches = [a for a in assets if isinstance(a, dict) and a.get("name") == name]
+        if len(matches) != 1:
+            raise UpdateError("同Release附件缺失或重名")
+        url = matches[0].get("browser_download_url")
+        _url(url)
+        urls.append(url)
+    offer = Offer(release.get("id"), version, tuple(urls),
+                  _fetch(urls[0], 65536, budget), _fetch(urls[1], 1024, budget))
+    verify_offer(offer, current_version, arch)
+    return offer
 
 def _target(path):
     path = Path(path).resolve(strict=True)
@@ -363,7 +457,27 @@ def _owned(work, target):
         raise UpdateError("owner记录不符")
 
 
+def protected_materials(work, target):
+    from update_helper import read_json
+    try:
+        for name in (".accountkeeper-update.json", ".accountkeeper-update.json.bak", ".accountkeeper-update-state.json"):
+            path = target.parent / name
+            if not path.exists():
+                continue
+            record = read_json(path)
+            if record.get("work") == str(work):
+                return True
+            for attempt in (record.get("active"), (record.get("last") or {}).get("attempt")):
+                if attempt and (attempt.get("binding") or {}).get("work") == str(work):
+                    return True  # 外层日志、归档或持久绑定仍引用时，整个验签证据目录都保留。
+        return (work / "commit.json").exists()
+    except Exception:
+        return True  # 无法解释归属时禁止清理，不能用删除现场来掩盖损坏。
+
+
 def _remove(work, target):
+    if protected_materials(work, target):
+        raise UpdateError("事务证据仍被引用，禁止删除")
     _owned(work, target)
     entries = list(work.iterdir())
     if any(p.name not in _FILES or p.resolve() != p or not p.is_file() for p in entries):
@@ -376,12 +490,87 @@ def _remove(work, target):
 
 
 def cleanup_incomplete(target_exe):
+    from update_helper import Busy, FileLock
     target = _target(target_exe)
+    try:
+        with FileLock(target, "install", 0):
+            _cleanup_incomplete(target)
+    except Busy:
+        return  # 安装正在发布绑定，不能在归属检查与删除之间穿插交接。
+
+
+def _cleanup_incomplete(target):
     base = _base(target)
     if base.exists():
         for work in base.iterdir():
             if re.fullmatch("[0-9a-f]{32}", work.name) and work.is_dir() and not (work / "ready.json").exists():
-                _remove(work, target)
+                try:
+                    _remove(work, target)
+                except (OSError, UpdateError):  # 归属不明或被占用：保留现场，但不阻断本次下载。
+                    continue
+
+
+_STALE_SECONDS = 7 * 86400
+
+
+def cleanup_stale(target_exe, current_version):
+    """启动或下次检查时回收暂存目录；返回实际回收数量。"""
+    from update_helper import Busy, FileLock
+    target = _target(target_exe)
+    try:
+        with FileLock(target, "install", 0), FileLock(target, "download", 0):  # 清理和事务发布互斥。
+            return _sweep(target, current_version)
+    except Busy:
+        return 0
+
+
+def _sweep(target, current_version):
+    base = _base(target)
+    if not base.exists():
+        return 0
+    removed = 0
+    for work in list(base.iterdir()):
+        if not (re.fullmatch("[0-9a-f]{32}", work.name) and work.is_dir()):
+            continue
+        if protected_materials(work, target):
+            continue
+        if not _stale(work, target, current_version):
+            continue
+        try:
+            _remove(work, target)
+            removed += 1
+        except UpdateError:
+            if (work / "owner.json").exists():  # 归属不符：可能属于别的事务，保留现场。
+                continue
+            entries = list(work.iterdir())
+            # 归属文件都没写成就崩了：只回收白名单文件，避免目录永久占位。
+            if any(p.name not in _FILES or p.resolve() != p or not p.is_file() for p in entries):
+                continue
+            for path in entries:
+                path.unlink()
+            work.rmdir()
+            removed += 1
+        except OSError:
+            continue  # 被占用：下次再试，不影响本次检查。
+    return removed
+
+
+def _stale(work, target, current_version):
+    ready = work / "ready.json"
+    if not ready.exists():
+        return True  # 没发布就绪就是半套材料。
+    try:
+        r = _json(_small(ready))
+        if not isinstance(r, dict) or not isinstance(r.get("version"), str):
+            return True
+        if _version(r["version"]) <= _version(current_version):
+            return True  # 候选不比当前版本新，永远不会被安装。
+        candidate = work / "candidate.exe"
+        if not candidate.is_file() or candidate.stat().st_size != r.get("size"):
+            return True
+    except (OSError, UpdateError, TypeError):  # 解析失败一律按损坏处理。
+        return True
+    return time.time() - ready.stat().st_mtime > _STALE_SECONDS
 
 
 def _record(path, value):
@@ -411,6 +600,46 @@ def _download_attempt(offer, target_exe, current_version, arch, cancel, progress
         raise
 
 
+def _download_file(m, part, cancel, progress):
+    """整次下载共享一个 300 秒预算，最多 3 次尝试；已落盘部分用 Range 续传。"""
+    last = None
+    with _Budget(cancel) as budget:
+        for attempt in range(3):
+            if cancel is not None and cancel.is_set():
+                raise Cancelled("下载已取消")
+            start = part.stat().st_size if part.exists() else 0
+            if start > m["size"]:  # 越界残片不可信，直接丢弃重下。
+                part.unlink()
+                start = 0
+            digest = hashlib.sha256()
+            if start:  # 续传前重算前缀哈希，否则最终摘要只覆盖后半段。
+                with part.open("rb") as prefix:
+                    while chunk := prefix.read(1 << 20):
+                        digest.update(chunk)
+            try:
+                with part.open("ab" if start else "wb") as stream:
+                    _stream(m["url"], m["size"], budget, stream.write, m["size"], progress, start, digest)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if part.stat().st_size != m["size"]:
+                    raise _Transient("下载长度不符")
+                return digest.hexdigest()
+            except _Restart:  # 服务端忽略 Range：清空后按同一预算从头重下。
+                part.unlink(missing_ok=True)
+                last = None
+                continue
+            except (OSError, http.client.HTTPException, _Transient) as error:
+                last = error
+                if attempt == 2:
+                    break
+                budget.check()  # 预算耗尽直接抛超时，不再重试。
+                until = time.monotonic() + 2 ** attempt
+                while time.monotonic() < until:  # 有界退避，且随时响应取消与超时。
+                    budget.check()
+                    budget.cancel.wait(min(0.05, budget.timeout()))
+    raise last if last is not None else UpdateError("下载失败")
+
+
 def _download(offer, target_exe, current_version, arch, cancel=None, progress=None):
     m = verify_offer(offer, current_version, arch)
     target = _target(target_exe)
@@ -425,25 +654,28 @@ def _download(offer, target_exe, current_version, arch, cancel=None, progress=No
     try:
         _record(work / "owner.json", {"schema": 1, "transaction_id": work.name, "target": str(target)})
         _owned(work, target)
-        with _Budget(cancel) as budget:
-            with (work / "candidate.exe.part").open("xb") as stream:
-                digest = _stream(m["url"], m["size"], budget, stream.write, m["size"], progress)
-                stream.flush()
-                os.fsync(stream.fileno())
-            if digest != m["sha256"]:
-                raise UpdateError("包SHA-256不符")
-            budget.check()
-            (work / "candidate.exe.part").rename(work / "candidate.exe")
-            (work / "manifest.json").write_bytes(offer.manifest)
-            (work / "manifest.sig").write_bytes(offer.signature)
-            record = dict(schema=1, transaction_id=work.name, release_id=offer.release_id,
-                          target=str(target), candidate=str(work / "candidate.exe"), version=m["version"],
-                          arch=arch, size=m["size"], sha256=m["sha256"], manifest=str(work / "manifest.json"),
-                          signature=str(work / "manifest.sig"), assets=list(offer.assets), attempt=offer.attempt)
-            _record(work / "ready.json.tmp", record)
-            budget.check()
-            (work / "ready.json.tmp").replace(ready)
-            return ready
+        digest = _download_file(m, work / "candidate.exe.part", cancel, progress)
+        if digest != m["sha256"]:
+            raise UpdateError("包SHA-256不符")
+        if cancel is not None and cancel.is_set():
+            raise Cancelled("下载已取消")
+        (work / "candidate.exe.part").rename(work / "candidate.exe")
+        helper_meta = dict(size=m["helper_size"], sha256=m["helper_sha256"], url=m["helper_url"])
+        helper_part = work / "update_helper.exe.part"
+        if _download_file(helper_meta, helper_part, cancel, None) != m["helper_sha256"]:
+            raise UpdateError("helper SHA-256不符")  # 与主包共用下载器，大小、续传、取消和300秒期限口径一致。
+        helper_part.rename(work / "update_helper.exe")
+        (work / "manifest.json").write_bytes(offer.manifest)
+        (work / "manifest.sig").write_bytes(offer.signature)
+        record = dict(schema=1, transaction_id=work.name, release_id=offer.release_id,
+                      target=str(target), candidate=str(work / "candidate.exe"), version=m["version"],
+                      arch=arch, size=m["size"], sha256=m["sha256"], manifest=str(work / "manifest.json"),
+                      signature=str(work / "manifest.sig"), assets=list(offer.assets), attempt=offer.attempt)
+        _record(work / "ready.json.tmp", record)
+        if cancel is not None and cancel.is_set():
+            raise Cancelled("下载已取消")
+        (work / "ready.json.tmp").replace(ready)
+        return ready
     except BaseException as error:  # 包含调用方中断；就绪发布前均回收本事务。
         if not ready.exists():
             try:
@@ -453,7 +685,7 @@ def _download(offer, target_exe, current_version, arch, cancel=None, progress=No
         raise
 
 
-def verify_ready(ready_path, target_exe, current_version, arch):
+def verify_ready(ready_path, target_exe, current_version, arch, *, with_manifest=False):
     # helper可以独立复验；ready字段和磁盘路径均不是信任根。
     target = _target(target_exe)
     ready = Path(ready_path).absolute()
@@ -472,15 +704,22 @@ def verify_ready(ready_path, target_exe, current_version, arch):
     m = verify_offer(offer, current_version, arch)
     if any(r.get(key) != m[key] for key in ("version", "arch", "size", "sha256")):
         raise UpdateError("ready与签名清单不符")
-    candidate, digest, size = work / "candidate.exe", hashlib.sha256(), 0
-    if candidate.resolve() != candidate:
+    candidate = work / "candidate.exe"
+    verify_payload(candidate, m["size"], m["sha256"])
+    verify_payload(work / "update_helper.exe", m["helper_size"], m["helper_sha256"])
+    return (candidate, m) if with_manifest else candidate
+
+
+def verify_payload(path, expected_size, expected_sha):
+    # 下载后和交接前都读盘上字节；内存摘要不能证明候选仍完整。
+    digest, size = hashlib.sha256(), 0
+    if path.resolve() != path:
         raise UpdateError("候选路径越界")
-    with candidate.open("rb") as stream:
+    with path.open("rb") as stream:
         while chunk := stream.read(65536):
             size += len(chunk)
-            if size > m["size"]:
+            if size > expected_size:
                 raise UpdateError("候选大小越界")
             digest.update(chunk)
-    if size != m["size"] or digest.hexdigest() != m["sha256"]:
+    if size != expected_size or digest.hexdigest() != expected_sha:
         raise UpdateError("候选已被改写")
-    return candidate

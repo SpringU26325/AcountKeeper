@@ -14,20 +14,16 @@ ENV/
 dist/
 *.egg-info/
 *.egg
-# PyInstaller 自动生成的 spec 是副产品，不进仓库
-*.spec
 build/
+*.spec
+release/
 
 # ---------- 真实数据（必须忽略！） ----------
 account.db
-# #58 Step 1 迁移前的整库备份，上面的 account.db 匹配不到这个文件名
 account.db.bak
-# 注：account.csv 已随 #40 作废，CSV 只由用户「另存为」自定路径
 account_export_*.csv
 导入外部账单方案（草稿）.txt
 导入外部账单执行计划.md
-微信支付账单流水文件(20260905-20261005)_20261005190852.xlsx
-支付宝交易明细(20260905-20261005).csv
 
 # ---------- 本地工作流文件（不进仓库） ----------
 docs/_issues.txt
@@ -35,15 +31,18 @@ docs/_提示词生成要求.txt
 docs/audit.md
 docs/_last_report.md
 _probe/
-docs/AGENTS.md
+/AGENTS.md                
 docs/import_preview_ui.md
 docs/memory.md
-.workbuddy
+docs/UPDATE_ARCHITECTURE.md
+docs/_report_sign_*.md
 
 # ---------- 临时文件 ----------
 temp.py
 *.tmp
-*.log
+*.log             
+.import-preview-*/  
+.workbuddy-ai/
 
 # ---------- IDE 配置 ----------
 .vscode/

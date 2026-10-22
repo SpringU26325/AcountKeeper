@@ -6,7 +6,7 @@
 
 import sys
 from pathlib import Path
-from update_helper import bootstrap, native_notice, offer_manual_retry
+from update_helper import bootstrap, native_notice, register_data
 
 
 def _run_app(context) -> None:
@@ -15,17 +15,11 @@ def _run_app(context) -> None:
     from tkinter import messagebox
     import customtkinter as ctk
     from config import APP_VERSION, DATA_DIR, RESOURCE_DIR
+    register_data(DATA_DIR, context)  # 配置/迁移/控件可能写数据，必须先登记；登记靠进程退出失效。
     from settings import get_last_export_dir
     from store import AccountStore
     from ui import AccountKeeperApp
     from window_icon import apply_window_icon_frames
-    if context is None and getattr(sys, "frozen", False):
-        arch = "arm64" if platform.machine().upper() == "ARM64" else "x64" if sys.maxsize > 2**32 else "x86"
-        try:
-            if not offer_manual_retry(Path(sys.executable).resolve(), APP_VERSION, arch, DATA_DIR):
-                return  # helper接管后当前主进程必须退出，不再打开数据库。
-        except Exception as error:
-            native_notice(f"自动更新保持暂停，原应用仍可使用：{error}")
     if hasattr(ctypes, "windll"):
         try:
             # 建窗前申请系统 DPI 感知；这里只声明一次，不处理运行中跨屏或混合 DPI。
@@ -54,6 +48,10 @@ def _run_app(context) -> None:
         factory = PendingApp if context is not None else AccountKeeperApp
         # 把上次导出目录注入界面层，导出时作初始目录、成功后写回配置（界面层不重复读配置）。
         app = factory(store, last_export_dir=last_export_dir)
+        # 恢复派发后才创建更新控制器；源码宿主不持有正式exe更新上下文。
+        target = Path(sys.executable).resolve() if getattr(sys, "frozen", False) and sys.platform == "win32" else None
+        arch = "arm64" if platform.machine().upper() == "ARM64" else "x64" if sys.maxsize > 2**32 else "x86"
+        app.configure_updates(target, APP_VERSION, arch, DATA_DIR)
     except Exception as error:
         if context is not None:
             context.failed(error)  # 不弹阻塞确认框，由helper判失败并回退。
@@ -85,12 +83,15 @@ def _run_app(context) -> None:
                 if context.poll():
                     store.enable_business_writes()
                     app.deiconify()
+                    app.update_flow.startup()  # 持久提交后才允许安排下一次更新检查。
                     return
                 app.after(50, await_commit)
             except Exception as error:
                 context.failed(error)  # 提交后failed不写失败，不能吞掉用户新账目。
                 app.destroy()
         app.after_idle(await_commit)
+    else:
+        app.after_idle(app.update_flow.startup)  # 主循环首帧后计时，不等待网络才显示窗口。
     app.mainloop()
 
 

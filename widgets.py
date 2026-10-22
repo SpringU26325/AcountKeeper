@@ -364,6 +364,7 @@ class ToolbarFrame(ctk.CTkFrame):
         open_folder_callback: Callable[[], None], edit_callback: Callable[[], None],
         import_callback: Callable[[], None] | None = None,
         batches_callback: Callable[[], None] | None = None,
+        update_callback: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master, fg_color="transparent")
         self.columnconfigure(0, weight=1)
@@ -391,6 +392,9 @@ class ToolbarFrame(ctk.CTkFrame):
             self._file_callbacks["导入外部账单"] = import_callback
         if batches_callback is not None:
             self._file_callbacks["导入批次"] = batches_callback
+        if update_callback is not None:
+            # 更新入口仍由主窗协调，工具栏不导入网络或事务逻辑。
+            self._file_callbacks["检查更新"] = update_callback
         # 文件入口与日期/标签共用三角及定位；业务仍只通过原有回调执行。
         self.file_menu = FileMenu(heading, tuple(self._file_callbacks), self._run_file_action)
         self.file_menu.configure(fg_color="#E8EEF5")
