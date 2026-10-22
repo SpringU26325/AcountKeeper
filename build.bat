@@ -13,6 +13,7 @@ echo ==========================================
 if not "%errorlevel%"=="0" exit /b %errorlevel%
 
 echo ==========================================
-echo   打包完成！exe 文件位于 dist/ 文件夹下
+echo   打包完成！exe 位于 dist/ 文件夹（包含 AccountKeeper.exe 和 update_helper.exe）
+echo   请前往 Gitee 上传附件，拿取 URL 后运行 sign_release.py 进行签名。
 echo ==========================================
 pause

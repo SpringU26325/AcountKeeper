@@ -760,5 +760,7 @@ class AccountStore:
         with save_path.open("w", newline="", encoding="utf-8-sig") as file:
             writer = csv.writer(file)
             writer.writerow(CSV_FIELDS)
-            writer.writerows(rows)
+            # 所有导出单元格统一防公式执行；只改变CSV表示，数据库中的金额和备注保持原值。
+            writer.writerows(tuple("'" + str(value) if str(value).startswith(("=", "+", "-", "@")) else value
+                                   for value in row) for row in rows)
         return save_path

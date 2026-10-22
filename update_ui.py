@@ -1,5 +1,6 @@
 """更新弹窗与线程协调；事务、验签和替换只调用既有公开接口。"""
 from functools import wraps
+import math
 import os
 from pathlib import Path
 import queue
@@ -304,8 +305,15 @@ class UpdateFlow:
 
     def _error(self, error, kind=None):
         if isinstance(error, updater.RateLimited):
-            self.retry_at = error.retry_at
-            text = "更新源限流，请在" + time.strftime("%H:%M:%S", time.localtime(self.retry_at)) + "后重试。"
+            try:
+                remaining = float(error.retry_at) - time.time()
+                if not math.isfinite(remaining):
+                    raise ValueError("限流时间不是有限数")
+                seconds = math.ceil(min(86400, max(0, remaining)))
+            except (TypeError, ValueError, OverflowError, OSError):  # 展示异常不能炸穿UI事件循环。
+                seconds = 60
+            self.retry_at = time.time() + seconds
+            text = f"更新源限流，请在{seconds}秒后重试。"  # 展示有界时长，避开Windows日历时间转换范围。
         else:
             reason = "网络连接超时" if isinstance(error, TimeoutError) else str(error)[:130]
             text = ("安装交接失败：" if self.blocked else "下载失败：" if kind == "download" else "更新失败：") + reason

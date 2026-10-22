@@ -281,10 +281,14 @@ def _stream(url, limit, budget, sink, expected=None, progress=None, start=0, dig
             if response.status == 429:
                 value = response.getheader("Retry-After", "")
                 try:
-                    delay = int(value) if value.isascii() and value.isdigit() else parsedate_to_datetime(value).timestamp() - time.time()
-                except (ValueError, TypeError, OverflowError):  # 无效限流时间使用保守冷却。
+                    if value.isascii() and value.isdigit():
+                        digits = value.lstrip("0") or "0"
+                        delay = 86400 if len(digits) > 5 else int(digits)  # 超长数字不转大整数，避免位数限制及浮点溢出。
+                    else:
+                        delay = parsedate_to_datetime(value).timestamp() - time.time()
+                except (ValueError, TypeError, OverflowError, OSError):  # Windows不支持的日期也按无效冷却处理。
                     delay = 60
-                raise RateLimited(time.time() + max(0, delay))
+                raise RateLimited(time.time() + min(86400, max(0, delay)))  # 外部元数据最多使检查冷却24小时。
             if 500 <= response.status <= 599:
                 raise OSError("更新源暂时不可用")
             if response.getheader("Content-Encoding", "identity").lower() != "identity":

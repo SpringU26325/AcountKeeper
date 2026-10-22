@@ -36,6 +36,7 @@ docs/import_preview_ui.md
 docs/memory.md
 docs/UPDATE_ARCHITECTURE.md
 docs/_report_sign_*.md
+docs/RELEASE_GUIDE.md
 
 # ---------- 临时文件 ----------
 temp.py

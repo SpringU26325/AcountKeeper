@@ -10,6 +10,8 @@ from dataclasses import dataclass
 import io
 from pathlib import Path
 
+MAX_FILE_BYTES = 50 * 1024 * 1024  # 在解析器和整文件解码前限制输入，避免大账单耗尽内存。
+
 
 @dataclass(frozen=True)
 class RawCell:
@@ -42,7 +44,10 @@ class BillFile:
 
 def _read_csv(path: Path) -> BillFile:
     # 先完整解码再解析，编码回退只处理解码失败，不能把非法 CSV 格式误当成另一种编码。
-    content = path.read_bytes()
+    with path.open("rb") as stream:
+        content = stream.read(MAX_FILE_BYTES + 1)  # 有界读取也覆盖stat之后文件继续增长的窗口。
+    if len(content) > MAX_FILE_BYTES:
+        raise ValueError("账单文件超过50 MiB上限。")
     # UTF-8 优先且去 BOM，GB18030 兼容常见中文导出；不替换坏字节，以免金额/单号被静默改写。
     for encoding in ("utf-8-sig", "gb18030"):
         try:
@@ -101,6 +106,8 @@ def _read_xlsx(path: Path, sheet_name: str | None) -> BillFile:
 def read_bill_file(path: Path, *, sheet_name: str | None = None) -> BillFile:
     """按扩展名只读 CSV/XLSX，返回完整读取结果；不检查交易语义或写入数据库。"""
     path = Path(path)
+    if path.suffix.casefold() in (".csv", ".xlsx") and path.stat().st_size > MAX_FILE_BYTES:
+        raise ValueError("账单文件超过50 MiB上限。")  # CSV/XLSX统一在调用解析器之前拒绝超限文件。
     if path.suffix.casefold() == ".csv":
         if sheet_name is not None:
             raise ValueError("CSV 没有工作表。")

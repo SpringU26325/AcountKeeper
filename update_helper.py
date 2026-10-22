@@ -122,11 +122,40 @@ def digest(path):
     return result.hexdigest()
 
 
-def copy_checked(source, destination, expected):
+def copy_paths(source, destination):
     source, destination = Path(source), Path(destination)
-    if source.resolve() != source or destination.resolve() != destination or digest(source) != expected:
+    if source.resolve() != source or destination.resolve() != destination:
         raise UpdateFailure("复制源或路径校验失败")
-    with source.open("rb") as src, destination.open("wb") as dst:
+    src = os.stat(source)
+    try:
+        dst = os.stat(destination)
+    except FileNotFoundError:
+        dst = None  # 目标未创建才允许xb；其余stat异常保持拒绝。
+    current = os.stat(Path(sys.executable).resolve())
+    if (src.st_nlink > 1 or (dst is not None and
+            (dst.st_nlink > 1 or os.path.samestat(src, dst) or os.path.samestat(current, dst)))
+            or destination == Path(sys.executable).resolve() or source == destination):
+        raise UpdateFailure("复制涉及硬链接、同一物理文件或当前程序，禁止写入")
+    return src, dst
+
+
+def copy_checked(source, destination, expected, *, reusable=False):
+    source, destination = Path(source), Path(destination)
+    source_info, existing = copy_paths(source, destination)
+    if digest(source) != expected:
+        raise UpdateFailure("复制源哈希不符")
+    if existing is not None:
+        if not reusable:
+            raise UpdateFailure("备份目标已存在，禁止覆盖")
+        if digest(destination) == expected:
+            return  # 完整恢复暂存可以重放，不能为重试再次截断它。
+        destination.unlink()  # 仅已校验的单链接恢复暂存可丢弃；随后xb防止名称被抢占后覆盖。
+    with source.open("rb") as src, destination.open("xb") as dst:
+        source_open, destination_open = os.fstat(src.fileno()), os.fstat(dst.fileno())
+        if (source_open.st_nlink > 1 or destination_open.st_nlink > 1
+                or not os.path.samestat(source_open, source_info)
+                or not os.path.samestat(destination_open, os.stat(destination))):
+            raise UpdateFailure("打开后的复制文件身份改变")  # stat与open之间发生替换也不能开始写入。
         shutil.copyfileobj(src, dst, 65536)
         dst.flush()
         os.fsync(dst.fileno())
@@ -255,8 +284,8 @@ def locked_helper(path, size, expected):
         with os.fdopen(descriptor, "rb") as stream:
             value = hashlib.file_digest(stream, "sha256").hexdigest()
             if os.fstat(stream.fileno()).st_size != size or value != expected or path.resolve() != path:
-                raise UpdateFailure("锁定的helper与签名清单不符")
-            yield  # 句柄由启动方保留到helper持锁登记，正常/异常出口都会关闭。
+                raise UpdateFailure("锁定的可执行文件与签名清单不符")
+            yield  # 启动方持有至接管或健康确认结束；正常、异常及超时出口均关闭。
 
 
 def windows_api():
@@ -419,6 +448,18 @@ def read_state(target):
         raise UpdateFailure("尝试结算状态损坏")
     if a is not None and (not isinstance(a, dict) or a.get("seq") != s["sequence"] or a.get("seq") <= s["settled"]):
         raise UpdateFailure("当前尝试损坏")
+    receipt = s.get("committed")
+    if receipt is not None:
+        if (not isinstance(receipt, dict) or set(receipt) != {"target", "sha256", "data_dir", "transaction", "token"}
+                or receipt.get("target") != str(target)):
+            raise UpdateFailure("终态安装凭据身份损坏")
+        for name, length in (("sha256", 64), ("transaction", 32), ("token", 64)):
+            value = receipt.get(name)
+            if not isinstance(value, str) or len(value) != length or any(c not in "0123456789abcdef" for c in value):
+                raise UpdateFailure("终态安装凭据格式损坏")
+        data = Path(receipt["data_dir"])
+        if data.resolve() != data or data == target.parent:
+            raise UpdateFailure("终态安装凭据数据路径越界")  # 缺材料放行仍须保留凭据和数据目录的严格身份边界。
     return s
 
 
@@ -709,6 +750,10 @@ def snapshot(j):
         if src.resolve() != src or not src.is_file():
             raise UpdateFailure("快照源路径越界")
         if name == "account.db":
+            copy_paths(src, dst)
+            with dst.open("xb") as reserved:
+                if os.fstat(reserved.fileno()).st_nlink != 1:
+                    raise UpdateFailure("数据库备份目标存在硬链接")  # SQLite连接前独占创建，不能借已有别名覆盖原账本。
             with closing(sqlite3.connect(src.as_uri() + "?mode=ro", uri=True, timeout=3)) as source:
                 with closing(sqlite3.connect(dst)) as destination:
                     with source, destination:
@@ -805,7 +850,7 @@ def rollback(j):
                     destination.unlink(missing_ok=True)
                 else:
                     stage = data / (name + ".accountkeeper-restore")
-                    copy_checked(Path(j["backup"]) / name, stage, expected)
+                    copy_checked(Path(j["backup"]) / name, stage, expected, reusable=True)
                     retry_transient(lambda: os.replace(stage, destination))  # AV共享窗口内有限重试，不掩盖持久拒绝。
                 if name == "account.db":
                     for suffix in ("-wal", "-shm", "-journal"):
@@ -818,7 +863,7 @@ def rollback(j):
         j["intent"] = "restore:exe"
         write_journal(j)
         stage = work / "restore.exe"
-        copy_checked(Path(j["backup"]) / "old.exe", stage, j["old_sha"])
+        copy_checked(Path(j["backup"]) / "old.exe", stage, j["old_sha"], reusable=True)
         retry_transient(lambda: os.replace(stage, target))  # exe也可能被杀软短暂占用，与数据恢复使用同一重试口径。
     if digest(target) != j["old_sha"]:
         raise UpdateFailure("旧包未完整恢复")
@@ -827,14 +872,76 @@ def rollback(j):
     release_data(j)
 
 
+def reconcile_sqlite(j):
+    import sqlite3
+    data = Path(j["data_dir"])
+    database = data / "account.db"
+    companions = [data / ("account.db" + suffix) for suffix in ("-journal", "-wal", "-shm")]
+    if not database.exists() or not any(p.exists() for p in companions):
+        return True  # 不创建原本不存在的账本；没有伴生文件也不额外触碰数据库。
+    with DataGate(data):
+        reservation = data / ".accountkeeper-data-update.json"
+        if data_members(data) or (reservation.exists() and read_json(reservation) != data_reservation(j)):
+            return False  # 已有业务实例或其他事务接管时交给其SQLite连接处理，不裸删活动WAL。
+        for p in (database, *companions):
+            if p.resolve() != p or (p.exists() and (not p.is_file() or p.stat().st_nlink != 1)):
+                raise UpdateFailure("SQLite恢复路径被重定向")
+        try:
+            with closing(sqlite3.connect(database.as_uri() + "?mode=rw", uri=True, timeout=0)) as db:
+                with db:
+                    if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                        raise UpdateFailure("SQLite原生完整性校验失败")  # 按真实校验结果诊断，不能把官方伴生文件当损坏。
+                    if db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
+                        return False  # 有读写者时SQLite报告busy，保留WAL中已提交账目并延后清理。
+                    mode = db.execute("PRAGMA journal_mode").fetchone()[0]
+                    db.execute("BEGIN EXCLUSIVE")
+                    if mode != "wal":
+                        for p in companions:
+                            if p.exists() and p.stat().st_size == 0:
+                                p.unlink()  # 非WAL模式独占事务下仅删除空残留；有效日志由SQLite自行恢复。
+                    db.commit()  # WAL/shm由SQLite在最后连接关闭时清理，不能在WAL读者存活时手工删除。
+        except sqlite3.Error as error:
+            if (getattr(error, "sqlite_errorcode", 0) & 255) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                return False  # 未登记的外部连接也受SQLite原生锁保护，忙碌不等同于非法文件。
+            raise UpdateFailure(f"SQLite原生恢复失败：{error}") from error
+    return True
+
+
+def record_commit(j):
+    with FileLock(Path(j["target"]), "state"):
+        state = read_state(j["target"])
+        state["committed"] = dict(target=j["target"], sha256=j["new_sha"], data_dir=j["data_dir"],
+                                  transaction=j["transaction"], token=j["token"])
+        atomic_json(state_path(j["target"]), state)  # 独立终态凭据先落盘，材料目录被删除后仍能核实当前安装。
+
+
+def retire_committed(j):
+    if digest(Path(j["target"])) != j["new_sha"]:
+        raise UpdateFailure("提交包与物理目标不符")  # 哈希核验必须先于所有尽力清理，不能被except吞掉。
+    settle_attempt(j["target"], j["attempt"], "success", "入口提交补记")
+    record_commit(j)
+    release_data(j)
+    try:
+        if not helper_alive(j):
+            with FileLock(Path(j["target"]), "install", 0):
+                current = load_journal(j["target"])
+                if current["transaction"] == j["transaction"] and current["phase"] == "committed":
+                    (Path(j["target"]).parent / ".accountkeeper-update.json").unlink()
+    except (OSError, UpdateFailure) as error:
+        log_line(j["target"], f"终态日志清理待重试：{error}")  # 可信终态已持久化，旧材料或清理失败不得阻断业务。
+
+
 def cleanup_finished(j):
     installed = committed(j)
     if (not installed and j["phase"] != "rolled_back") or digest(Path(j["target"])) != j["new_sha" if installed else "old_sha"]:
         raise UpdateFailure("终结包核对失败")
+    if not installed:
+        reconcile_sqlite(j)  # 终态只处理当前数据库的原生日志，不重新恢复事务旧快照。
     release_data(j)  # 终结已核实，尽力删除备份失败不能让预约永久阻塞记账。
     backup = Path(j["backup"])
     if backup.exists():
         allowed = {"old.exe", "account.db", "settings.json", "tags.json", "categories.json", "import_mappings.json"}
+        allowed.update({"account.db-journal", "account.db-wal", "account.db-shm"})  # 私有快照终结后可连同SQLite备份残留一起删除。
         for p in backup.iterdir():
             if p.name not in allowed or p.resolve() != p or not p.is_file():
                 raise UpdateFailure("备份目录含未知文件，停止清理")
@@ -861,6 +968,8 @@ def recover_transaction(target):
     if j["phase"] == "rolled_back":
         if digest(Path(j["target"])) != j["old_sha"]:
             raise UpdateFailure("回退结果与旧包不符")
+        reconcile_sqlite(j)
+        release_data(j)  # 终态落盘后可能尚未解锁就崩溃；只补解匹配预约，绝不重放数据快照。
         return "rolled_back"  # 已终结的重放不再消耗恢复次数，也不改变原有结算幂等。
     j["recovery_attempts"] = j.get("recovery_attempts", 0) + 1
     write_journal(j)  # 每次恢复先落盘计数，恢复中崩溃也不能把同一attempt永远困在第一次。
@@ -877,6 +986,72 @@ def recover_transaction(target):
     if j["recovery_attempts"] >= 3:
         return escape_transaction(j)
     return "rolled_back"
+
+
+def confirm_new(j):
+    target, child, guard = Path(j["target"]), None, ExitStack()
+    try:
+        guard.enter_context(locked_helper(target, j["size"], j["new_sha"]))  # 同一只读共享句柄内验包、拉起并监督新版。
+        j.update(phase="launching", intent="launch", new_started=True)
+        write_journal(j)
+        end = time.monotonic() + 120
+        child = subprocess.Popen([str(target), "--update-transaction", j["transaction"], "--update-token", j["token"]],
+                                 env=dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1"),
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+        record = process_identity(child.pid)
+        if record is None:
+            raise UpdateFailure("新版登记前已退出")
+        j.update(new_processes=[record], phase="confirming", intent=None)
+        write_journal(j)
+        confirm_end = None
+        work = Path(j["work"])
+        while time.monotonic() < end:
+            if (work / "failure.json").exists():
+                failure = read_json(work / "failure.json")
+                if failure.get("transaction") != j["transaction"] or failure.get("token") != j["token"]:
+                    raise UpdateFailure("失败记录身份不符")
+                raise UpdateFailure(f"新版初始化失败：{failure.get('error')}")
+            if child.poll() is not None:
+                raise UpdateFailure(f"新版提前退出：{child.returncode}")
+            if (work / "pending.json").exists():
+                records = new_records(j)
+                if confirm_end is None:
+                    confirm_end = time.monotonic() + 60
+                if time.monotonic() >= confirm_end:
+                    break
+                if (work / "healthy.json").exists():
+                    health = read_json(work / "healthy.json")
+                    # 新版自报的进程顺序取决于它自己的登记顺序，与helper侧相反，故拆出processes按三元组排序比较（保留重复项），其余字段仍要求全等。
+                    processes = health.pop("processes", None) if isinstance(health, dict) else None
+                    expected = dict(transaction=j["transaction"], token=j["token"], version=j["new_version"],
+                                    sha256=j["new_sha"], migrations=True)
+                    if (health != expected or not records or not isinstance(processes, list)
+                            or sorted(map(process_key, processes)) != sorted(map(process_key, records))
+                            or any(wait_processes([r], 0) for r in records)):
+                        raise UpdateFailure("健康确认无效")
+                    if digest(target) != j["new_sha"]:
+                        raise UpdateFailure("健康包发生变化")
+                    if time.monotonic() >= min(end, confirm_end):
+                        raise UpdateFailure("健康确认已超过期限")
+                    atomic_json(work / "commit.json", dict(transaction=j["transaction"], token=j["token"],
+                                attempt=j["attempt"], version=j["new_version"], sha256=j["new_sha"]))
+                    settle_attempt(target, j["attempt"], "success", "健康提交")
+                    j.update(phase="committed", result="success")
+                    write_journal(j)
+                    record_commit(j)
+                    cleanup_finished(j)
+                    return
+            time.sleep(0.05)
+        raise UpdateFailure("新版确认超时")
+    finally:
+        try:
+            if child is not None and not committed(j):
+                j["new_processes"] += image_processes(target)  # 也登记尚未写pending的解包子进程，不能只终止父进程。
+                write_journal(j)
+                stop_new(j)  # 未提交新版先退出并释放资源，防替换锁仍然持有。
+                child.wait(5)
+        finally:
+            guard.close()  # 任何启动/超时/终止异常都先释放句柄，再交外层回滚替换exe。
 
 
 def run_worker(target, recover=False):
@@ -914,56 +1089,8 @@ def run_worker(target, recover=False):
             os.replace(stage, target)
             if digest(target) != j["new_sha"]:
                 raise UpdateFailure("替换后包不符")
-            j.update(phase="launching", intent="launch", new_started=True)
-            write_journal(j)
-            end = time.monotonic() + 120
-            child = subprocess.Popen([str(target), "--update-transaction", j["transaction"], "--update-token", j["token"]],
-                                     env=dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1"),
-                                     creationflags=subprocess.CREATE_NO_WINDOW)
-            record = process_identity(child.pid)
-            if record is None:
-                raise UpdateFailure("新版登记前已退出")
-            j.update(new_processes=[record], phase="confirming", intent=None)
-            write_journal(j)
-            confirm_end = None
-            work = Path(j["work"])
-            while time.monotonic() < end:
-                if (work / "failure.json").exists():
-                    failure = read_json(work / "failure.json")
-                    if failure.get("transaction") != j["transaction"] or failure.get("token") != j["token"]:
-                        raise UpdateFailure("失败记录身份不符")
-                    raise UpdateFailure(f"新版初始化失败：{failure.get('error')}")
-                if child.poll() is not None:
-                    raise UpdateFailure(f"新版提前退出：{child.returncode}")
-                if (work / "pending.json").exists():
-                    records = new_records(j)
-                    if confirm_end is None:
-                        confirm_end = time.monotonic() + 60
-                    if time.monotonic() >= confirm_end:
-                        break
-                    if (work / "healthy.json").exists():
-                        health = read_json(work / "healthy.json")
-                        # 新版自报的进程顺序取决于它自己的登记顺序，与helper侧相反，故拆出processes按三元组排序比较（保留重复项），其余字段仍要求全等。
-                        processes = health.pop("processes", None) if isinstance(health, dict) else None
-                        expected = dict(transaction=j["transaction"], token=j["token"], version=j["new_version"],
-                                        sha256=j["new_sha"], migrations=True)
-                        if (health != expected or not records or not isinstance(processes, list)
-                                or sorted(map(process_key, processes)) != sorted(map(process_key, records))
-                                or any(wait_processes([r], 0) for r in records)):
-                            raise UpdateFailure("健康确认无效")
-                        if digest(target) != j["new_sha"]:
-                            raise UpdateFailure("健康包发生变化")
-                        if time.monotonic() >= min(end, confirm_end):
-                            raise UpdateFailure("健康确认已超过期限")
-                        atomic_json(work / "commit.json", dict(transaction=j["transaction"], token=j["token"],
-                                    attempt=j["attempt"], version=j["new_version"], sha256=j["new_sha"]))
-                        settle_attempt(target, j["attempt"], "success", "健康提交")
-                        j.update(phase="committed", result="success")
-                        write_journal(j)
-                        cleanup_finished(j)
-                        return
-                time.sleep(0.05)
-            raise UpdateFailure("新版确认超时")
+            confirm_new(j)
+            return
         except Exception as error:  # 提交后错误只能留待清理，不得重新恢复数据。
             log_line(target, f"worker失败：{traceback.format_exc()}")
             j["error"] = repr(error)
@@ -1010,13 +1137,62 @@ class BootContext:
                         dict(transaction=self.j["transaction"], token=self.j["token"], error=repr(error)))
 
 
+def rescue_new(target, token):
+    target = target_path(target)
+    with FileLock(target, "install", 10):
+        j = load_journal(target)
+        verify_materials(j)
+        runner = Path(j["work"]) / "staged.exe"
+        if token != j["token"] or Path(sys.executable).resolve() != runner or helper_alive(j):
+            raise UpdateFailure("恢复执行者身份不符")
+        if j["phase"] in ("committed", "rolled_back"):
+            return  # 排队的重复执行者看到终态就退出，不能再次初始化或恢复已经开放的账本。
+        if j["phase"] not in ("switching", "launching", "confirming") or digest(target) != j["new_sha"]:
+            raise UpdateFailure("恢复接管阶段或主包不符")
+        with locked_helper(runner, j["size"], j["new_sha"]):
+            if not wait_processes(j.get("recovery_waiters", []), 30):
+                raise Busy("接管前主程序尚未退出")
+            j["helper_processes"] = own_records(runner)
+            if read_state(target)["active"]:
+                transfer_attempt(target, j["attempt"], j["helper_processes"][0])
+            write_journal(j)
+            try:
+                confirm_new(j)  # 独立副本监督真实迁移、首帧和期限；失败后主包可完整退出再回滚。
+            except Exception as error:
+                if committed(j):
+                    return  # 提交后的暂存清理失败不可覆盖用户新账。
+                j["error"] = repr(error); write_journal(j)
+                status = recover_transaction(target)
+                if status in ("rolled_back", "escaped"):
+                    subprocess.Popen([str(target)], env=dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1"),
+                                     creationflags=subprocess.CREATE_NO_WINDOW)
+
+
 def escape_transaction(j):
     """仅在旧包与数据安全可证时隔离日志；调用者负责继续启动或拉起旧版。"""
     target, work, data = Path(j["target"]), Path(j["work"]), Path(j["data_dir"])
+    if (j["phase"] in ("switching", "launching", "confirming") and target.is_file()
+            and digest(target) == j["new_sha"] and not helper_alive(j) and not committed(j)):
+        verify_materials(j)
+        required = {"old.exe", "account.db", "settings.json", "tags.json", "categories.json", "import_mappings.json"}
+        if (set(j["backups"]) != required or j["backups"]["old.exe"] != j["old_sha"]
+                or any(value is not None and digest(Path(j["backup"]) / name) != value for name, value in j["backups"].items())):
+            raise UpdateFailure("接管缺少可安全回退的快照")  # 在迁移前证明失败回退可执行，不能仅凭新包签名直接提交。
+        runner = work / "staged.exe"
+        with locked_helper(target, j["size"], j["new_sha"]):
+            copy_checked(target, runner, j["new_sha"], reusable=True)
+        j["recovery_waiters"] = own_records(target)
+        write_journal(j)
+        with locked_helper(runner, j["size"], j["new_sha"]):
+            subprocess.Popen([str(runner), "--update-rescue", str(target), j["token"]],
+                             env=dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1"), creationflags=subprocess.CREATE_NO_WINDOW)
+        return "rescuing"  # 调用者必须退出，由独立副本确认或回滚，不能留在业务启动路径。
     if committed(j) or not target.is_file() or digest(target) != j["old_sha"]:
         raise UpdateFailure("逃生未获安全旧包，禁止放行业务")
     if not wait_processes(new_records(j), 0):
         raise UpdateFailure("新版尚未退出，禁止逃生")
+    if not reconcile_sqlite(j):
+        raise Busy("SQLite仍被占用，尚不能完成逃生数据核验")  # 未终结事务必须等原生恢复完成，不能只核对未合并WAL的主文件。
     if j["new_started"] or any((work / name).exists() for name in ("pending.json", "healthy.json")):
         for name in ("account.db", "settings.json", "tags.json", "categories.json", "import_mappings.json"):
             if name not in j["backups"]:
@@ -1024,16 +1200,14 @@ def escape_transaction(j):
             path, expected = data / name, j["backups"][name]
             if path.resolve() != path or (path.exists() if expected is None else not path.is_file() or digest(path) != expected):
                 raise UpdateFailure("逃生数据未恢复，禁止放行业务")
-        if any((data / ("account.db" + suffix)).exists() for suffix in ("-wal", "-shm", "-journal")):
-            raise UpdateFailure("逃生仍有SQLite伴随文件")  # 主文件相同不能证明残留WAL不会再次改写账本。
     state = read_state(target)
     if state["active"]:
         settle_attempt(target, state["active"], "cancelled", "恢复次数达到3次，安全逃生")
-    j["escape_verified"] = True
-    write_journal(j)  # 安全证明必须先持久化，缺少证明的残缺.bak不能充当放行凭据。
+    j.update(phase="rolled_back", result="failed", intent=None, escape_verified=True)
+    write_journal(j)  # 解锁前先持久化终态；此后其他副本可写账，重启不得再用旧快照回退。
+    release_data(j)  # 解锁失败保留终态日志，由入口补解；归档仍必须在解锁成功之后。
     path = target.parent / ".accountkeeper-update.json"
     retry_transient(lambda: os.replace(path, path.with_name(path.name + ".bak")))
-    release_data(j)
     return "escaped"
 
 
@@ -1063,6 +1237,9 @@ def recovery_evidence(target):
 def bootstrap():
     if not getattr(sys, "frozen", False):
         return None  # 源码启动不执行exe替换，也不探测正式账本。
+    if len(sys.argv) == 4 and sys.argv[1] == "--update-rescue":
+        rescue_new(Path(sys.argv[2]), sys.argv[3])
+        return False  # 复制的主程序只执行恢复监督，绝不装载业务配置或主窗。
     target = target_path(Path(sys.executable).resolve())
     reconcile_handoff(target)  # 业务导入之前修复准备发布中断，armed事务仍严格恢复。
     path = target.parent / ".accountkeeper-update.json"
@@ -1070,6 +1247,14 @@ def bootstrap():
         s = read_state(target)
         a = s["active"] or (s["last"] or {}).get("attempt") or {}
         binding = a.get("binding")
+        receipt = s.get("committed")
+        if (receipt and not (s["active"] and binding) and (not binding or
+                (binding.get("work") == str(target.parent / ".accountkeeper-update" / receipt["transaction"])
+                 and binding.get("new_sha") == receipt.get("sha256") and binding.get("data_dir") == receipt.get("data_dir")))):
+            if receipt.get("target") != str(target) or digest(target) != receipt.get("sha256"):
+                raise UpdateFailure("终态安装凭据与当前主包不符")
+            release_data(receipt)
+            return None  # 日志及隐藏目录可被清理；有新安装绑定时仍走原有缺日志拦截。
         if binding:
             if digest(target) != binding.get("old_sha") or s["active"]:
                 raise UpdateFailure(f"事务日志缺失，禁止打开账本：{recovery_evidence(target)}")
@@ -1079,12 +1264,17 @@ def bootstrap():
                     or any(archived.get(k) != binding.get(k) for k in ("old_sha", "new_sha", "work", "data_dir"))
                     or type(archived.get("recovery_attempts")) is not int or archived["recovery_attempts"] < 3):
                 raise UpdateFailure("事务日志缺失且没有匹配的安全逃生归档")
+            reconcile_sqlite(archived)
+            release_data(archived)  # 对归档后的崩溃补做释放；只匹配本事务身份，不解除别人的预约。
             # .bak只由安全逃生发布；已放行旧版的账本可以继续写，不能再拿旧快照摘要否决正常记账。
         if s["active"] and wait_processes([s["active"]["owner"]], 0):
             settle_attempt(target, s["active"], "failed", "检查或下载进程中断")
         return None
     try:
         j = load_journal(target)
+        if j["phase"] == "committed":
+            retire_committed(j)
+            return None  # 先验证实际主包，终态不再依赖可被用户删除的签名材料或commit文件。
         verify_materials(j)
     except (OSError, UpdateFailure, ValueError) as error:
         raise UpdateFailure(f"日志或材料损坏，禁止打开账本：{recovery_evidence(target)}") from error
@@ -1108,6 +1298,8 @@ def bootstrap():
         settle_attempt(target, j["attempt"], "failed", j.get("error") or "回退完成补记")
         if digest(target) != j["old_sha"]:
             raise UpdateFailure("回退包与日志不符")
+        reconcile_sqlite(j)
+        release_data(j)  # 不依赖helper是否存在或已退出；终态核验后补解本事务预约，失败必须穿透入口。
         if not helper_alive(j):
             helper = Path(j["helper"])
             if helper.exists() and digest(helper) == j["helper_sha"]:
@@ -1133,6 +1325,9 @@ def bootstrap():
         raise UpdateFailure("新版启动身份未登记")
     if helper_alive(j):
         raise UpdateFailure("更新正在进行，请等待当前事务结束")
+    if j["phase"] in ("switching", "launching", "confirming") and digest(target) == j["new_sha"]:
+        with FileLock(target, "install", 0):
+            return False if escape_transaction(load_journal(target)) == "rescuing" else None
     with FileLock(target, "install", 0):
         j = load_journal(target)
         if j.get("recovery_attempts", 0) >= 3 and not j["new_started"] and digest(target) == j["old_sha"]:
@@ -1154,8 +1349,7 @@ def bootstrap():
             j["recovery_attempts"] = j.get("recovery_attempts", 0) + 1
             write_journal(j)
             if j["recovery_attempts"] >= 3:
-                escape_transaction(j)
-                return None
+                return False if escape_transaction(j) == "rescuing" else None
         raise
     return False  # 当前主exe必须先退出，临时helper才能恢复它。
 
