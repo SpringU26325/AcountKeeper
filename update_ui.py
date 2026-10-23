@@ -34,12 +34,12 @@ def discard_candidate(target, offer, ready):
     with helper.FileLock(target, "install", 0):
         if ready is not None:
             work = Path(ready).parent
-            journal = target.parent / ".accountkeeper-update.json"
+            journal = helper.journal_path(target)
             if journal.exists() and helper.load_journal(target)["transaction"] == work.name:
                 return
-            if (Path(ready).name != "ready.json" or work.parent != target.parent / ".accountkeeper-update"
+            if (Path(ready).name != "ready.json" or work.parent != helper.transaction_root(target)
                     or not re.fullmatch("[0-9a-f]{32}", work.name) or work.resolve() != work
-                    or work.stat().st_dev != target.stat().st_dev):
+                    or helper.payload_path(work, target, "candidate.exe").parent.stat().st_dev != target.stat().st_dev):
                 raise updater.UpdateError("候选清理路径归属不符")
             owner = work / "owner.json"
             expected = dict(schema=1, transaction_id=work.name, target=str(target))
@@ -47,7 +47,7 @@ def discard_candidate(target, offer, ready):
                 raise updater.UpdateError("候选owner不符，保留现场")
             allowed = {"owner.json", "candidate.exe", "candidate.exe.part", "manifest.json",
                        "manifest.sig", "ready.json", "ready.json.tmp", "update_helper.exe"}
-            entries = tuple(work.iterdir())
+            entries = helper.transaction_entries(work, target)
             if any(p.name not in allowed or p.resolve() != p or not p.is_file()
                    or p.stat().st_nlink != 1 for p in entries):
                 raise updater.UpdateError("候选目录存在非本事务文件，保留现场")
@@ -55,7 +55,7 @@ def discard_candidate(target, offer, ready):
                 if path != owner:
                     path.unlink()
             owner.unlink()  # 最后移除归属证据，清理失败时尽量保留可重试依据。
-            work.rmdir()
+            helper.remove_transaction_dirs(work, target)
         if offer is not None:
             helper.settle_attempt(target, offer.attempt, "cancelled", "用户取消更新")
 
@@ -162,7 +162,7 @@ class UpdateFlow:
                     try:
                         active = helper.read_state(self.target)["active"]
                         attempt = offer.attempt if offer is not None else active if before is None else None
-                        journal_path = self.target.parent / ".accountkeeper-update.json"
+                        journal_path = helper.journal_path(self.target)
                         owned_journal = (kind == "install" and journal_path.exists()
                                          and helper.load_journal(self.target)["transaction"] == Path(ready).parent.name)
                         if (attempt and active and attempt["id"] == active["id"]

@@ -20,11 +20,12 @@ from urllib.parse import urljoin, urlsplit
 from nacl.bindings import crypto_core_ed25519_is_valid_point
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
+from update_helper import (journal_path, state_path, transaction_root, payload_path,
+                           transaction_entries, remove_transaction_dirs)
 
 # 信任列表：键为公钥指纹（SHA-256 前 8 位，形如 "B52A-0FD5"）。
-# TEST ONLY：当前是测试钥，真实发布前必须替换；轮换时追加新键，不要直接删旧键。
 PUBLIC_KEYS = {
-    "B52A-0FD5": bytes.fromhex("27ddbc844141850e7b744205c52d232e0f24b0c4d072cc924495470e62f08b4f"),
+    "836F-F8A8": bytes.fromhex("836ff8a8169621d2af5f440bb10de9a8bedc8dbcdb016cf2a4cad4a5afdf3ae5"),
 }
 
 
@@ -439,9 +440,9 @@ def _target(path):
     return path
 
 def _base(target):
-    base = target.parent / ".accountkeeper-update"
-    if base.exists() and (base.resolve() != base or base.stat().st_dev != target.stat().st_dev):
-        raise UpdateError("暂存目录越界或异卷")
+    base = transaction_root(target)  # 小型交接材料归DATA_DIR，大文件另放同卷目录。
+    if base.resolve() != base:
+        raise UpdateError("事务记录目录越界")
     return base
 
 def _small(path, limit=65536):
@@ -454,7 +455,9 @@ def _small(path, limit=65536):
     return raw
 
 def _owned(work, target):
-    if not re.fullmatch("[0-9a-f]{32}", work.name) or work.resolve() != work or work.stat().st_dev != target.stat().st_dev:
+    payload = payload_path(work, target, "candidate.exe").parent
+    if (not re.fullmatch("[0-9a-f]{32}", work.name) or work.resolve() != work
+            or (payload.exists() and payload.stat().st_dev != target.stat().st_dev)):
         raise UpdateError("事务目录归属不符")
     owner = _json(_small(work / "owner.json", 4096))
     if not isinstance(owner, dict) or type(owner.get("schema")) is not int or owner != {"schema": 1, "transaction_id": work.name, "target": str(target)}:
@@ -464,8 +467,7 @@ def _owned(work, target):
 def protected_materials(work, target):
     from update_helper import read_json
     try:
-        for name in (".accountkeeper-update.json", ".accountkeeper-update.json.bak", ".accountkeeper-update-state.json"):
-            path = target.parent / name
+        for path in (journal_path(target), journal_path(target, archived=True), state_path(target)):
             if not path.exists():
                 continue
             record = read_json(path)
@@ -483,14 +485,14 @@ def _remove(work, target):
     if protected_materials(work, target):
         raise UpdateError("事务证据仍被引用，禁止删除")
     _owned(work, target)
-    entries = list(work.iterdir())
+    entries = transaction_entries(work, target)
     if any(p.name not in _FILES or p.resolve() != p or not p.is_file() for p in entries):
         raise UpdateError("存在非本事务文件，停止清理")
     for path in entries:
         if path.name != "owner.json":
             path.unlink()
     (work / "owner.json").unlink()
-    work.rmdir()
+    remove_transaction_dirs(work, target)
 
 
 def cleanup_incomplete(target_exe):
@@ -546,13 +548,13 @@ def _sweep(target, current_version):
         except UpdateError:
             if (work / "owner.json").exists():  # 归属不符：可能属于别的事务，保留现场。
                 continue
-            entries = list(work.iterdir())
+            entries = transaction_entries(work, target)
             # 归属文件都没写成就崩了：只回收白名单文件，避免目录永久占位。
             if any(p.name not in _FILES or p.resolve() != p or not p.is_file() for p in entries):
                 continue
             for path in entries:
                 path.unlink()
-            work.rmdir()
+            remove_transaction_dirs(work, target)
             removed += 1
         except OSError:
             continue  # 被占用：下次再试，不影响本次检查。
@@ -569,7 +571,7 @@ def _stale(work, target, current_version):
             return True
         if _version(r["version"]) <= _version(current_version):
             return True  # 候选不比当前版本新，永远不会被安装。
-        candidate = work / "candidate.exe"
+        candidate = payload_path(work, target, "candidate.exe")
         if not candidate.is_file() or candidate.stat().st_size != r.get("size"):
             return True
     except (OSError, UpdateError, TypeError):  # 解析失败一律按损坏处理。
@@ -651,28 +653,29 @@ def _download(offer, target_exe, current_version, arch, cancel=None, progress=No
         raise Cancelled("下载已取消")
     cleanup_incomplete(target)
     base = _base(target)
-    base.mkdir(exist_ok=True)
+    base.mkdir(parents=True, exist_ok=True)
     work = base / secrets.token_hex(16)
     work.mkdir()
     ready = work / "ready.json"
     try:
         _record(work / "owner.json", {"schema": 1, "transaction_id": work.name, "target": str(target)})
+        payload_path(work, target, "candidate.exe").parent.mkdir(parents=True, exist_ok=False)  # 创建失败时仍能凭owner清理轻量记录。
         _owned(work, target)
-        digest = _download_file(m, work / "candidate.exe.part", cancel, progress)
+        digest = _download_file(m, payload_path(work, target, "candidate.exe.part"), cancel, progress)
         if digest != m["sha256"]:
             raise UpdateError("包SHA-256不符")
         if cancel is not None and cancel.is_set():
             raise Cancelled("下载已取消")
-        (work / "candidate.exe.part").rename(work / "candidate.exe")
+        (payload_path(work, target, "candidate.exe.part")).rename(payload_path(work, target, "candidate.exe"))
         helper_meta = dict(size=m["helper_size"], sha256=m["helper_sha256"], url=m["helper_url"])
-        helper_part = work / "update_helper.exe.part"
+        helper_part = payload_path(work, target, "update_helper.exe.part")
         if _download_file(helper_meta, helper_part, cancel, None) != m["helper_sha256"]:
             raise UpdateError("helper SHA-256不符")  # 与主包共用下载器，大小、续传、取消和300秒期限口径一致。
-        helper_part.rename(work / "update_helper.exe")
+        helper_part.rename(payload_path(work, target, "update_helper.exe"))
         (work / "manifest.json").write_bytes(offer.manifest)
         (work / "manifest.sig").write_bytes(offer.signature)
         record = dict(schema=1, transaction_id=work.name, release_id=offer.release_id,
-                      target=str(target), candidate=str(work / "candidate.exe"), version=m["version"],
+                      target=str(target), candidate=str(payload_path(work, target, "candidate.exe")), version=m["version"],
                       arch=arch, size=m["size"], sha256=m["sha256"], manifest=str(work / "manifest.json"),
                       signature=str(work / "manifest.sig"), assets=list(offer.assets), attempt=offer.attempt)
         _record(work / "ready.json.tmp", record)
@@ -701,16 +704,17 @@ def verify_ready(ready_path, target_exe, current_version, arch, *, with_manifest
     if not isinstance(r, dict) or type(r.get("schema")) is not int or r.get("schema") != 1 or r.get("transaction_id") != work.name or r.get("target") != str(target):
         raise UpdateError("ready身份不符")
     for key, name in (("candidate", "candidate.exe"), ("manifest", "manifest.json"), ("signature", "manifest.sig")):
-        if r.get(key) != str(work / name):
+        expected = payload_path(work, target, name) if key == "candidate" else work / name
+        if r.get(key) != str(expected):
             raise UpdateError("交接路径不符")
     offer = Offer(r.get("release_id"), r.get("version"), tuple(r.get("assets", ())),
                   _small(work / "manifest.json"), _small(work / "manifest.sig", 1024))
     m = verify_offer(offer, current_version, arch)
     if any(r.get(key) != m[key] for key in ("version", "arch", "size", "sha256")):
         raise UpdateError("ready与签名清单不符")
-    candidate = work / "candidate.exe"
+    candidate = payload_path(work, target, "candidate.exe")
     verify_payload(candidate, m["size"], m["sha256"])
-    verify_payload(work / "update_helper.exe", m["helper_size"], m["helper_sha256"])
+    verify_payload(payload_path(work, target, "update_helper.exe"), m["helper_size"], m["helper_sha256"])
     return (candidate, m) if with_manifest else candidate
 
 

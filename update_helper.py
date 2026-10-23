@@ -30,6 +30,69 @@ def target_path(path):
     if p.name != "AccountKeeper.exe" or p.resolve() != p:
         raise UpdateFailure("目标路径必须是无重解析的AccountKeeper.exe")
     return p
+# 独立helper由启动参数绑定数据目录；主程序延迟读取配置，不在模块导入时触碰账本。
+_HELPER_DATA_DIR = None
+_PAYLOAD_NAMES = {"candidate.exe", "candidate.exe.part", "update_helper.exe",
+                  "update_helper.exe.part", "staged.exe", "restore.exe", "backup"}
+
+
+def data_root():
+    if _HELPER_DATA_DIR is not None:
+        return _HELPER_DATA_DIR
+    from config import DATA_DIR
+    return Path(DATA_DIR).resolve(strict=True)
+
+
+def update_root(target):
+    # 用完整安装路径隔离轻量记录；不同目录的同名exe不能共享计数、日志或安装锁。
+    key = hashlib.sha256(os.path.normcase(str(target_path(target))).encode("utf-8")).hexdigest()
+    root = data_root() / "update" / key
+    if root.resolve() != root:
+        raise UpdateFailure("更新状态目录被重定向")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def journal_path(target, *, archived=False):
+    return update_root(target) / (".accountkeeper-update.json.bak" if archived else ".accountkeeper-update.json")
+
+
+def transaction_root(target):
+    return update_root(target) / "transactions"
+
+
+def payload_path(work, target, name):
+    work, target = Path(work), target_path(target)
+    if (work.parent != transaction_root(target) or work.resolve() != work
+            or len(work.name) != 32 or any(c not in "0123456789abcdef" for c in work.name)
+            or name not in _PAYLOAD_NAMES):
+        raise UpdateFailure("安装包材料归属不符")
+    # 安装包与恢复暂存必须留在目标exe同盘，os.replace才具有同卷原子替换语义。
+    base = target.parent / ".accountkeeper-update"
+    path = base / work.name / name
+    if path.resolve() != path or (base.exists() and base.stat().st_dev != target.parent.stat().st_dev):
+        raise UpdateFailure("安装包目录越界或异卷")
+    return path
+
+
+def transaction_entries(work, target):
+    work = Path(work)
+    payload = payload_path(work, target, "candidate.exe").parent
+    entries = list(work.iterdir()) if work.exists() else []
+    entries += list(payload.iterdir()) if payload.exists() else []
+    # 元数据和大文件不能串到另一个根目录，否则清理可能跨越信任边界。
+    if any(p.resolve() != p or p.parent != (payload if p.name in _PAYLOAD_NAMES else work)
+           for p in entries):
+        raise UpdateFailure("事务文件所在目录不符")
+    return entries
+
+
+def remove_transaction_dirs(work, target):
+    payload = payload_path(work, target, "candidate.exe").parent
+    if payload.exists():
+        payload.rmdir()
+    if Path(work).exists():
+        Path(work).rmdir()
 
 
 # 另一进程正在读同一文件、或文件处于删除挂起，都会表现为拒绝访问；只有预算耗尽才按失败处理。
@@ -99,13 +162,13 @@ LOG_NAME = ".accountkeeper-update.log"
 
 
 def log_path(target):
-    return target_path(target).parent / LOG_NAME
+    return update_root(target) / LOG_NAME
 
 
 def log_line(target, message):
     """无控制台构建下唯一能留存的证据通道；日志自身失败不得改变事务结果。"""
-    path = log_path(target)
     try:
+        path = log_path(target)  # 状态目录不可写时也不能让诊断异常覆盖事务异常。
         if path.exists() and path.stat().st_size > 262144:
             path.unlink()  # 只保留最近一段，避免长期累积。
         with path.open("a", encoding="utf-8") as stream:
@@ -165,7 +228,7 @@ def copy_checked(source, destination, expected, *, reusable=False):
 
 class FileLock:
     def __init__(self, target, kind, seconds=10):
-        self.path = target_path(target).parent / (".accountkeeper-" + kind + ".lock")
+        self.path = update_root(target) / (".accountkeeper-" + kind + ".lock")
         self.seconds, self.stream = seconds, None
 
     def __enter__(self):
@@ -424,14 +487,14 @@ def own_records(target):
 
 
 def state_path(target):
-    return target_path(target).parent / ".accountkeeper-update-state.json"
+    return update_root(target) / ".accountkeeper-update-state.json"
 
 
 def read_state(target):
     target = target_path(target)
     path = state_path(target)
     if not path.exists():
-        if (target.parent / ".accountkeeper-update.json").exists():
+        if journal_path(target).exists():
             raise UpdateFailure("有事务却缺少计数状态，禁止按零初始化")
         return dict(schema=1, target=str(target), sequence=0, settled=0, failures=0,
                     paused=False, active=None, last=None, reasons=[])
@@ -477,7 +540,7 @@ def begin_attempt(target, manual=False):
         s = read_state(target)
         if s["active"] is not None:
             raise UpdateFailure("上一尝试尚未结算")
-        journal = target.parent / ".accountkeeper-update.json"
+        journal = journal_path(target)
         if journal.exists() and read_json(journal).get("phase") not in ("committed", "rolled_back"):
             raise UpdateFailure("恢复未完成，禁止新尝试")
         if s["paused"] and not manual:
@@ -514,7 +577,7 @@ def settle_attempt(target, attempt, outcome, reason):
 def abandon_attempt(target, attempt, outcome, reason):
     """接管者未成立时结算当前尝试；已交接、阶段已推进或不属于本进程一律保留pending交恢复。"""
     target = target_path(target)
-    journal = target.parent / ".accountkeeper-update.json"
+    journal = journal_path(target)
     if journal.exists():
         j = read_json(journal)
         if j.get("phase") != "prepared" or j.get("helper_processes"):
@@ -556,11 +619,11 @@ def reconcile_handoff(target):
             raise Busy("安装准备执行者尚未退出")
         binding = a["binding"]
         work = Path(binding["work"])
-        if (work.parent != target.parent / ".accountkeeper-update" or work.resolve() != work
+        if (work.parent != transaction_root(target) or work.resolve() != work
                 or digest(target) != binding["old_sha"]
                 or any((work / name).exists() for name in ("pending.json", "healthy.json", "commit.json"))):
             raise UpdateFailure("准备交接的安全证据不符")
-        path = target.parent / ".accountkeeper-update.json"
+        path = journal_path(target)
         j = read_json(path) if path.exists() else None
         if j and j.get("attempt", {}).get("id") == a["id"]:
             if (j.get("phase") != "prepared" or j.get("new_started") is not False
@@ -579,7 +642,7 @@ def reconcile_handoff(target):
 
 def load_journal(target, *, archived=False):
     target = target_path(target)
-    j = read_json(target.parent / (".accountkeeper-update.json.bak" if archived else ".accountkeeper-update.json"))
+    j = read_json(journal_path(target, archived=archived))
     if not isinstance(j, dict) or j.get("schema") != 1 or j.get("target") != str(target):
         raise UpdateFailure("事务身份不符")
     if j.get("phase") not in {"prepared", "backed_up", "switching", "launching", "confirming", "rolling_back", "rolled_back", "committed"}:
@@ -587,12 +650,12 @@ def load_journal(target, *, archived=False):
     if type(j.get("recovery_attempts", 0)) is not int or j.get("recovery_attempts", 0) < 0:
         raise UpdateFailure("恢复计数损坏")  # 恢复次数独立于失败结算，不能用布尔值或负数绕过阈值。
     work = Path(j["work"])
-    if (work.parent != target.parent / ".accountkeeper-update" or work.resolve() != work
+    if (work.parent != transaction_root(target) or work.resolve() != work
             or len(work.name) != 32 or any(c not in "0123456789abcdef" for c in work.name)):
         raise UpdateFailure("事务目录越界")
-    expected = {"candidate": work / "candidate.exe", "helper": work / "update_helper.exe",
+    expected = {"candidate": payload_path(work, target, "candidate.exe"), "helper": payload_path(work, target, "update_helper.exe"),
                 "manifest": work / "manifest.json", "signature": work / "manifest.sig",
-                "backup": work / "backup"}
+                "backup": payload_path(work, target, "backup")}
     if any(j.get(k) != str(v) or v.resolve() != v for k, v in expected.items()):
         raise UpdateFailure("事务材料路径越界")
     s = read_state(target)
@@ -602,7 +665,7 @@ def load_journal(target, *, archived=False):
         if not a or any(a[k] != j["attempt"][k] for k in ("id", "seq")) or a.get("binding") != binding:
             raise UpdateFailure("事务与持久尝试绑定不符")
     data = Path(j["data_dir"])
-    if data.resolve() != data or not data.is_dir() or data == target.parent:
+    if data.resolve() != data or not data.is_dir() or data == target.parent or data != data_root():
         raise UpdateFailure("数据目录归属不符")
     return j
 
@@ -610,7 +673,7 @@ def load_journal(target, *, archived=False):
 def write_journal(j):
     j["sequence"] += 1
     j["updated"] = time.time()
-    atomic_json(Path(j["target"]).parent / ".accountkeeper-update.json", j)
+    atomic_json(journal_path(j["target"]), j)
     log_line(j["target"], f"phase={j['phase']} sequence={j['sequence']}")  # 与事务日志同一时间线，便于事后对时。
 
 
@@ -661,8 +724,10 @@ def prepare_install(ready_path, target, old_version, arch, data_dir):
 def _install(ready_path, target, old_version, arch, data_dir):
     from updater import verify_ready
     data_dir = Path(data_dir).resolve(strict=True)
+    if data_dir != data_root():
+        raise UpdateFailure("安装数据目录与配置不符")  # helper和主程序必须使用同一份数据及状态。
     candidate, manifest = verify_ready(ready_path, target, old_version, arch, with_manifest=True)
-    ready, work = read_json(Path(ready_path)), candidate.parent
+    ready, work = read_json(Path(ready_path)), Path(ready_path).parent
     attempt = ready.get("attempt")
     if not attempt:
         raise UpdateFailure("ready未登记完整尝试")
@@ -670,14 +735,14 @@ def _install(ready_path, target, old_version, arch, data_dir):
         records = own_records(target)
         if any(r not in records for r in image_processes(target)):
             raise Busy("其他实例尚未退出")  # 另一个实例占用属于正常中断，不增加失败计数。
-        helper = work / "update_helper.exe"
+        helper = payload_path(work, target, "update_helper.exe")
         # 时序：副本已落盘、尚未启动，此时比对签名清单里的 helper 哈希，堵住替换副本的路径。
         if digest(helper) != manifest["helper_sha256"]:
             raise UpdateFailure("helper 与签名清单不符")
         j = dict(schema=1, transaction=work.name, token=secrets.token_hex(32), attempt=attempt,
                  target=str(target), work=str(work), candidate=str(candidate), data_dir=str(data_dir),
                  helper=str(helper), helper_sha=digest(helper), manifest=str(work / "manifest.json"),
-                 signature=str(work / "manifest.sig"), backup=str(work / "backup"), backups={},
+                 signature=str(work / "manifest.sig"), backup=str(payload_path(work, target, "backup")), backups={},
                  old_version=old_version, new_version=ready["version"], arch=arch,
                  old_sha=digest(target), new_sha=ready["sha256"], size=ready["size"],
                  old_processes=records, new_processes=[], helper_processes=[], recovery_waiters=[],
@@ -709,7 +774,8 @@ def _launch_helper(j, recover=False):
         if helper.resolve() != helper or helper.stat().st_size != manifest["helper_size"] or digest(helper) != j["helper_sha"]:
             raise UpdateFailure("helper副本校验失败")
         env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
-        command = [str(helper), "--recover" if recover else "--install", j["target"]]
+        command = [str(helper), "--recover" if recover else "--install", j["target"],
+                   "--data-dir", str(data_root())]  # 不依赖helper工作目录或临时解压目录推断路径。
         process = subprocess.Popen(command, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
         launched = process_identity(process.pid)
         if launched is None:
@@ -862,7 +928,7 @@ def rollback(j):
                 write_journal(j)
         j["intent"] = "restore:exe"
         write_journal(j)
-        stage = work / "restore.exe"
+        stage = payload_path(work, target, "restore.exe")
         copy_checked(Path(j["backup"]) / "old.exe", stage, j["old_sha"], reusable=True)
         retry_transient(lambda: os.replace(stage, target))  # exe也可能被杀软短暂占用，与数据恢复使用同一重试口径。
     if digest(target) != j["old_sha"]:
@@ -926,7 +992,7 @@ def retire_committed(j):
             with FileLock(Path(j["target"]), "install", 0):
                 current = load_journal(j["target"])
                 if current["transaction"] == j["transaction"] and current["phase"] == "committed":
-                    (Path(j["target"]).parent / ".accountkeeper-update.json").unlink()
+                    journal_path(j["target"]).unlink()
     except (OSError, UpdateFailure) as error:
         log_line(j["target"], f"终态日志清理待重试：{error}")  # 可信终态已持久化，旧材料或清理失败不得阻断业务。
 
@@ -948,7 +1014,7 @@ def cleanup_finished(j):
             p.unlink()
         backup.rmdir()
     for name in ("candidate.exe", "staged.exe", "restore.exe"):
-        p = Path(j["work"]) / name
+        p = payload_path(Path(j["work"]), j["target"], name)
         if p.resolve() != p:
             raise UpdateFailure("暂存路径越界")
         p.unlink(missing_ok=True)
@@ -1080,7 +1146,7 @@ def run_worker(target, recover=False):
                 raise UpdateFailure("旧实例未完全退出")
             reserve_data(j, [])  # 快照前再次核验，并依靠持久预约阻止新实例抢入。
             snapshot(j)
-            stage = Path(j["work"]) / "staged.exe"
+            stage = payload_path(Path(j["work"]), target, "staged.exe")
             copy_checked(Path(j["candidate"]), stage, j["new_sha"])
             if digest(target) != j["old_sha"]:
                 raise UpdateFailure("目标在准备期间变化")
@@ -1142,7 +1208,7 @@ def rescue_new(target, token):
     with FileLock(target, "install", 10):
         j = load_journal(target)
         verify_materials(j)
-        runner = Path(j["work"]) / "staged.exe"
+        runner = payload_path(Path(j["work"]), target, "staged.exe")
         if token != j["token"] or Path(sys.executable).resolve() != runner or helper_alive(j):
             raise UpdateFailure("恢复执行者身份不符")
         if j["phase"] in ("committed", "rolled_back"):
@@ -1178,7 +1244,7 @@ def escape_transaction(j):
         if (set(j["backups"]) != required or j["backups"]["old.exe"] != j["old_sha"]
                 or any(value is not None and digest(Path(j["backup"]) / name) != value for name, value in j["backups"].items())):
             raise UpdateFailure("接管缺少可安全回退的快照")  # 在迁移前证明失败回退可执行，不能仅凭新包签名直接提交。
-        runner = work / "staged.exe"
+        runner = payload_path(work, target, "staged.exe")
         with locked_helper(target, j["size"], j["new_sha"]):
             copy_checked(target, runner, j["new_sha"], reusable=True)
         j["recovery_waiters"] = own_records(target)
@@ -1206,7 +1272,7 @@ def escape_transaction(j):
     j.update(phase="rolled_back", result="failed", intent=None, escape_verified=True)
     write_journal(j)  # 解锁前先持久化终态；此后其他副本可写账，重启不得再用旧快照回退。
     release_data(j)  # 解锁失败保留终态日志，由入口补解；归档仍必须在解锁成功之后。
-    path = target.parent / ".accountkeeper-update.json"
+    path = journal_path(target)
     retry_transient(lambda: os.replace(path, path.with_name(path.name + ".bak")))
     return "escaped"
 
@@ -1218,7 +1284,7 @@ def recovery_evidence(target):
         attempt = s["active"] or (s["last"] or {}).get("attempt") or {}
         binding = attempt.get("binding") or {}
         work = Path(binding["work"])
-        if (work.parent != target.parent / ".accountkeeper-update" or work.resolve() != work
+        if (work.parent != transaction_root(target) or work.resolve() != work
                 or len(work.name) != 32 or any(c not in "0123456789abcdef" for c in work.name)):
             raise UpdateFailure("物理证据目录越界")
         current = digest(target) if target.is_file() else None
@@ -1242,14 +1308,14 @@ def bootstrap():
         return False  # 复制的主程序只执行恢复监督，绝不装载业务配置或主窗。
     target = target_path(Path(sys.executable).resolve())
     reconcile_handoff(target)  # 业务导入之前修复准备发布中断，armed事务仍严格恢复。
-    path = target.parent / ".accountkeeper-update.json"
+    path = journal_path(target)
     if not path.exists():
         s = read_state(target)
         a = s["active"] or (s["last"] or {}).get("attempt") or {}
         binding = a.get("binding")
         receipt = s.get("committed")
         if (receipt and not (s["active"] and binding) and (not binding or
-                (binding.get("work") == str(target.parent / ".accountkeeper-update" / receipt["transaction"])
+                (binding.get("work") == str(transaction_root(target) / receipt["transaction"])
                  and binding.get("new_sha") == receipt.get("sha256") and binding.get("data_dir") == receipt.get("data_dir")))):
             if receipt.get("target") != str(target) or digest(target) != receipt.get("sha256"):
                 raise UpdateFailure("终态安装凭据与当前主包不符")
@@ -1382,11 +1448,17 @@ def offer_manual_retry(target, version, arch, data_dir):
 
 
 def main():
+    global _HELPER_DATA_DIR
+    sys.modules["update_helper"] = sys.modules[__name__]  # updater复用同一个模块实例，避免丢失参数绑定。
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--install", type=Path)
     group.add_argument("--recover", type=Path)
+    parser.add_argument("--data-dir", required=True, type=Path)
     args = parser.parse_args()
+    if not args.data_dir.is_absolute() or args.data_dir.resolve(strict=True) != args.data_dir:
+        raise UpdateFailure("helper数据目录必须是已存在的无重解析绝对路径")
+    _HELPER_DATA_DIR = args.data_dir
     if not getattr(sys, "frozen", False):
         raise UpdateFailure("独立执行必须使用冻结helper")
     try:

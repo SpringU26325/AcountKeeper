@@ -81,7 +81,7 @@ def main() -> int:
             sys.executable, "-B", "-m", "PyInstaller", "--noconfirm",
             "--distpath", str(args.distpath.resolve()),
             "--workpath", str(args.workpath.resolve()),
-            str(root / "AccountKeeper_v0.1.8-alpha.spec"),
+            str(root / "AccountKeeper.spec"),
         ], cwd=root, check=True, env=environment)
         if hashlib.sha256(config.read_bytes()).digest() != before:
             raise ValueError("构建期间 config.py 发生变化，产物不得发布。")
