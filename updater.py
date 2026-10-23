@@ -25,7 +25,7 @@ from update_helper import (journal_path, state_path, transaction_root, payload_p
 
 # 信任列表：键为公钥指纹（SHA-256 前 8 位，形如 "B52A-0FD5"）。
 PUBLIC_KEYS = {
-    "836F-F8A8": bytes.fromhex("836ff8a8169621d2af5f440bb10de9a8bedc8dbcdb016cf2a4cad4a5afdf3ae5"),
+    "0762-4AAB": bytes.fromhex("6dfe1c8ffb59ec70dcde49df7377dbcaea376187526460cd782bf701088cca8e"),
 }
 
 

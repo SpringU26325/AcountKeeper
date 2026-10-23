@@ -39,10 +39,15 @@ def main():
         print("已取消：未生成、未显示任何密钥。")
         return 1
     key = SigningKey.generate()
+    public = bytes(key.verify_key)
+    fingerprint = _fingerprint(public)
     # 先打公钥：公钥可公开，先出可避免私钥滚出屏幕后连公钥也找不到。
-    print("公钥（64 位 hex，作为新条目追加到 updater.py 的 PUBLIC_KEYS）：")
-    print(bytes(key.verify_key).hex())
-    print(f"公钥指纹 {_fingerprint(bytes(key.verify_key))}（签名时应与 sign_release.py 打印的一致）")
+    print("公钥（64 位 hex，可公开）：")
+    print(public.hex())
+    # 长指纹前9个字符是8位摘要加中间连字符，与客户端字典键保持一致，避免手拼出错。
+    print(f'"{fingerprint[:9]}": bytes.fromhex("{public.hex()}"),')
+    print("请直接将上述完整行复制，替换 updater.py 中 PUBLIC_KEYS 字典里的旧行")
+    print(f"公钥指纹 {fingerprint}（这是用于人眼核对签名的指纹，不要填进代码；签名时应与 sign_release.py 打印的一致）")
     print()
     print("私钥（64 位 hex，仅显示这一次；离线保存，禁止入库、入云、截图上传）：")
     print(bytes(key).hex())
