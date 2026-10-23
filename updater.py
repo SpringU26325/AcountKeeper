@@ -53,7 +53,7 @@ def _check_public_key():
 
 
 _check_public_key()  # 导入即拒绝：宁可启动失败，也不能带着错误信任根发版。
-_API = "https://gitee.com/api/v5/repos/zhuo-chunyu/account-keeper/releases"
+_API = "https://gitee.com/api/v5/repos/SpringU26325/account-keeper/releases"
 _HOSTS = {"gitee.com", "foruda.gitee.com"}
 _FILES = {"candidate.exe.part", "candidate.exe", "manifest.json", "manifest.sig",
           "ready.json.tmp", "ready.json", "owner.json", "update_helper.exe", "update_helper.exe.part",
