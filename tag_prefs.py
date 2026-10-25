@@ -1,4 +1,4 @@
-"""用户标签偏好：维护 tags.json 中唯一的、有序标签列表。
+"""用户标签偏好：维护 tags.json 的常用列表与按收支分组的新增记忆。
 
 偏好单独存文件而不并入 settings.json：settings 写入时会整份覆盖，混放标签会被
 导出路径更新洗掉。旧版 categories.json 只在首次初始化时读取，不修改、不删除。
@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Callable, Iterable
 
 from config import CATEGORY_PREFS_PATH, DEFAULT_TAGS, TAG_PREFS_PATH
@@ -115,18 +117,64 @@ def build_tag_candidates() -> list[str]:
     return _tags_list(document)
 
 
+def _remembered_tags(document: dict) -> dict[str, list[str]]:
+    """仅识别明确的收支分组，旧文件或非法字段不借另一方向兜底。"""
+    raw = document.get("last_used_tags")
+    if not isinstance(raw, dict):
+        return {}
+    return {key: _clean_list(raw[key], f"last_used_tags.{key}")
+            for key in ("expense", "income") if key in raw}
+
+
+def load_remembered_tags(amount_type: str) -> tuple[str, ...]:
+    """读取新增方向的完整标签；缺失或损坏均返回空元组，不修写原文件。"""
+    key = {"支出": "expense", "收入": "income"}.get(amount_type)
+    document = _read_tags_document()
+    # 未知方向绝不能被当成默认支出，避免调用方错误造成跨方向回填。
+    return tuple(_remembered_tags(document).get(key, ())) if document and key else ()
+
+
+def save_remembered_tags(amount_type: str, tags: tuple[str, ...]) -> bool:
+    """只更新指定方向；空元组代表用户明确取消该方向的默认记忆。"""
+    key = {"支出": "expense", "收入": "income"}.get(amount_type)
+    if key is None:
+        return False
+    document = _read_tags_document()
+    if document is None:
+        # 不让一次可选记忆写入覆盖损坏文件内尚可人工恢复的常用列表。
+        if TAG_PREFS_PATH.exists():
+            return False
+        document = {"tags": []}
+    remembered = _remembered_tags(document)
+    remembered[key] = _clean_list(list(tags), f"last_used_tags.{key}")
+    document["last_used_tags"] = remembered
+    return _write_document(document)
+
+
 def _write_document(document: dict) -> bool:
-    """只写 version/tags 标准结构；直接整份覆盖，未采用导入映射的临时文件原子替换。"""
-    payload = {"version": _SCHEMA_VERSION, "tags": _tags_list(document)}
+    """共同保存候选与方向记忆，临时文件替换避免写入失败截断原偏好。"""
+    payload: dict = {"version": _SCHEMA_VERSION, "tags": _tags_list(document)}
+    if "last_used_tags" in document:
+        payload["last_used_tags"] = _remembered_tags(document)
+    temporary: Path | None = None
     try:
         # 用户可能移动或删除数据目录，写入前补建目录以便偏好功能自行恢复。
         TAG_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with TAG_PREFS_PATH.open("w", encoding="utf-8") as handle:
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=TAG_PREFS_PATH.parent,
+                                prefix=".tags-", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
             json.dump(payload, handle, ensure_ascii=False, indent=2)
+        temporary.replace(TAG_PREFS_PATH)  # 关闭句柄后同目录替换，兼容 Windows 文件占用规则。
     except OSError as error:
-        # 返回 False 只表示未能保存，直接写入失败并不承诺原文件仍完整；由调用方反馈结果。
+        # 保留原偏好，失败结果交给当前操作反馈，不能冒充已经记住或清除了标签。
         _warn(f"{TAG_PREFS_PATH.name} 写入失败（{error}），本次操作未保存。")
         return False
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as error:
+                _warn(f"临时标签文件清理失败（{error}）。")  # 清理失败不覆盖实际保存结果。
     return True
 
 
@@ -142,7 +190,9 @@ def _apply(name: str, change: Callable[[str, list[str]], bool]) -> bool:
     # change 的 False 表示列表未变，不是操作失败；只有有效变更才重写标准结构。
     if not change(cleaned, tags):
         return True
-    return _write_document({"tags": tags})
+    document = document or {}
+    document["tags"] = tags  # 候选增删置顶保留同一文档中的两组记忆。
+    return _write_document(document)
 
 
 def save_tag(name: str) -> bool:

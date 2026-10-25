@@ -194,11 +194,15 @@ class AccountKeeperApp(ctk.CTk):
         self.input_frame = InputFrame(
             self,
             self.add_record,
+            clear_tags_callback=self.clear_tag_memory,
         )
+        # 只给新增区安装方向回填；编辑窗继续完全按原记录初始化。
+        self.input_frame.amount_type_var.trace_add("write", lambda *_: self._restore_tag_memory())
+        self._restore_tag_memory()
         self.input_frame.pack(fill="x", padx=24, pady=(0, 8))
         # 把这些控件引用提升到主窗口，方便各回调直接读取/清空；控件本身仍归 InputFrame 所有。
         # 标签刻意不提升：它不是一个 StringVar，而是 chips 那个有序集合，
-        # 归 InputFrame 自己管，主窗口只经 collect_tags() / clear_tags() 两个口子打交道。
+        # 归 InputFrame 自己管，主窗口只经标签收集、清空及记忆回填接口打交道。
         # 不把 _tags 提到主窗口，是为了不让两条路径去改同一份标签集合。
         self.date_var = self.input_frame.date_var
         self.amount_entry = self.input_frame.amount_entry
@@ -328,6 +332,19 @@ class AccountKeeperApp(ctk.CTk):
         self.toolbar.set_record_actions_enabled(record_id is not None)
         self.table_frame.set_selected_record(record_id)
 
+    def _restore_tag_memory(self) -> None:
+        amount_type = self.input_frame.amount_type_var.get()
+        self.input_frame.set_remembered_tags(tag_prefs.load_remembered_tags(amount_type))
+
+    @business_action
+    def clear_tag_memory(self) -> None:
+        amount_type = self.input_frame.amount_type_var.get()
+        saved = tag_prefs.save_remembered_tags(amount_type, ())
+        self.input_frame.clear_tags()  # 主动清空与提交后复位不同，必须同时清除当前方向的持久记忆。
+        if not saved:
+            messagebox.showwarning("标签记忆未清除", "当前标签已清空，但记忆保存失败；请检查文件权限后重试。")
+        self.input_frame.tag_chips.tag_entry.focus_set()  # 提示结束后再聚焦，用户可直接重新输入。
+
     @business_action
     def add_record(self) -> None:
         try:
@@ -377,13 +394,13 @@ class AccountKeeperApp(ctk.CTk):
         except ValueError:
             messagebox.showerror("输入错误", "日期格式应为 YYYY-MM-DD，金额必须是数字。")
             return
-        # 清空金额/标签/备注，但保留日期，方便用户连续录入同一天的流水。
+        # 只在账本写入成功之后记忆本次方向，校验或入账失败不能污染默认值。
+        tag_prefs.save_remembered_tags(amount_type, tags)
+        # 清空金额/备注但保留日期与当前方向记忆，方便用户连续录入。
         # 金额框使用的是 placeholder_text 而非 textvariable，控件内容必须单独清空，
         # 否则下一次提交会把上一次的金额重复带进去。
         self.amount_entry.delete(0, "end")
-        # 标签归 InputFrame 管，主窗口只让它自己复位（连带清掉输入框里的残留文字）。
-        # 清空已选 chips 与待提交文本是同一动作，不能在主窗口绕过接口直接改内部 _tags。
-        self.input_frame.clear_tags()
+        self._restore_tag_memory()  # 同时清手输残留；回填依据当前方向，而非缓存窗的旧值。
         self.note_var.set("")
         # 需求 3.13：这里不再需要「重新查历史标签 + 刷新候选」。
         # 候选改由 tag_prefs 在每次点 ▼ 时现算，弹窗里点「+ 保存」把标签写进

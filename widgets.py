@@ -16,6 +16,7 @@ from typing import Callable
 from tkinter import ttk, font as tkfont
 
 import customtkinter as ctk
+import tag_picker
 
 from calendar_picker import ask_date
 from file_picker import FileMenu
@@ -83,6 +84,7 @@ class TagChipsFrame(ctk.CTkFrame):
         self._tags: list[str] = []  # 保留输入/选择顺序，提交时导出 tuple，不向外暴露可变列表。
         self._tag_buttons: dict[str, ctk.CTkButton] = {}  # 名称同时是去重身份和控件查找键。
         self._chips_width = -1
+        self._revision = 0  # 清空/换方向后，嵌套选择器返回的旧结果必须失效。
         # 高度重算只关心实际行数变化；宽度变化但仍排成相同行数时无需通知外层。
         self._layout_rows = 0
         self._on_layout_change = on_layout_change
@@ -233,12 +235,14 @@ class TagChipsFrame(ctk.CTkFrame):
 
     def clear_tags(self) -> None:
         """清空 chips 与输入框，供新增记录成功后复位。"""
+        self._revision += 1
         for button in self._tag_buttons.values():
             button.destroy()
         self._tag_buttons.clear()
         self._tags.clear()
         self.tag_entry.delete(0, "end")
-        self._relayout_tags()
+        # 清空与回填常在同一事件内发生；空闲时再布局最终内容，避免同步隐藏Canvas后无法重新显示。
+        self._schedule_relayout()
 
     def set_tags(self, tags: tuple[str, ...]) -> None:
         """用给定标签整体替换 chips，供编辑弹窗按记录值初始化。"""
@@ -248,6 +252,7 @@ class TagChipsFrame(ctk.CTkFrame):
 
     def _pick_tags(self) -> None:
         """仅在 picker 返回完成结果时合并所选标签与输入框残留。"""
+        revision = self._revision
         picked = globals()["ask_tags"](
             self.winfo_toplevel(),
             self.tag_entry,
@@ -255,7 +260,7 @@ class TagChipsFrame(ctk.CTkFrame):
             toggle_button=self.tag_button,
             selected_tags=self.get_tags(),
         )
-        if picked is None:
+        if picked is None or revision != self._revision:
             return
         # 选择器等待会处理事件，完成后再读手输残留；取消则不改当前输入。
         typed = split_tag_input(self.tag_entry.get())
@@ -264,10 +269,30 @@ class TagChipsFrame(ctk.CTkFrame):
         self._add_tags(final)
 
 
+class _InputTagChips(TagChipsFrame):
+    """仅为新增区通知标签变更，编辑控件不接入默认记忆或新增提示。"""
+
+    def __init__(self, master: ctk.CTkBaseClass, on_change: Callable[[], None]) -> None:
+        self._on_change = on_change
+        super().__init__(master, placeholder_text="输入标签后回车，或点 ▼ 选择")
+
+    def _schedule_relayout(self) -> None:
+        super()._schedule_relayout()
+        self._on_change()  # 手动增删后取消来源提示，药丸本身始终沿用统一样式。
+
+    def clear_tags(self) -> None:
+        picker = tag_picker._active_picker
+        if picker is not None and picker.anchor is self.tag_entry:
+            picker.close()  # 只结束本字段的面板，避免清空后旧选择再次回填。
+        super().clear_tags()
+        self._on_change()
+
+
 class InputFrame(ctk.CTkFrame):
     """双行录入卡片，收支符号仍交给逻辑层处理。"""
 
-    def __init__(self, master: ctk.CTk, add_callback: Callable[[], None]) -> None:
+    def __init__(self, master: ctk.CTk, add_callback: Callable[[], None],
+                 clear_tags_callback: Callable[[], None] | None = None) -> None:
         super().__init__(master, corner_radius=14, fg_color="#FFFFFF",
                          border_width=1, border_color="#E0E8F0")
         self.date_var = tk.StringVar(value=date.today().isoformat())
@@ -281,7 +306,7 @@ class InputFrame(ctk.CTkFrame):
 
         # 第一行让日期、金额分配弹性空间，收支与添加保持固定尺寸和输入框基线。
         first_row = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
-        first_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
+        first_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
         first_row.columnconfigure((0, 1), weight=1, uniform="primary_field")
         date_field = _field_column(first_row, "日期")
         date_field.grid(row=0, column=0, sticky="new", padx=(0, 12))
@@ -317,19 +342,44 @@ class InputFrame(ctk.CTkFrame):
 
         # 第二行标签与备注按 2:3 分配；标签增加仅向下展开，不推动输入框和备注。
         second_row = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
-        second_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 12))
+        # 收紧卡片留白，为最小窗口展开三行标签后保留表格的可视高度。
+        second_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
         second_row.columnconfigure(0, weight=2, uniform="secondary_field")
         second_row.columnconfigure(1, weight=3, uniform="secondary_field")
-        tags_field = _field_column(second_row, "标签（可选）")
-        tags_field.grid(row=0, column=0, sticky="new", padx=(0, 12))
-        # 只为主窗口启用提示，编辑区和选择器 footer 的预填交互保持原样。
-        self.tag_chips = TagChipsFrame(
-            tags_field, placeholder_text="输入标签后回车，或点 ▼ 选择")
-        self.tag_chips.grid(row=1, column=0, sticky="ew")
-        note_field = _field_column(second_row, "备注（可选）")
-        note_field.grid(row=0, column=1, sticky="new")
+        tags_field = ctk.CTkFrame(second_row, fg_color="transparent", corner_radius=0)
+        tags_field.columnconfigure(0, weight=1)
+        tags_field.grid(row=1, column=0, sticky="new", padx=(0, 12))
+        # 来源提示与纯文本清空共享原有标题行，既不挤占输入宽度也不增加字段行数。
+        # 两侧标题共用父容器的同一行，清空按钮的实际请求高度会同时作用于两侧输入基线。
+        tags_header = ctk.CTkFrame(second_row, fg_color="transparent", corner_radius=0)
+        tags_header.grid(row=0, column=0, sticky="ew", padx=(0, 12), pady=(0, 6))
+        tags_header.columnconfigure(1, weight=1)
+        ctk.CTkLabel(tags_header, text="标签（可选）", width=0, height=20,
+                     font=("Microsoft YaHei UI", 11), text_color="#64748B").grid(row=0, column=0)
+        self.tag_memory_hint = ctk.CTkLabel(
+            tags_header, text="", width=0, height=20, anchor="w",
+            font=("Microsoft YaHei UI", 10), text_color="#94A3B8")
+        self.tag_memory_hint.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.clear_tags_button = ctk.CTkButton(
+            tags_header, text="清空", width=44, height=20, border_width=0, corner_radius=4,
+            fg_color="transparent", hover_color="#F0F3F7", text_color="#64748B",
+            text_color_disabled="#CBD5E1", font=("Microsoft YaHei UI", 11), state="disabled",
+            command=clear_tags_callback or self.clear_tags)
+        self.clear_tags_button.grid(row=0, column=2, sticky="e")
+        self.tag_chips = _InputTagChips(tags_field, self._tag_input_changed)
+        self.tag_chips.grid(row=0, column=0, sticky="ew")
+        self._last_tag_text = ""
+        self.tag_chips.tag_entry.bind("<KeyRelease>", self._tag_entry_changed, add="+")
+        for sequence in ("<<Paste>>", "<<Cut>>"):
+            self.tag_chips.tag_entry.bind(sequence, self._queue_tag_entry_changed, add="+")
+        ctk.CTkLabel(second_row, text="备注（可选）", height=20, anchor="w",
+                     font=("Microsoft YaHei UI", 11), text_color="#64748B").grid(
+            row=0, column=1, sticky="ew", pady=(0, 6))
+        note_field = ctk.CTkFrame(second_row, fg_color="transparent", corner_radius=0)
+        note_field.columnconfigure(0, weight=1)
+        note_field.grid(row=1, column=1, sticky="new")
         self.note_surface, self.note_entry = _entry_surface(note_field, self.note_var)
-        self.note_surface.grid(row=1, column=0, sticky="ew")
+        self.note_surface.grid(row=0, column=0, sticky="ew")
         # 只处理主页面入口的外侧圆角，避免共享chips在编辑窗里跟着改外观。
         for button in (self.date_button, self.tag_chips.tag_button):
             button.configure(background_corner_colors=("#F8FAFC", "#FFFFFF", "#FFFFFF", "#F8FAFC"))
@@ -351,6 +401,31 @@ class InputFrame(ctk.CTkFrame):
 
     def clear_tags(self) -> None:
         self.tag_chips.clear_tags()
+
+
+    def set_remembered_tags(self, tags: tuple[str, ...]) -> None:
+        self.tag_chips.set_tags(tags)
+        self.tag_memory_hint.configure(text="沿用上次" if tags else "")
+        self._sync_tag_controls()
+
+    def _sync_tag_controls(self) -> None:
+        self._last_tag_text = self.tag_chips.tag_entry.get()
+        populated = bool(self.tag_chips.get_tags() or self._last_tag_text)
+        self.clear_tags_button.configure(state="normal" if populated else "disabled")
+
+    def _tag_input_changed(self) -> None:
+        self.tag_memory_hint.configure(text="")
+        self._sync_tag_controls()
+
+    def _tag_entry_changed(self, _event: tk.Event | None = None) -> None:
+        if self.tag_chips.tag_entry.get() != self._last_tag_text:
+            self._tag_input_changed()  # 光标键不改变内容时，保留沿用提示。
+
+    def _queue_tag_entry_changed(self, _event: tk.Event) -> None:
+        revision = self.tag_chips._revision
+        # 虚拟粘贴/剪切事件先于文本变化；延期核对且不跨清空/方向切换更新提示。
+        self.after_idle(lambda: self._tag_entry_changed()
+                        if revision == self.tag_chips._revision else None)
 
 
 class ToolbarFrame(ctk.CTkFrame):
