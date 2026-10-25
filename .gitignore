@@ -38,6 +38,10 @@ docs/UPDATE_ARCHITECTURE.md
 docs/_report_sign_*.md
 docs/RELEASE_GUIDE.md
 
+# ---------- 独立任务报告（纳入版本管理） ----------
+/docs/report/
+/docs/report/**
+
 # ---------- 临时文件 ----------
 temp.py
 *.tmp
