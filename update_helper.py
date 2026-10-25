@@ -30,7 +30,7 @@ def target_path(path):
     if p.name != "AccountKeeper.exe" or p.resolve() != p:
         raise UpdateFailure("目标路径必须是无重解析的AccountKeeper.exe")
     return p
-# 独立helper由启动参数绑定数据目录；主程序延迟读取配置，不在模块导入时触碰账本。
+# 独立helper由启动参数绑定数据目录；早期恢复独立定位路径，不导入配置或触碰账本。
 _HELPER_DATA_DIR = None
 _PAYLOAD_NAMES = {"candidate.exe", "candidate.exe.part", "update_helper.exe",
                   "update_helper.exe.part", "staged.exe", "restore.exe", "backup"}
@@ -39,8 +39,16 @@ _PAYLOAD_NAMES = {"candidate.exe", "candidate.exe.part", "update_helper.exe",
 def data_root():
     if _HELPER_DATA_DIR is not None:
         return _HELPER_DATA_DIR
-    from config import DATA_DIR
-    return Path(DATA_DIR).resolve(strict=True)
+    # 与config.py保持同步：相同的platformdirs参数、默认选项及ImportError降级路径。
+    # 恢复判定必须先于配置加载，不能通过导入config获取路径。
+    try:
+        from platformdirs import user_data_dir
+    except ImportError:
+        root = Path.home() / "AccountKeeper"  # 与config的缺依赖降级规则一致。
+    else:
+        root = Path(user_data_dir("AccountKeeper", "SpringU26325"))
+    root.mkdir(parents=True, exist_ok=True)  # 首次启动也需支持严格解析，不依赖config创建目录。
+    return root.resolve(strict=True)
 
 
 def update_root(target):
@@ -861,25 +869,66 @@ def process_key(record):
 
 
 def stop_new(j):
-    records = new_records(j)
+    if committed(j):
+        raise UpdateFailure("已提交事务禁止终止新版")
+    target, end = Path(j["target"]), time.monotonic() + 10
     atomic_json(Path(j["work"]) / "stop.json", dict(token=j["token"]))
-    if wait_processes(records, 3):
-        return
     c, _, k = windows_api()
-    for record in records:
-        handle = open_process(record["pid"], True)
-        if not handle:
-            continue
-        try:
-            if wait_signal(handle, 0):
+    while True:
+        observed = image_processes(target)
+        records = new_records(j)  # 扫描期间新版可能完成pending登记，只从事务登记取得终止权限。
+        protected = j["old_processes"] + j["helper_processes"] + j.get("recovery_waiters", [])
+        if any(set(r) != {"pid", "created", "image"} or type(r["pid"]) is not int
+               or type(r["created"]) is not int or r["pid"] == os.getpid() or r in protected for r in records):
+            raise UpdateFailure("新版进程登记不完整或混入受保护实例，禁止终止")
+        unknown = [r for r in observed if r not in records]
+        if unknown:
+            raise UpdateFailure(f"存在未登记目标进程，禁止按路径查杀：{unknown!r}")
+        # 空扫描也不能代替已登记对象的退出证据；为正常关闭先留出有限宽限。
+        if wait_processes(records, min(3, max(0, end - time.monotonic()))) and not image_processes(target):
+            return
+        for record in records:
+            handle = open_process(record["pid"], True)
+            if not handle:
                 continue
-            if describe(handle, record["pid"]) == record:
+            try:
+                if wait_signal(handle, 0) or describe(handle, record["pid"]) != record:
+                    continue  # PID复用不构成终止授权，必须在同一句柄上核验三元组。
                 if not k.TerminateProcess(handle, 2):
-                    raise c.WinError(c.get_last_error())
-                if not wait_signal(handle, 5000):
-                    raise UpdateFailure("新版未完全退出")
-        finally:
-            k.CloseHandle(handle)
+                    error = c.WinError(c.get_last_error())
+                    if not wait_signal(handle, max(0, min(2000, int((end - time.monotonic()) * 1000)))):
+                        raise error
+                if not wait_signal(handle, max(0, min(5000, int((end - time.monotonic()) * 1000)))):
+                    raise UpdateFailure(f"登记新版未完全退出：{record!r}")
+            except OSError as error:
+                if getattr(error, "winerror", None) not in (5, 1168) or not wait_signal(handle, 0):
+                    raise UpdateFailure(f"无法确认登记新版已退出：{record!r}；{error!r}") from error
+            finally:
+                k.CloseHandle(handle)
+        if time.monotonic() >= end:
+            raise UpdateFailure(f"等待登记新版退出超过10秒：{records!r}")
+        time.sleep(0.05)  # 再扫只发现阻塞，绝不把同路径进程追加为授权名单。
+
+
+def reset_confirmation(j):
+    stop_new(j)  # 必须先排除上一轮所有写入者，才能清理信号并重新启动。
+    work, signals = Path(j["work"]), []
+    for name in ("failure.json", "pending.json", "healthy.json", "stop.json"):
+        path = work / name
+        if not path.exists():
+            continue
+        if path.resolve() != path or path.stat().st_nlink != 1:
+            raise UpdateFailure("确认信号路径越界或存在硬链接")
+        value = read_json(path)
+        if (not isinstance(value, dict) or value.get("token") != j["token"]
+                or (name != "stop.json" and value.get("transaction") != j["transaction"])):
+            raise UpdateFailure("旧确认信号不属于当前事务")
+        if name == "failure.json":
+            log_line(j["target"], f"重新确认前留存旧失败：{value.get('error')!r}")
+        signals.append(path)
+    for path in signals:
+        path.unlink()  # 全部身份校验成功后才删除；不触碰提交标记、签名材料或快照。
+    j["new_processes"] = []
 
 
 def rollback(j):
@@ -1045,7 +1094,10 @@ def recover_transaction(target):
             j.update(phase="rolling_back", intent="recover")
             write_journal(j)
             rollback(j)
-    except (OSError, UpdateFailure):  # 第三次仍失败也必须尝试安全逃生；新包或未知数据绝不放行。
+    except (OSError, UpdateFailure) as error:  # 第三次仍失败也必须尝试安全逃生；新包或未知数据绝不放行。
+        j["error"] = f"{j.get('error') or '回滚失败'}; recovery={error!r}"
+        write_journal(j)  # 保留实际中断原因，不能只有rolling_back而丢失恢复异常。
+        log_line(target, traceback.format_exc())
         if j["recovery_attempts"] >= 3:
             return escape_transaction(j)
         raise
@@ -1058,6 +1110,7 @@ def confirm_new(j):
     target, child, guard = Path(j["target"]), None, ExitStack()
     try:
         guard.enter_context(locked_helper(target, j["size"], j["new_sha"]))  # 同一只读共享句柄内验包、拉起并监督新版。
+        reset_confirmation(j)  # 在Popen之前隔离上一轮信号，禁止跨启动轮次复用健康或失败记录。
         j.update(phase="launching", intent="launch", new_started=True)
         write_journal(j)
         end = time.monotonic() + 120
@@ -1112,8 +1165,6 @@ def confirm_new(j):
     finally:
         try:
             if child is not None and not committed(j):
-                j["new_processes"] += image_processes(target)  # 也登记尚未写pending的解包子进程，不能只终止父进程。
-                write_journal(j)
                 stop_new(j)  # 未提交新版先退出并释放资源，防替换锁仍然持有。
                 child.wait(5)
         finally:

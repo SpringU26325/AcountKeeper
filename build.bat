@@ -9,11 +9,11 @@ echo   开始打包 AccountKeeper
 echo ==========================================
 
 :: 版本与构建参数统一交给 Python；失败时原样返回，不输出成功提示。
-"%~dp0.venv\Scripts\python.exe" -B -X utf8 "%~dp0build_release.py" %*
+"%~dp0.venv\Scripts\python.exe" -B -X utf8 "%~dp0release\build_release.py" %*
 if not "%errorlevel%"=="0" exit /b %errorlevel%
 
 echo ==========================================
-echo   打包完成！exe 位于 dist/ 文件夹（包含 AccountKeeper.exe 和 update_helper.exe）
-echo   请前往 Gitee 上传附件，拿取 URL 后运行 sign_release.py 进行签名。
+echo   打包完成！exe 位于 release/_staging/ 文件夹（包含 AccountKeeper.exe 和 update_helper.exe）
+echo   请前往 Gitee 上传附件，拿取 URL 后运行 release/sign_release.py 进行签名。
 echo ==========================================
 pause

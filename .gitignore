@@ -58,3 +58,5 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+# 临时备份目录，迁移确认后删除
+/AccountKeeper_release_backup_20261023/
