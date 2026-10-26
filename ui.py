@@ -26,13 +26,12 @@ import tag_prefs
 import calendar_picker
 import dialogs
 import settings
-from chart_window import show_chart_window
+from chart_window import StatsWindow
 from config import DATA_DIR, DEFAULT_EXPORT_DIR
 from dialog_lifecycle import ManagedToplevel, _cancel_owned_tasks
 from dialogs import center_dialog_on_parent
 from snail import SnailManager
 from store import Account, AccountStore
-from tag_aggregation import MULTI_TAG_TOTALS_NOTE, aggregate_records_by_tag
 from widgets import InputFrame, RecordTableFrame, ToolbarFrame
 from update_ui import UpdateFlow, business_action
 
@@ -208,7 +207,7 @@ class AccountKeeperApp(ctk.CTk):
         self.amount_entry = self.input_frame.amount_entry
         self.note_var = self.input_frame.note_var
 
-        # 工具栏只负责界面，把具体业务动作（筛选/删除/统计/导出/图表）回调给主窗口实现。
+        # 工具栏只负责界面，数据中心的创建和复用由主窗口协调。
         self.toolbar = ToolbarFrame(
             self,
             filter_callback=self.filter_records,
@@ -218,8 +217,6 @@ class AccountKeeperApp(ctk.CTk):
             stats_callback=self.show_stats,
             export_callback=self.export_csv,
             backup_callback=self.backup_data,
-            # 图表依赖 matplotlib，用 lambda 延迟到实际点击时才导入，加快启动速度。
-            chart_callback=lambda: show_chart_window(self),
             open_folder_callback=self.open_data_folder,
             import_callback=self.import_bill,
             batches_callback=self.show_import_batches,
@@ -561,7 +558,7 @@ class AccountKeeperApp(ctk.CTk):
 
         # 该月一条记录都没有时不必生成空文件，直接告知用户更友好。
         # 必须带上结尾的 "-"：只写月前缀时 2024-01 会把 2024-010 这类脏数据也算进来，
-        # 与 store.export_month_csv 的 LIKE 'YYYY-MM-%'、下面 show_stats 的口径保持一致。
+        # 与 store.export_month_csv 的 LIKE 'YYYY-MM-%' 口径保持一致。
         if not any(record.record_date.startswith(month + "-") for record in self.store.records):
             messagebox.showinfo("无法导出", "该月没有记录，无法导出")
             return
@@ -601,48 +598,15 @@ class AccountKeeperApp(ctk.CTk):
 
     @business_action
     def show_stats(self) -> None:
-        # 与 export_csv 同一套口径：月份由月历弹窗点选（issues #3.2），取消返回 None。
-        month = dialogs.ask_month(self, "选择统计月份")
-        if month is None:
-            return
-        # 只保留该月份的记录；要求存储的日期带前导零，所以前缀匹配是安全的（需求 3.4）。
-        month_records = [
-            record
-            for record in self.store.records
-            if record.record_date.startswith(month + "-")
-        ]
-        totals = aggregate_records_by_tag(month_records)
-        total_income = totals.total_income
-        total_expense = totals.total_expense
-        # 结余 = 收入 - 支出；支出转成正数后相减，避免出现"负数减负数"的歧义。
-        balance = total_income - total_expense
-        # 月度统计只展示支出明细，且忽略金额为零的桶以保持旧有显示语义。
-        expense_totals = {
-            tag: tag_totals.expense
-            for tag, tag_totals in totals.by_tag.items()
-            if tag_totals.expense > 0
-        }
-        # 分三种情况给出结论，避免展示一个"只有标题没有内容"的空明细。
-        if not month_records:
-            details = "该月份没有记账记录"
-        elif total_expense == 0:
-            details = "该月份只有收入，没有支出"
+        # 每次刷新读取完整缓存，不从搜索后的表格取数，保证同月统计口径一致。
+        window = getattr(self, "_stats_window", None)
+        if window is None or not window.winfo_exists():
+            self._stats_window = StatsWindow(self, lambda: self.store.records)
         else:
-            expense_details = "\n".join(
-                f"{tag}: {amount:.2f} 元"
-                for tag, amount in sorted(expense_totals.items())
-            )
-            details = (
-                f"支出标签明细：\n{expense_details}\n\n"
-                f"{MULTI_TAG_TOTALS_NOTE}"
-            )
-        summary = (
-            f"{month} 月度统计\n"
-            f"总收入：{total_income:.2f} 元\n"
-            f"总支出：{total_expense:.2f} 元\n"
-            f"结余：{balance:.2f} 元"
-        )
-        messagebox.showinfo("月度统计", f"{summary}\n\n{details}")
+            window.refresh()
+            window.deiconify()
+            window.lift()
+            window.focus_set()
 
     def ask_month(
         self,
@@ -656,11 +620,11 @@ class AccountKeeperApp(ctk.CTk):
         不在业务回调中另写一套选择逻辑。
 
         Args:
-            title: 窗口标题栏文字，带语境（如「查看图表」）。
+            title: 窗口标题栏文字，带语境（如「导出账单」）。
             initial_month: 预选月份（YYYY-MM），同时决定初始展示的年份；
                 不传或字符串不合法时定位到今天所在月份。
             anchor: 锚点控件（触发月份选择的按钮）：弹窗贴它的左下角弹出，
-                不传则屏幕居中。三个工具栏按钮目前没留控件引用，故先按居中走。
+                不传则屏幕居中；导出入口目前不传锚点。
         """
         # 可选项一律关键字透传：dialogs.ask_month 的形参顺序将来若有调整，
         # 这里不会静默错位（例如把 initial_month 当 anchor 传下去）。

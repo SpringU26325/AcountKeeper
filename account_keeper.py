@@ -96,7 +96,7 @@ def _run_app(context) -> None:
 
 
 def main() -> None:
-    context = None
+    cont-ext = None
     try:
         context = bootstrap()
         if context is not False:

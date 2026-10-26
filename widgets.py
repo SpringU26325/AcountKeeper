@@ -435,7 +435,7 @@ class ToolbarFrame(ctk.CTkFrame):
         self, master: ctk.CTk, filter_callback: Callable[..., None],
         refresh_callback: Callable[[], None], delete_callback: Callable[[], None],
         stats_callback: Callable[[], None], export_callback: Callable[[], None],
-        backup_callback: Callable[[], None], chart_callback: Callable[[], None],
+        backup_callback: Callable[[], None],
         open_folder_callback: Callable[[], None], edit_callback: Callable[[], None],
         import_callback: Callable[[], None] | None = None,
         batches_callback: Callable[[], None] | None = None,
@@ -454,10 +454,8 @@ class ToolbarFrame(ctk.CTkFrame):
         ctk.CTkLabel(heading, text="账目记录", anchor="w",
                      font=("Microsoft YaHei UI", 13, "bold"),
                      text_color="#243447").grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(heading, text="统计", command=stats_callback,
+        ctk.CTkButton(heading, text="财务分析", command=stats_callback,
                       **neutral_button).grid(row=0, column=1, padx=(0, 8))  # pyright: ignore[reportArgumentType]  # 参数已核验，混合字典展开丢失键值类型对应。
-        ctk.CTkButton(heading, text="图表", command=chart_callback,
-                      **neutral_button).grid(row=0, column=2, padx=(0, 8))  # pyright: ignore[reportArgumentType]  # 参数已核验，混合字典展开丢失键值类型对应。
         self._file_callbacks = {
             "导出 CSV": export_callback, "备份数据": backup_callback,
             "打开数据目录": open_folder_callback,
@@ -475,7 +473,7 @@ class ToolbarFrame(ctk.CTkFrame):
         self.file_menu.configure(fg_color="#E8EEF5")
         for button in (self.file_menu.label_button, self.file_menu.toggle_button):
             button.configure(fg_color="#E8EEF5", hover_color="#DDE7F2", text_color="#475569")
-        self.file_menu.grid(row=0, column=3)
+        self.file_menu.grid(row=0, column=2)
 
         # 第二行将搜索留在左侧，编辑/删除常驻右侧；只有搜索列吸收多余宽度。
         actions = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
