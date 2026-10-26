@@ -52,6 +52,9 @@ def _run_app(context) -> None:
         target = Path(sys.executable).resolve() if getattr(sys, "frozen", False) and sys.platform == "win32" else None
         arch = "arm64" if platform.machine().upper() == "ARM64" else "x64" if sys.maxsize > 2**32 else "x86"
         app.configure_updates(target, APP_VERSION, arch, DATA_DIR)
+        update_flow = app.update_flow
+        if update_flow is None:
+            raise RuntimeError("更新控制器未完成初始化")  # 启动回调只捕获已就绪实例，不带着可空引用进入事件循环。
     except Exception as error:
         if context is not None:
             context.failed(error)  # 不弹阻塞确认框，由helper判失败并回退。
@@ -83,7 +86,7 @@ def _run_app(context) -> None:
                 if context.poll():
                     store.enable_business_writes()
                     app.deiconify()
-                    app.update_flow.startup()  # 持久提交后才允许安排下一次更新检查。
+                    update_flow.startup()  # 持久提交后才允许安排下一次更新检查。
                     return
                 app.after(50, await_commit)
             except Exception as error:
@@ -91,12 +94,12 @@ def _run_app(context) -> None:
                 app.destroy()
         app.after_idle(await_commit)
     else:
-        app.after_idle(app.update_flow.startup)  # 主循环首帧后计时，不等待网络才显示窗口。
+        app.after_idle(update_flow.startup)  # 主循环首帧后计时，不等待网络才显示窗口。
     app.mainloop()
 
 
 def main() -> None:
-    cont-ext = None
+    context = None  # bootstrap自身失败时也有明确的异常处理上下文。
     try:
         context = bootstrap()
         if context is not False:

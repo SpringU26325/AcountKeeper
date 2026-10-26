@@ -9,6 +9,7 @@ import secrets
 import threading
 import time
 import tkinter as tk
+from typing import Any
 
 import customtkinter as ctk
 from dialog_lifecycle import ManagedToplevel
@@ -132,7 +133,8 @@ class UpdateFlow:
             before = None
             try:
                 if kind == "check":
-                    state = helper.read_state(self.target)
+                    # 状态包含计数、列表及可空尝试字典；本地标注不改变冻结接口的读取行为。
+                    state: dict[str, Any] = helper.read_state(self.target)
                     before = state["active"]
                     if manual and state["paused"] and not retry:
                         value = ("paused", state["reasons"])
@@ -160,11 +162,16 @@ class UpdateFlow:
             except Exception as error:
                 if kind in ("check", "download", "install"):
                     try:
-                        active = helper.read_state(self.target)["active"]
+                        state = helper.read_state(self.target)
+                        active = state["active"]
                         attempt = offer.attempt if offer is not None else active if before is None else None
                         journal_path = helper.journal_path(self.target)
-                        owned_journal = (kind == "install" and journal_path.exists()
-                                         and helper.load_journal(self.target)["transaction"] == Path(ready).parent.name)
+                        owned_journal = False
+                        if kind == "install":
+                            if ready is None:
+                                raise updater.UpdateError("安装就绪路径缺失，保留事务现场")  # 缺失归属依据时不能继续结算。
+                            owned_journal = (journal_path.exists()
+                                             and helper.load_journal(self.target)["transaction"] == Path(ready).parent.name)
                         if (attempt and active and attempt["id"] == active["id"]
                                 and active["owner"] == helper.process_identity(os.getpid())
                                 and not owned_journal and (kind == "install" or not active["binding"])):
@@ -190,7 +197,8 @@ class UpdateFlow:
                 continue  # 校验活跃token与阶段，旧异常也不得覆盖新弹窗。
             if event == "progress":
                 if (not self.building and not self.closing and not self.cancel_event.is_set() and self.window is not None
-                        and not self.window.closing and self.progress is not None):
+                        and not self.window.closing and self.progress is not None and self.detail is not None):
+                    # 建窗或销毁期间缺少文字控件时跳过进度，等待完整UI接收下一条消息。
                     done, total = value
                     self.progress.set(done / total)
                     self.detail.configure(text=f"{done / 1048576:.1f} / {total / 1048576:.1f} MB · {done / total:.0%}")
@@ -238,7 +246,8 @@ class UpdateFlow:
             self._show("取消更新", "正在结束本次更新…", [])
             return
         if not ok:
-            if kind == "download" and self.thread.ident is not None:
+            if kind == "download" and self.thread is not None and self.thread.ident is not None:
+                # 线程尚未建立时不假定后台已经完成结算，保留现有候选处理语义。
                 self.offer = None  # 后台已结算；错误弹窗建窗重入时也不能复用旧Offer。
             if kind == "install":
                 self.blocked = True  # 接管超时可能仍有helper存活，禁止重试和恢复业务写入。
@@ -268,6 +277,8 @@ class UpdateFlow:
             self._dismiss()
 
     def _offer_window(self):
+        if self.offer is None:
+            raise updater.UpdateError("更新候选缺失，无法显示更新信息")  # 不能用虚构版本展示不完整候选。
         self._show("发现更新", f"发现新版本 v{self.offer.version}\n当前版本 v{self.version}\n更新包大小 {self.manifest['size'] / 1048576:.1f} MB",
                    [("暂不更新", self.decline), ("立即下载", self.download)])
         self.phase = "offer"  # CTk建窗会重入事件循环；控件齐备后才发布可操作阶段。
@@ -275,6 +286,8 @@ class UpdateFlow:
     def download(self):
         if self.phase != "offer" or self.thread is not None or self.closing:
             return
+        if self.offer is None:
+            raise updater.UpdateError("更新候选缺失，无法开始下载")  # 阶段标记不能替代候选本身的存在性。
         self._start("download")
         self._show("下载更新", f"正在下载新版本 v{self.offer.version}", [("取消", self.cancel)], progress=True)
 
@@ -334,7 +347,8 @@ class UpdateFlow:
         if self.phase == "offer":
             self.decline()
         elif self.phase == "download":
-            self.window.withdraw()  # 仅隐藏窗口，后台任务和token保持有效。
+            if self.window is not None:
+                self.window.withdraw()  # 迟到关闭回调遇到空窗口时跳过隐藏，后台任务和token保持有效。
         elif self.phase == "check":
             self.cancel()
         elif self.phase not in ("install", "draining", "discard"):

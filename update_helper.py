@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import traceback
+from typing import Any
 
 
 class UpdateFailure(Exception):
@@ -268,10 +269,10 @@ class FileLock:
     def __exit__(self, *args):
         import msvcrt
         try:
-            self.stream.seek(0)
-            msvcrt.locking(self.stream.fileno(), msvcrt.LK_UNLCK, 1)
+            self.stream.seek(0)  # type: ignore[reportOptionalMemberAccess]  # with仅在__enter__成功后调用__exit__，此时文件流已打开。
+            msvcrt.locking(self.stream.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[reportOptionalMemberAccess]  # 成功进入上下文才会解锁，stream由__enter__持有且未置空。
         finally:
-            self.stream.close()
+            self.stream.close()  # type: ignore[reportOptionalMemberAccess]  # 进入失败由__enter__关闭并重新抛出，不会调用此退出分支。
 
 
 class DataGate(FileLock):
@@ -361,7 +362,7 @@ def locked_helper(path, size, expected):
 
 def windows_api():
     if hasattr(windows_api, "loaded"):
-        return windows_api.loaded
+        return windows_api.loaded  # type: ignore[reportFunctionMemberAccess]  # hasattr已确认函数缓存属性存在，Python函数支持动态属性。
     import ctypes
     from ctypes import wintypes as w
     k = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -375,8 +376,8 @@ def windows_api():
         ("CreateToolhelp32Snapshot", [w.DWORD, w.DWORD], w.HANDLE),
     ):
         getattr(k, name).argtypes, getattr(k, name).restype = args, result
-    windows_api.loaded = ctypes, w, k
-    return windows_api.loaded
+    windows_api.loaded = ctypes, w, k  # type: ignore[reportFunctionMemberAccess]  # 函数对象允许保存动态缓存，静态FunctionType未声明该属性。
+    return windows_api.loaded  # type: ignore[reportFunctionMemberAccess]  # 本分支刚完成loaded赋值，返回已初始化的Windows API缓存。
 
 
 def wait_signal(handle, milliseconds):
@@ -498,7 +499,39 @@ def state_path(target):
     return update_root(target) / ".accountkeeper-update-state.json"
 
 
-def read_state(target):
+def validate_state_attempt(value, label):
+    # 状态文件属于外部输入；先验证嵌套结构，后续恢复诊断才能安全读取字段。
+    if (not isinstance(value, dict)
+            or not {"id", "seq", "owner", "started", "binding"} <= value.keys()
+            or not isinstance(value.get("id"), str) or not value["id"]
+            or type(value.get("seq")) is not int or value["seq"] < 1
+            or type(value.get("started")) not in (int, float)):
+        raise UpdateFailure(f"状态文件损坏：{label}尝试结构不完整")
+    owner = value["owner"]
+    if owner is not None and (not isinstance(owner, dict)
+            or set(owner) != {"pid", "created", "image"}
+            or type(owner.get("pid")) is not int or owner["pid"] < 1
+            or type(owner.get("created")) is not int or owner["created"] < 0
+            or not isinstance(owner.get("image"), str) or not owner["image"]):
+        raise UpdateFailure(f"状态文件损坏：{label}进程身份不完整")
+    binding = value["binding"]
+    if binding is not None:
+        if (not isinstance(binding, dict)
+                or any(not isinstance(binding.get(k), str) or not binding[k]
+                       for k in ("work", "data_dir", "old_sha", "new_sha"))):
+            raise UpdateFailure(f"状态文件损坏：{label}绑定结构不完整")
+    # preparing/armed后续必须索引绑定；未绑定尝试和abandoned仍允许合法None。
+    handoff = value.get("handoff")
+    if handoff is not None and (not isinstance(handoff, str)
+            or handoff not in ("preparing", "armed", "abandoned")):
+        raise UpdateFailure(f"状态文件损坏：{label}交接阶段无效")
+    if handoff in ("preparing", "armed") and binding is None:
+        raise UpdateFailure(f"状态文件损坏：{label}交接缺少绑定")
+    if "handoff_token" in value and not isinstance(value["handoff_token"], str):
+        raise UpdateFailure(f"状态文件损坏：{label}交接令牌类型无效")
+
+
+def read_state(target) -> dict[str, Any]:
     target = target_path(target)
     path = state_path(target)
     if not path.exists():
@@ -506,31 +539,51 @@ def read_state(target):
             raise UpdateFailure("有事务却缺少计数状态，禁止按零初始化")
         return dict(schema=1, target=str(target), sequence=0, settled=0, failures=0,
                     paused=False, active=None, last=None, reasons=[])
-    s = read_json(path)
+    try:
+        s = read_json(path)
+    except UpdateFailure as error:  # 格式损坏必须指出状态文件，且不能初始化或覆盖失败现场。
+        raise UpdateFailure(f"状态文件损坏：{error}") from error
     if not isinstance(s, dict) or type(s.get("schema")) is not int or s.get("schema") != 1 or s.get("target") != str(target):
-        raise UpdateFailure("失败状态身份不符")
+        raise UpdateFailure("状态文件损坏：失败状态身份不符")
     if any(type(s.get(k)) is not int or s[k] < 0 for k in ("sequence", "settled", "failures")):
-        raise UpdateFailure("失败状态计数损坏")
+        raise UpdateFailure("状态文件损坏：失败状态计数损坏")
     if s["settled"] > s["sequence"] or type(s.get("paused")) is not bool or s["paused"] != (s["failures"] >= 3):
-        raise UpdateFailure("失败状态次序损坏")
+        raise UpdateFailure("状态文件损坏：失败状态次序损坏")
     a = s.get("active")
-    if (s["sequence"] - s["settled"] not in (0, 1) or not isinstance(s.get("reasons"), list)
+    if (not {"active", "last", "reasons"} <= s.keys()
+            or s["sequence"] - s["settled"] not in (0, 1) or not isinstance(s.get("reasons"), list)
             or (a is None) != (s["sequence"] == s["settled"])):
-        raise UpdateFailure("尝试结算状态损坏")
-    if a is not None and (not isinstance(a, dict) or a.get("seq") != s["sequence"] or a.get("seq") <= s["settled"]):
-        raise UpdateFailure("当前尝试损坏")
+        raise UpdateFailure("状态文件损坏：尝试结算状态损坏")
+    if a is not None:
+        validate_state_attempt(a, "当前")
+        if a["seq"] != s["sequence"] or a["seq"] <= s["settled"]:
+            raise UpdateFailure("状态文件损坏：当前尝试次序损坏")
+    last = s["last"]
+    if last is not None:
+        if (not isinstance(last, dict) or not {"attempt", "outcome", "reason"} <= last.keys()
+                or not isinstance(last.get("outcome"), str)
+                or last["outcome"] not in ("failed", "success", "cancelled")
+                or not isinstance(last.get("reason"), str)):
+            raise UpdateFailure("状态文件损坏：最近结算结构不完整")
+        validate_state_attempt(last["attempt"], "最近结算")
+    # 暂停提示需要读取每项reason；只检查外层list会让坏元素在显示时崩溃。
+    if any(not isinstance(item, dict) or not isinstance(item.get("reason"), str)
+           for item in s["reasons"]):
+        raise UpdateFailure("状态文件损坏：失败原因结构不完整")
     receipt = s.get("committed")
     if receipt is not None:
         if (not isinstance(receipt, dict) or set(receipt) != {"target", "sha256", "data_dir", "transaction", "token"}
                 or receipt.get("target") != str(target)):
-            raise UpdateFailure("终态安装凭据身份损坏")
+            raise UpdateFailure("状态文件损坏：终态安装凭据身份损坏")
         for name, length in (("sha256", 64), ("transaction", 32), ("token", 64)):
             value = receipt.get(name)
             if not isinstance(value, str) or len(value) != length or any(c not in "0123456789abcdef" for c in value):
-                raise UpdateFailure("终态安装凭据格式损坏")
+                raise UpdateFailure("状态文件损坏：终态安装凭据格式损坏")
+        if not isinstance(receipt["data_dir"], str) or not receipt["data_dir"]:
+            raise UpdateFailure("状态文件损坏：终态安装凭据数据路径无效")
         data = Path(receipt["data_dir"])
         if data.resolve() != data or data == target.parent:
-            raise UpdateFailure("终态安装凭据数据路径越界")  # 缺材料放行仍须保留凭据和数据目录的严格身份边界。
+            raise UpdateFailure("状态文件损坏：终态安装凭据数据路径越界")  # 缺材料放行仍须保留凭据和数据目录的严格身份边界。
     return s
 
 
@@ -540,7 +593,7 @@ def begin_attempt(target, manual=False):
         raise UpdateFailure("目标缺失，先完成恢复再检查更新")
     pending = read_state(target)["active"]  # 锁外预检：死亡执行者遗留的悬挂尝试先补记，否则同一会话永久阻塞。
     if pending is not None:
-        owner = pending.get("owner")
+        owner = pending.get("owner")  # read_state验证非空active为字典，外层已排除None。
         if owner and not wait_processes([owner], 0):
             raise UpdateFailure("上一尝试尚未结算")
         settle_attempt(target, pending, "failed", "执行者中断未结算")
@@ -553,9 +606,9 @@ def begin_attempt(target, manual=False):
             raise UpdateFailure("恢复未完成，禁止新尝试")
         if s["paused"] and not manual:
             raise Paused("连续失败达到3次，自动检查已暂停")
-        a = dict(id=secrets.token_hex(16), seq=s["sequence"] + 1,
+        a = dict(id=secrets.token_hex(16), seq=s["sequence"] + 1,  # read_state对sequence执行严格整数及非负校验。
                  owner=process_identity(os.getpid()), started=time.time(), binding=None)
-        s.update(sequence=a["seq"], active=a)
+        s.update(sequence=a["seq"], active=a)  # seq来自已验证整数加一，active为本地构造的尝试字典。
         atomic_json(state_path(target), s)
         return dict(a)
 
@@ -568,15 +621,15 @@ def settle_attempt(target, attempt, outcome, reason):
         s = read_state(target)
         if attempt["seq"] <= s["settled"]:
             return s  # 旧失败/旧提交重放不能再次加一或清除后续失败。
-        if not s["active"] or any(s["active"][k] != attempt[k] for k in ("id", "seq")):
+        if not s["active"] or any(s["active"][k] != attempt[k] for k in ("id", "seq")):  # read_state保证非空active是字典，短路条件已排除空值。
             raise UpdateFailure("结算不是当前尝试")
         if outcome == "failed":
-            s["failures"] += 1
-            s["reasons"] = (s["reasons"] + [dict(id=attempt["id"], reason=str(reason)[:2000])])[-16:]
+            s["failures"] += 1  # read_state已验证failures为整数，失败计数可安全加一。
+            s["reasons"] = (s["reasons"] + [dict(id=attempt["id"], reason=str(reason)[:2000])])[-16:]  # read_state已验证reasons为列表，此处仅追加记录并切片。
         elif outcome == "success":
             s["failures"], s["reasons"] = 0, []
-        s.update(settled=attempt["seq"], paused=s["failures"] >= 3,
-                 last=dict(attempt=s["active"], outcome=outcome, reason=str(reason)[:2000]),
+        s.update(settled=attempt["seq"], paused=s["failures"] >= 3,  # failures经严格整数校验且仅执行整数增量或归零。
+                 last=dict(attempt=s["active"], outcome=outcome, reason=str(reason)[:2000]),  # last按状态格式保存结算字典，混合值推断遗漏了字典类型。
                  active=None)
         atomic_json(state_path(target), s)
         return s
@@ -594,7 +647,7 @@ def abandon_attempt(target, attempt, outcome, reason):
     if active is None:
         return
     if attempt is None:
-        if active.get("owner") != process_identity(os.getpid()):
+        if active.get("owner") != process_identity(os.getpid()):  # 前置检查已排除None，read_state保证active的字典类型。
             return  # 没有明确尝试身份时，只结算本进程自己持有的尝试。
         attempt = active
     settle_attempt(target, attempt, outcome, reason)
@@ -603,13 +656,13 @@ def abandon_attempt(target, attempt, outcome, reason):
 def transfer_attempt(target, attempt, owner, binding=None, *, handoff=None):
     with FileLock(target, "state"):
         s = read_state(target)
-        if not s["active"] or any(s["active"][k] != attempt[k] for k in ("id", "seq")):
+        if not s["active"] or any(s["active"][k] != attempt[k] for k in ("id", "seq")):  # read_state保证非空active为字典，空值先触发交接过期。
             raise UpdateFailure("交接已过期")
-        s["active"]["owner"] = owner
+        s["active"]["owner"] = owner  # 上方身份检查已排除空active，状态读取保证其为字典。
         if binding is not None:
-            s["active"]["binding"] = binding
+            s["active"]["binding"] = binding  # 非空active已验证为字典，绑定写入不受混合值推断限制。
         if handoff is not None:
-            s["active"]["handoff"] = handoff  # preparing不能执行helper，armed才允许接管。
+            s["active"]["handoff"] = handoff  # 非空active已验证为字典，此处写入可选交接阶段。 preparing不能执行helper，armed才允许接管。
         atomic_json(state_path(target), s)
 
 
@@ -734,7 +787,7 @@ def _install(ready_path, target, old_version, arch, data_dir):
     data_dir = Path(data_dir).resolve(strict=True)
     if data_dir != data_root():
         raise UpdateFailure("安装数据目录与配置不符")  # helper和主程序必须使用同一份数据及状态。
-    candidate, manifest = verify_ready(ready_path, target, old_version, arch, with_manifest=True)
+    candidate, manifest = verify_ready(ready_path, target, old_version, arch, with_manifest=True)  # type: ignore[reportGeneralTypeIssues]  # with_manifest=True时verify_ready明确返回候选与清单二元组。
     ready, work = read_json(Path(ready_path)), Path(ready_path).parent
     attempt = ready.get("attempt")
     if not attempt:
@@ -761,7 +814,13 @@ def _install(ready_path, target, old_version, arch, data_dir):
                          handoff="preparing")
         with FileLock(target, "state"):
             s = read_state(target)
-            s["active"]["handoff_token"] = j["token"]  # 预约清理只认本次随机身份。
+            active = s["active"]
+            # 两次持锁之间尝试可能已结算或被替换；不能给空值或其他尝试写入预约身份。
+            if (not isinstance(active, dict) or any(active.get(k) != attempt.get(k) for k in ("id", "seq"))
+                    or active.get("handoff") != "preparing"
+                    or active.get("binding") != {k: j[k] for k in ("work", "data_dir", "old_sha", "new_sha")}):
+                raise UpdateFailure("状态文件损坏或交接已过期：当前尝试身份、阶段或绑定不符")
+            active["handoff_token"] = j["token"]  # 预约清理只认本次随机身份。
             atomic_json(state_path(target), s)
         reserve_data(j, records)
         write_journal(j)
@@ -1025,7 +1084,7 @@ def reconcile_sqlite(j):
 def record_commit(j):
     with FileLock(Path(j["target"]), "state"):
         state = read_state(j["target"])
-        state["committed"] = dict(target=j["target"], sha256=j["new_sha"], data_dir=j["data_dir"],
+        state["committed"] = dict(target=j["target"], sha256=j["new_sha"], data_dir=j["data_dir"],  # 状态允许写入committed凭据字典，read_state也校验该结构。
                                   transaction=j["transaction"], token=j["token"])
         atomic_json(state_path(j["target"]), state)  # 独立终态凭据先落盘，材料目录被删除后仍能核实当前安装。
 
@@ -1177,12 +1236,13 @@ def run_worker(target, recover=False):
         j = load_journal(target)
         if Path(sys.executable).resolve() != Path(j["helper"]) or digest(Path(j["helper"])) != j["helper_sha"]:
             raise UpdateFailure("不是登记的独立helper")
-        a = read_state(target)["active"] or (read_state(target)["last"] or {}).get("attempt", {})
+        state = read_state(target)  # 同一次读取的已验证快照，避免active与last来自不同结算时刻。
+        a = state["active"] or (state["last"] or {}).get("attempt", {})
         if a.get("handoff") == "preparing":
             raise UpdateFailure("交接尚未持久化完成，禁止helper执行")
         j["helper_processes"] = own_records(Path(j["helper"]))
         transfer = read_state(target)["active"]
-        if transfer and transfer["id"] == j["attempt"]["id"]:
+        if transfer and transfer["id"] == j["attempt"]["id"]:  # read_state保证非空active为字典，此处先判断transfer真值。
             transfer_attempt(target, j["attempt"], j["helper_processes"][0])
         write_journal(j)
         if recover:
@@ -1366,9 +1426,9 @@ def bootstrap():
         binding = a.get("binding")
         receipt = s.get("committed")
         if (receipt and not (s["active"] and binding) and (not binding or
-                (binding.get("work") == str(transaction_root(target) / receipt["transaction"])
-                 and binding.get("new_sha") == receipt.get("sha256") and binding.get("data_dir") == receipt.get("data_dir")))):
-            if receipt.get("target") != str(target) or digest(target) != receipt.get("sha256"):
+                (binding.get("work") == str(transaction_root(target) / receipt["transaction"])  # read_state已验证非空committed为含transaction的完整凭据字典。
+                 and binding.get("new_sha") == receipt.get("sha256") and binding.get("data_dir") == receipt.get("data_dir")))):  # receipt经read_state完整凭据校验及前置真值判断，支持get。
+            if receipt.get("target") != str(target) or digest(target) != receipt.get("sha256"):  # 非空receipt已通过字典及必要字段校验，支持凭据字段读取。
                 raise UpdateFailure("终态安装凭据与当前主包不符")
             release_data(receipt)
             return None  # 日志及隐藏目录可被清理；有新安装绑定时仍走原有缺日志拦截。
@@ -1384,7 +1444,7 @@ def bootstrap():
             reconcile_sqlite(archived)
             release_data(archived)  # 对归档后的崩溃补做释放；只匹配本事务身份，不解除别人的预约。
             # .bak只由安全逃生发布；已放行旧版的账本可以继续写，不能再拿旧快照摘要否决正常记账。
-        if s["active"] and wait_processes([s["active"]["owner"]], 0):
+        if s["active"] and wait_processes([s["active"]["owner"]], 0):  # read_state保证非空active为字典，短路判断先排除空值。
             settle_attempt(target, s["active"], "failed", "检查或下载进程中断")
         return None
     try:
@@ -1450,7 +1510,7 @@ def bootstrap():
         if j.get("recovery_attempts", 0) >= 3 and not j["new_started"] and digest(target) == j["old_sha"]:
             escape_transaction(j)
             return None  # 当前映像已核实为旧版，直接继续；worker逃生则负责另起旧版。
-        owner = (read_state(target)["active"] or {}).get("owner")
+        owner = (read_state(target)["active"] or {}).get("owner")  # active经read_state验证为字典或None，空值替换为空字典。
         if owner and not wait_processes([owner], 0):
             raise UpdateFailure("事务执行者仍存活")
         settle_attempt(target, j["attempt"], "failed", j.get("error") or "未提交执行者中断")

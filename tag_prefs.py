@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from time import sleep
 from typing import Callable, Iterable
 
 from config import CATEGORY_PREFS_PATH, DEFAULT_TAGS, TAG_PREFS_PATH
@@ -139,7 +140,8 @@ def save_remembered_tags(amount_type: str, tags: tuple[str, ...]) -> bool:
     key = {"支出": "expense", "收入": "income"}.get(amount_type)
     if key is None:
         return False
-    document = _read_tags_document()
+    # JSON对象同时包含标签列表和分组字典，不能按新建分支推断成只有列表值。
+    document: dict[str, object] | None = _read_tags_document()
     if document is None:
         # 不让一次可选记忆写入覆盖损坏文件内尚可人工恢复的常用列表。
         if TAG_PREFS_PATH.exists():
@@ -149,6 +151,20 @@ def save_remembered_tags(amount_type: str, tags: tuple[str, ...]) -> bool:
     remembered[key] = _clean_list(list(tags), f"last_used_tags.{key}")
     document["last_used_tags"] = remembered
     return _write_document(document)
+
+
+def _replace_tag_file(temporary: Path) -> None:
+    """只对短暂的 Windows 替换拒绝有限等待，持续失败仍交给保存入口反馈。"""
+    for attempt in range(3):
+        try:
+            temporary.replace(TAG_PREFS_PATH)
+            return
+        except OSError as error:
+            # 拒绝访问也可能是永久权限问题，最多三次；其他错误不应靠等待掩盖。
+            if getattr(error, "winerror", None) not in (5, 32) or attempt == 2:
+                raise
+            # 仅复用已关闭的完整临时文件，累计等待150毫秒，不重复修改标签内容。
+            sleep((0.05, 0.1)[attempt])
 
 
 def _write_document(document: dict) -> bool:
@@ -164,7 +180,7 @@ def _write_document(document: dict) -> bool:
                                 prefix=".tags-", suffix=".tmp", delete=False) as handle:
             temporary = Path(handle.name)
             json.dump(payload, handle, ensure_ascii=False, indent=2)
-        temporary.replace(TAG_PREFS_PATH)  # 关闭句柄后同目录替换，兼容 Windows 文件占用规则。
+        _replace_tag_file(temporary)  # 关闭句柄后再替换，失败时仍保留原偏好和清理临时文件。
     except OSError as error:
         # 保留原偏好，失败结果交给当前操作反馈，不能冒充已经记住或清除了标签。
         _warn(f"{TAG_PREFS_PATH.name} 写入失败（{error}），本次操作未保存。")

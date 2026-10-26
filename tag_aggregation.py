@@ -184,7 +184,8 @@ def build_month_stats(records: Iterable[StatsRecord], month: str, today: date) -
         totals=totals, previous=before,
         average=average_expense(totals.total_expense, month, today),
         previous_average=average_expense(before.total_expense, previous_month, today),
-        daily=tuple(daily), half_year=tuple((key, *half[key]) for key in months),
+        # 明确三元组长度，不让可变列表展开影响结果结构的类型推断。
+        daily=tuple(daily), half_year=tuple((key, half[key][0], half[key][1]) for key in months),
         largest=largest, record_count=len(selected), skipped_count=skipped,
         future_count=future, months=tuple(sorted(available, reverse=True)),
     )

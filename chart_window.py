@@ -81,7 +81,7 @@ class StatsWindow(ManagedToplevel):
         self.finish_setup()
         if not self.closing:
             self.worker.start()
-            self.poll_job = self.after(40, self._poll_results)
+            self.poll_job = self.after(40, self._poll_results)  # type: ignore[reportArgumentType] # 无参回调经真实Tk验证可用，生命周期包装的可变参数推断过宽。
             self.refresh()
 
     def _label(self, parent, text, size=13, color=INK, bold=False, **kwargs):
@@ -291,20 +291,23 @@ class StatsWindow(ManagedToplevel):
         try:
             generation, result = self.results.get_nowait()
         except Empty:
-            result = None  # 尚未完成时保留加载状态，下一轮再取，不阻塞 GUI。
-        # 切月或刷新后只接收当前请求，旧线程结果不能回填到新月份。
-        if result is not None and generation == self.generation:
-            if isinstance(result, Exception):
-                self._set_error(f"统计失败：{result}")
-            else:
-                self.data = result
-                self._update_cards()
-                self._sync_month_choices(result.months)
-            self.request_render()
-        self.poll_job = self.after(40, self._poll_results)
+            pass  # 尚未完成时保留加载状态，下一轮再取，不阻塞 GUI。
+        else:
+            # 只有成功取数后才使用generation；旧请求仍不能回填到新月份。
+            if result is not None and generation == self.generation:
+                if isinstance(result, Exception):
+                    self._set_error(f"统计失败：{result}")
+                else:
+                    self.data = result
+                    self._update_cards()
+                    self._sync_month_choices(result.months)
+                self.request_render()
+        self.poll_job = self.after(40, self._poll_results)  # type: ignore[reportArgumentType] # 无参回调合法，保持公共生命周期包装及现有调度协议。
 
     def _update_cards(self):
         data = self.data
+        if data is None:
+            return  # 数据未就绪时保留刷新占位，不能访问空结果或显示伪造的零金额。
         values = (data.totals.total_income, data.totals.total_expense,
                   data.totals.total_income - data.totals.total_expense, data.average)
         previous = (data.previous.total_income, data.previous.total_expense,
@@ -342,7 +345,7 @@ class StatsWindow(ManagedToplevel):
             self.after_cancel(self.render_job)
         # 仅合并连续操作，不把 after 宣称为后台绘图；TkAgg 严格在主线程运行。
         revision = self.revision
-        self.render_job = self.after(30, lambda: self._render(revision))
+        self.render_job = self.after(30, lambda: self._render(revision))  # type: ignore[reportArgumentType] # 闭包为合法无参回调，捕获本次版本以丢弃过期绘制。
 
     def _clear_chart(self):
         if self.canvas is not None:
@@ -401,10 +404,13 @@ class StatsWindow(ManagedToplevel):
         try:
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
             from matplotlib.figure import Figure
+            from matplotlib.layout_engine import ConstrainedLayoutEngine
             from matplotlib.font_manager import FontProperties
             from matplotlib.ticker import MaxNLocator
             # TkAgg 按实际控件尺寸重绘，较高 DPI 让字号对应足够像素，而不是拉伸旧位图。
-            self.figure = Figure(figsize=(8, 3.2), dpi=125, facecolor="white", layout="constrained")
+            # 明确布局引擎类型和文字边距，避免从可空的基类返回值推断约束布局参数。
+            self.figure = Figure(figsize=(8, 3.2), dpi=125, facecolor="white",
+                                 layout=ConstrainedLayoutEngine(w_pad=0.12, h_pad=0.12))
             ax = self.figure.add_subplot(111)
             font = FontProperties(family="Microsoft YaHei", size=11)
             ax.set_axisbelow(True)
@@ -423,8 +429,6 @@ class StatsWindow(ManagedToplevel):
             # 字体仅作用于本图，不改全局 rcParams，避免污染其他窗口。
             for tick in [*ax.get_xticklabels(), *ax.get_yticklabels()]:
                 tick.set_fontproperties(font)
-            # 按当前画布重算文字边界；固定比例在缩放后不足以容纳轴标题，容易裁掉字底。
-            self.figure.get_layout_engine().set(w_pad=0.12, h_pad=0.12)
             self.canvas = FigureCanvasTkAgg(self.figure, master=host)
             self.canvas.get_tk_widget().pack(fill="both", expand=True)
             self.canvas.draw_idle()
@@ -470,7 +474,10 @@ class StatsWindow(ManagedToplevel):
                   borderaxespad=0, frameon=False, prop=font)
 
     def _draw_half_year(self, ax, font):
-        values = self.data.half_year
+        data = self.data
+        if data is None:
+            raise RuntimeError("统计数据尚未就绪")  # 交给现有图表失败提示，不把缺失结果画成空白。
+        values = data.half_year
         incomes = [float(income) for _, income, _ in values]
         expenses = [float(expense) for _, _, expense in values]
         ax.bar(range(6), incomes, width=0.52, color=GREEN, label="收入")
