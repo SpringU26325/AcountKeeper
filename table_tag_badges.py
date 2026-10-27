@@ -1,6 +1,6 @@
 """表格标签列的摘要测量与浅蓝余数徽标，只处理显示。
 
-widgets.RecordTableFrame 提供完整标签映射、原生 Treeview、测量字体及 tooltip。
+record_table.RecordTableFrame 提供完整标签映射、原生 Treeview、测量字体及 tooltip。
 tag_layout 同时供原生摘要和 Canvas 绘制使用，避免两套宽度预算得出不同的 N。
 Canvas 只覆盖溢出 cell；搜索和编辑仍读取 ui 持有的 store.records，不能解析摘要还原标签。
 相关验收入口为 _probe/probe_table_visuals.py；真实鼠标与系统 DPI 效果仍需人工确认。
@@ -125,8 +125,9 @@ class TagBadgeRenderer:
                 continue
             box = self.tree.bbox(iid, "tags")
             if not box:
-                # 已无可绘制边界时停止本轮扫描，余下旧槽位由循环后的收尾统一隐藏。
-                break
+                # 表头位置可能命中已滚出视口的上一行；跳过它，继续寻找下方可见行。
+                y += 1  # 单调推进且受视口高度限制，空边界不能截断整轮绘制。
+                continue
             y = max(y + 1, box[1] + box[3])  # 即使边界高度异常也保证前进，避免空闲绘制卡死。
             prefix, rest = tag_layout(self.table.record_tags.get(iid, ()),
                                       box[2] - round(10 * scale), self.table.tag_font, scale)

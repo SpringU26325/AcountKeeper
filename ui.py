@@ -2,7 +2,7 @@
 
 store.records 是完整账本缓存，搜索和编辑从中取值；表格仅持有当前筛选行的展示状态。
 刷新顺序为撤销旧提示/映射/覆盖层、重建 Treeview 行、同步操作按钮、请求徽标重绘。
-摘要及字体测量归 widgets/table_tag_badges，不能反解析显示文本来还原标签或主键。
+摘要及字体测量归 record_table/table_tag_badges，不能反解析显示文本来还原标签或主键。
 表格交互验收入口为 _probe/probe_table_visuals.py；用隔离宿主，避免连接真实账本。
 """
 
@@ -32,7 +32,9 @@ from dialog_lifecycle import ManagedToplevel, _cancel_owned_tasks
 from dialogs import center_dialog_on_parent
 from snail import SnailManager
 from store import Account, AccountStore
-from widgets import InputFrame, RecordTableFrame, ToolbarFrame
+from widgets import InputFrame
+from toolbar_frame import ToolbarFrame
+from record_table import RecordTableFrame
 from update_ui import UpdateFlow, business_action
 
 
