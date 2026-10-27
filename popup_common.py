@@ -5,6 +5,7 @@
 """
 
 from collections.abc import Callable
+import tkinter as tk
 import customtkinter as ctk
 
 
@@ -38,3 +39,23 @@ def anchored_position(anchor: tuple[int, int, int], size: tuple[int, int],
         # 两侧都不够时优先保屏幕边距，可能不再紧贴锚点；绝不靠改变尺寸制造不同组件口径。
         y = above if above >= 8 else max(screen_height - height - 8, 8)
     return x, y
+
+
+def entry_surface(
+    master: ctk.CTkBaseClass,
+    textvariable: tk.StringVar | None = None,
+    placeholder_text: str | None = None,
+) -> tuple[ctk.CTkFrame, ctk.CTkEntry]:
+    """日期、金额、标签及备注共用的输入外框。"""
+    # 外框统一描边；内部输入框和附加按钮不再各画一圈边框，避免控件割裂。
+    surface = ctk.CTkFrame(master, height=40, corner_radius=8, border_width=1,
+                           border_color="#D8E1EA", fg_color="#F8FAFC")
+    surface.columnconfigure(0, weight=1)
+    entry = ctk.CTkEntry(
+        surface, width=1, height=38, corner_radius=0, border_width=0,
+        fg_color="#F8FAFC", text_color="#243447", font=("Microsoft YaHei UI", 12),
+        textvariable=textvariable, placeholder_text=placeholder_text,
+    )
+    # 最小请求宽度不占满网格；内边距避开外框圆角，伸缩空间交给字段外框。
+    entry.grid(row=0, column=0, sticky="ew", padx=(9, 6), pady=1)
+    return surface, entry
