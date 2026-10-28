@@ -8,6 +8,7 @@
 **English summary:** AccountKeeper is a lightweight, open-source desktop app for personal bookkeeping, with local data storage, bill imports, interactive charts, and backups. Version 1.0.0 introduces a new data dashboard and secure uninstallation for a more reliable experience.
 
 🎉 我的第一个独立使用 vibe-coding 开发的记账软件，正式跨入 1.0.0 时代！
+</div>
 
 ## 🆕 v1.0.0 重磅更新
 
