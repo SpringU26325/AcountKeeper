@@ -8,6 +8,7 @@ record_tags 是记录标签来源，accounts.category 仅供历史迁移；常�
 """
 
 import csv
+import re
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,6 +21,15 @@ from time import monotonic
 from typing import Iterable, Iterator
 
 from config import CSV_FIELDS, DB_PATH
+
+
+def _csv_safe_cell(value: object) -> object:
+    text = str(value)
+    # 仅完整的十进制负数（含科学计数）可免转义，-1+2等表达式仍须按公式处理。
+    negative_number = re.fullmatch(r"-(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", text)
+    if text.startswith(("=", "+", "-", "@")) and not negative_number:
+        return "'" + text
+    return value
 
 # 历史标签迁移固定到 2；不能把目标改成 3，否则已迁过的库会再次补 legacy 标签。
 _MULTI_TAG_USER_VERSION = 2
@@ -757,10 +767,20 @@ class AccountStore:
 
         # utf-8-sig 会写入 BOM，目的是让 Excel 双击打开中文 CSV 时不出现乱码。
         # 这里不吞异常：权限不足、磁盘已满等情况交给 UI 层捕获并提示（需求 3.6）。
+        # 配置、导入映射及SQLite辅助文件同样不能被CSV截断；比较身份也覆盖硬链接别名。
+        protected = [self.path] + [self.path.parent / name for name in (
+            "tags.json", "categories.json", "settings.json", "import_mappings.json",
+            *(self.path.name + suffix for suffix in (".bak", "-wal", "-shm", "-journal")),
+        )]
+        for source in protected:
+            try:
+                if save_path.resolve() == source.resolve() or save_path.samefile(source):
+                    raise ValueError("导出目标不能是当前账本数据库或应用数据文件，请选择其他文件。")
+            except FileNotFoundError:
+                continue  # 尚不存在的普通导出目标可新建；其他访问错误必须向上传播。
         with save_path.open("w", newline="", encoding="utf-8-sig") as file:
             writer = csv.writer(file)
             writer.writerow(CSV_FIELDS)
-            # 所有导出单元格统一防公式执行；只改变CSV表示，数据库中的金额和备注保持原值。
-            writer.writerows(tuple("'" + str(value) if str(value).startswith(("=", "+", "-", "@")) else value
-                                   for value in row) for row in rows)
+            # 按完整单元格判断公式；纯负数保持数字表示，数据库原值不作任何修改。
+            writer.writerows(tuple(_csv_safe_cell(value) for value in row) for row in rows)
         return save_path

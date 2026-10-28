@@ -21,6 +21,7 @@ class ToolbarFrame(ctk.CTkFrame):
         import_callback: Callable[[], None] | None = None,
         batches_callback: Callable[[], None] | None = None,
         update_callback: Callable[[], None] | None = None,
+        uninstall_callback: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master, fg_color="transparent")
         self.columnconfigure(0, weight=1)
@@ -46,15 +47,29 @@ class ToolbarFrame(ctk.CTkFrame):
             self._file_callbacks["导入外部账单"] = import_callback
         if batches_callback is not None:
             self._file_callbacks["导入批次"] = batches_callback
-        if update_callback is not None:
-            # 更新入口仍由主窗协调，工具栏不导入网络或事务逻辑。
-            self._file_callbacks["检查更新"] = update_callback
         # 文件入口与日期/标签共用三角及定位；业务仍只通过原有回调执行。
         self.file_menu = FileMenu(heading, tuple(self._file_callbacks), self._run_file_action)
         self.file_menu.configure(fg_color="#E8EEF5")
         for button in (self.file_menu.label_button, self.file_menu.toggle_button):
             button.configure(fg_color="#E8EEF5", hover_color="#DDE7F2", text_color="#475569")
         self.file_menu.grid(row=0, column=2)
+        self._app_callbacks = {}
+        if update_callback is not None:
+            self._app_callbacks["检查更新"] = update_callback
+        if uninstall_callback is not None:
+            self._app_callbacks["卸载 AccountKeeper"] = uninstall_callback
+        self.app_menu = None
+        if self._app_callbacks:
+            ctk.CTkFrame(heading, width=1, height=20, fg_color="#CCD7E3").grid(row=0, column=3, padx=16, pady=6, sticky="ns")  # 显式行内高度，避免默认200px撑大工具栏。
+            self.app_menu = FileMenu(heading, tuple(self._app_callbacks), lambda action: self._app_callbacks[action](), application=True)
+            self.app_menu.grid(row=0, column=4)
+            self.app_menu.configure(fg_color="#E8EEF5")
+            self.app_menu.label_button.configure(fg_color="#E8EEF5", hover_color="#DDE7F2", text_color="#475569")
+        for menu in (self.file_menu, self.app_menu):
+            if menu is not None:
+                for button in (menu.label_button, menu.toggle_button):
+                    if button is not None:
+                        button.configure(command=lambda chosen=menu: self._toggle_menu(chosen))
 
         # 第二行将搜索留在左侧，编辑/删除常驻右侧；只有搜索列吸收多余宽度。
         actions = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
@@ -90,6 +105,12 @@ class ToolbarFrame(ctk.CTkFrame):
     def _run_file_action(self, action: str) -> None:
         # FileMenu已先隐藏并恢复三角，再进入模态业务，重复选择不依赖标题值变化。
         self._file_callbacks[action]()
+
+    def _toggle_menu(self, chosen: FileMenu) -> None:
+        for menu in (self.file_menu, self.app_menu):
+            if menu is not None and menu is not chosen:
+                menu.close()  # 程序调用与鼠标点击都先关闭另一菜单，不能依赖外点事件碰巧互斥。
+        chosen.toggle()
 
     def set_record_actions_enabled(self, enabled: bool) -> None:
         if enabled == self._record_actions_enabled:

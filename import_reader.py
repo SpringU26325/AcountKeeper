@@ -9,8 +9,12 @@ import csv
 from dataclasses import dataclass
 import io
 from pathlib import Path
+from zipfile import ZipFile
 
 MAX_FILE_BYTES = 50 * 1024 * 1024  # 在解析器和整文件解码前限制输入，避免大账单耗尽内存。
+MAX_ROWS = 100_000  # 两种格式均包含说明、表头和中间空行，限制展开后的行数。
+MAX_CELLS = 500_000  # 在业务对象分配前限制单元格数量，不能仅依赖压缩文件大小。
+MAX_XLSX_COLUMNS = 50  # 按列位置计数，防止末列很远的稀疏表在补齐时放大内存。
 
 
 @dataclass(frozen=True)
@@ -61,7 +65,14 @@ def _read_csv(path: Path) -> BillFile:
     reader = csv.reader(io.StringIO(text, newline=""), strict=True)
     rows = []
     next_line = 1
+    cell_count = 0
     for values in reader:
+        # CSV按逻辑记录计行；引号内换行保留，不把单笔备注拆成多行账单。
+        if len(rows) >= MAX_ROWS:
+            raise ValueError("CSV 账单超过 100,000 行上限，请拆分文件后导入。")
+        cell_count += len(values)
+        if cell_count > MAX_CELLS:
+            raise ValueError("CSV 账单超过 500,000 单元格上限，请拆分文件后导入。")
         # 引号内换行会占多条物理行；记录起始行号，不能以交易序号冒充原始行号。
         rows.append(RawRow(next_line, tuple(RawCell(value, "text") for value in values)))
         next_line = reader.line_num + 1
@@ -71,6 +82,10 @@ def _read_csv(path: Path) -> BillFile:
 def _read_xlsx(path: Path, sheet_name: str | None) -> BillFile:
     from openpyxl import load_workbook  # 延迟依赖，普通记账启动不读取 XLSX 或初始化解析器。
 
+    # 共享字符串/样式会在只读模式下预加载；先限制ZIP全部成员的解压总量。
+    with ZipFile(path) as archive:
+        if sum(item.file_size for item in archive.infolist()) > MAX_FILE_BYTES:
+            raise ValueError("Excel 账单解压总大小超过 50 MiB 上限，请拆分文件后导入。")
     # data_only=False 保留公式表达式供后续判定，不能把缓存计算值冒充原始确认值。
     workbook = load_workbook(path, read_only=True, data_only=False)
     try:
@@ -85,15 +100,23 @@ def _read_xlsx(path: Path, sheet_name: str | None) -> BillFile:
         # 外部导出器可能把范围声明写小；按实际 XML 读取，不能静默漏掉范围之外的交易。
         sheet.reset_dimensions()
         # read_only 保留日期类型和单元格格式；不执行公式、不把说明区当平台判断依据。
-        rows = tuple(
-            RawRow(index, tuple(
+        rows = []
+        width = 0
+        for index, cells in enumerate(sheet.iter_rows(), start=1):
+            # 在构造业务单元格及全表补齐前中止，不能读取完毕后才检查规模。
+            if index > MAX_ROWS:
+                raise ValueError("Excel 账单超过 100,000 行上限，请拆分文件后导入。")
+            if len(cells) > MAX_XLSX_COLUMNS:
+                raise ValueError("Excel 账单超过 50 列上限，请精简文件后导入。")
+            width = max(width, len(cells))
+            # 返回结构需按最大宽度补齐，预算必须包括将要生成的空单元格。
+            if index * width > MAX_CELLS:
+                raise ValueError("Excel 账单超过 500,000 单元格上限，请拆分文件后导入。")
+            rows.append(RawRow(index, tuple(
                 RawCell(cell.value, cell.data_type, cell.number_format or "")
                 for cell in cells
-            ))
-            for index, cells in enumerate(sheet.iter_rows(), start=1)
-        )
+            )))
         # 不依赖不可靠的声明宽度；按实际最大列数补齐空单元格，保留列位置和中间空行。
-        width = max((len(row.cells) for row in rows), default=0)
         rows = tuple(
             RawRow(row.row_number, row.cells + (RawCell(None, "n"),) * (width - len(row.cells)))
             for row in rows
@@ -113,5 +136,9 @@ def read_bill_file(path: Path, *, sheet_name: str | None = None) -> BillFile:
             raise ValueError("CSV 没有工作表。")
         return _read_csv(path)
     if path.suffix.casefold() == ".xlsx":
-        return _read_xlsx(path, sheet_name)
+        try:
+            return _read_xlsx(path, sheet_name)
+        except MemoryError as error:
+            # 工作簿共享字符串和样式会预加载；内存不足必须失败，不能伪造部分账单。
+            raise ValueError("读取 Excel 账单时内存不足，请关闭其他程序或拆分文件后重试。") from error
     raise ValueError("本次只支持 CSV 和 XLSX 账单文件。")

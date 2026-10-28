@@ -9,7 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from calendar import monthrange
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, localcontext
+from functools import wraps
 from typing import Iterable
 
 from store import Account
@@ -18,6 +19,16 @@ MULTI_TAG_TOTALS_NOTE = (
     "一条记录有多个标签时会分别计入各项，故各项之和可能大于当期总额；"
     "未分类表示没有打标签的记录。"
 )
+
+
+def _money_precision(method):
+    @wraps(method)
+    def precise(*args, **kwargs):
+        # Decimal上下文按线程隔离；每个入口建立局部精度，不依赖主线程的全局设置。
+        with localcontext() as context:
+            context.prec = max(context.prec, 100)
+            return method(*args, **kwargs)
+    return precise
 
 
 @dataclass(frozen=True)
@@ -35,6 +46,7 @@ class RecordTotals:
     by_tag: dict[str, TagTotals]
 
 
+@_money_precision
 def aggregate_records_by_tag(records: Iterable[Account | StatsRecord]) -> RecordTotals:
     """按完整 tags 聚合当前输入；不按摘要统计，也不在这里筛选日期或排序标签。"""
     total_income = Decimal("0")
@@ -106,6 +118,7 @@ def offset_month(month: str, offset: int) -> str:
     return f"{year:04d}-{remainder + 1:02d}"
 
 
+@_money_precision
 def average_expense(expense: Decimal, month: str, today: date) -> Decimal | None:
     current = today.strftime("%Y-%m")
     if month > current:
@@ -115,6 +128,7 @@ def average_expense(expense: Decimal, month: str, today: date) -> Decimal | None
     return expense / Decimal(days)
 
 
+@_money_precision
 def describe_change(current: Decimal | None, previous: Decimal | None) -> tuple[str, int]:
     """返回环比文字与数值方向，颜色由 UI 决定，负结余以基数绝对值作分母。"""
     if current is None or previous is None:
@@ -130,6 +144,7 @@ def describe_change(current: Decimal | None, previous: Decimal | None) -> tuple[
     return f"{arrow} {percent:.2f}%", direction
 
 
+@_money_precision
 def build_month_stats(records: Iterable[StatsRecord], month: str, today: date) -> MonthStats:
     """仅聚合传入快照；不查库、不接触控件，不修改旧数据。"""
     first = date.fromisoformat(month + "-01")

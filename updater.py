@@ -64,6 +64,12 @@ class UpdateError(Exception):
     """拒绝不可信或不完整的更新候选。"""
 
 
+class _HTTPStatusError(UpdateError):
+    def __init__(self, status, url):
+        super().__init__(f"网络连接失败或接口不可用（HTTP {status}）")  # 显示真实状态，便于区分访问拒绝与资源缺失。
+        self.status, self.url = status, url  # 保留实际响应来源，只有版本列表的404可以解释为未发布。
+
+
 class Cancelled(UpdateError):
     """取消不能被当作可重试的网络故障。"""
 
@@ -245,7 +251,9 @@ class _Budget:
                 raw.connect(address)
                 self.check()
                 # 先登记SSL对象再握手，监督任务才能中断握手／响应头／慢速读取。
-                self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host, do_handshake_on_connect=False)
+                context = ssl.create_default_context()
+                context.set_alpn_protocols(["http/1.1"])  # 与标准HTTPSConnection一致声明HTTP/1.1，避免接口拒绝未声明协议的TLS请求。
+                self.sock = context.wrap_socket(raw, server_hostname=host, do_handshake_on_connect=False)
                 self.sock.settimeout(self.timeout())
                 self.sock.do_handshake()
                 self.check()
@@ -267,7 +275,9 @@ def _stream(url, limit, budget, sink, expected=None, progress=None, start=0, dig
         response = None
         try:
             connection.sock = budget.connect(p.hostname)
-            headers = {"User-Agent": "AccountKeeper", "Accept-Encoding": "identity"}
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                       "Accept": "application/json" if p.path.startswith("/api/") else "*/*",
+                       "Accept-Language": "zh-CN,zh;q=0.9", "Accept-Encoding": "identity"}  # API严格请求JSON；附件仍接收二进制，保持禁用压缩。
             if start:
                 headers["Range"] = f"bytes={start}-"  # 续传只取剩余部分；服务端不回206即视为不支持。
             connection.request("GET", (p.path or "/") + ("?" + p.query if p.query else ""), headers=headers)
@@ -293,7 +303,7 @@ def _stream(url, limit, budget, sink, expected=None, progress=None, start=0, dig
             if 500 <= response.status <= 599:
                 raise OSError("更新源暂时不可用")
             if response.getheader("Content-Encoding", "identity").lower() != "identity":
-                raise UpdateError("HTTP状态或编码不受支持")
+                raise UpdateError(f"网络请求异常：接口返回不支持的内容编码（{response.getheader('Content-Encoding')[:64]}）")
             if response.status == 206 and start:
                 match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)",
                                      (response.getheader("Content-Range") or "").strip())
@@ -307,7 +317,7 @@ def _stream(url, limit, budget, sink, expected=None, progress=None, start=0, dig
                     raise _Restart("服务端忽略 Range")
                 declared_expected = expected
             else:
-                raise UpdateError("HTTP状态或编码不受支持")
+                raise _HTTPStatusError(response.status, url)
             declared = response.getheader("Content-Length")
             if declared is not None and (not declared.isascii() or not declared.isdigit() or int(declared) > limit
                                          or (declared_expected is not None and int(declared) != declared_expected)):
@@ -386,7 +396,17 @@ def _check_updates(current_version, arch, cancel=None):
     releases = []
     with _Budget(cancel) as budget:
         for page in range(1, 4):
-            entries = _json(_fetch(_API + f"?per_page=20&page={page}", 1048576, budget))
+            release_url = _API + f"?per_page=20&page={page}"
+            try:
+                raw = _fetch(release_url, 1048576, budget)
+            except _HTTPStatusError as error:
+                if error.status != 404 or error.url != release_url:
+                    raise  # 附件、重定向落点及其他HTTP错误不能伪装成没有更新。
+                break  # 没有Release或后续分页不存在；保留已读分页的候选，沿用None无更新约定。
+            try:
+                entries = _json(raw)
+            except UpdateError as error:
+                raise UpdateError("网络请求异常：更新接口未返回有效JSON，请稍后重试") from error  # HTML或损坏JSON无法证明已是最新。
             if not isinstance(entries, list):
                 raise UpdateError("Release列表非法")
             releases.extend(entries)

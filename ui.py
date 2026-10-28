@@ -56,6 +56,8 @@ class AccountKeeperApp(ctk.CTk):
         self._calendar_closing = False
         self._calendar_destroyed = False
         self._backup_running = False  # 模态对话框会处理事件，禁止嵌套触发同一次备份。
+        self._uninstall_choice = None
+        self._uninstall_job = None
         self.import_workflow = None  # 延迟加载导入依赖，主页面启动不读取外部账单。
         # store 由外部注入，方便测试时替换成临时数据库，避免测试污染真实账本。
         self.store = store
@@ -130,6 +132,22 @@ class AccountKeeperApp(ctk.CTk):
                     child.destroy()  # 先唤醒重入的其他模态等待；构建中的ManagedToplevel自行延期销毁。
             return  # 保留主窗及解释器，让CTk建窗完成后安全兑现关闭。
         self.snail_manager.stop()
+        if self._uninstall_choice is not None:
+            try:
+                from uninstall import CleanupJob, build_plan
+                if self._uninstall_job is None:
+                    # 更新与业务已完成排空才拍清单；外部执行者就绪前保留主窗以反馈启动失败。
+                    plan = build_plan(Path(sys.executable), DATA_DIR, self._uninstall_choice)
+                    self._uninstall_job = CleanupJob(plan)
+                if not self._uninstall_job.ready():
+                    self.after(50, self.destroy)
+                    return
+            except Exception as error:
+                # 不把卸载失败伪装成成功退出，外部程序尚未接管时给出可见原因。
+                messagebox.showerror("卸载失败", f"删除失败，请重启后手动删除。\n{error}", parent=self)
+                if self._uninstall_job is not None:
+                    self._uninstall_job.abort()
+            self._uninstall_choice = None
         _cancel_owned_tasks(self)  # 根窗退出也清理所属CTk/预创建定时器，避免失效脚本留在解释器中。
         super().destroy()
         self._calendar_destroyed = True
@@ -140,6 +158,10 @@ class AccountKeeperApp(ctk.CTk):
     def check_updates(self):
         if self.update_flow is not None:
             self.update_flow.check()
+
+    def uninstall(self):
+        from uninstall import request_uninstall
+        request_uninstall(self, DATA_DIR)
 
     def prepare_update_exit(self):
         workflow = self.import_workflow
@@ -223,6 +245,7 @@ class AccountKeeperApp(ctk.CTk):
             import_callback=self.import_bill,
             batches_callback=self.show_import_batches,
             update_callback=self.check_updates,
+            uninstall_callback=self.uninstall,
         )
         self.toolbar.pack(fill="x", padx=24, pady=(0, 10))
         self.search_entry = self.toolbar.search_entry
@@ -362,6 +385,10 @@ class AccountKeeperApp(ctk.CTk):
             # 入口只接收有限金额，不能把能解析等同于业务合法。
             if not amount.is_finite():
                 raise ValueError
+            # 比较数值而非输入格式，兼容科学计数及尾随零，拒绝会被入库舍入的金额。
+            if amount != amount.quantize(Decimal("0.01")):
+                messagebox.showerror("输入错误", "金额最多支持两位小数")
+                return
         except (ValueError, InvalidOperation):
             messagebox.showerror("输入错误", "日期格式应为 YYYY-MM-DD，金额必须是数字。")
             return
@@ -581,8 +608,8 @@ class AccountKeeperApp(ctk.CTk):
         save_path = Path(save_path_str)
         try:
             export_path = self.store.export_month_csv(month, save_path)
-        except OSError as error:
-            # 磁盘写满、文件被占用、没有写入权限等都属于 OSError，提示后返回即可。
+        except (OSError, ValueError) as error:
+            # 数据层拒绝覆盖账本与磁盘写入错误均须明确提示，失败时不记忆导出目录。
             messagebox.showerror("导出失败", f"无法写入导出文件：{error}")
             return
 

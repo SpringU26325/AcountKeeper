@@ -580,6 +580,10 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
             # 与新增入口同样拒收非有限数，历史脏值也须先改成有限金额才允许确认。
             if not parsed_amount.is_finite():
                 raise ValueError
+            # 与新增入口按数值判断精度，不因合法文本格式不同而改变入账规则。
+            if parsed_amount != parsed_amount.quantize(Decimal("0.01")):
+                error_var.set("金额最多支持两位小数")
+                return
         except (ValueError, InvalidOperation):
             error_var.set("日期格式应为 YYYY-MM-DD，金额必须是数字。")
             return

@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 
 # 运行与构建共用此字面量；构建只读解析，不导入本模块触发数据目录创建。
-APP_VERSION = "0.1.9"
+APP_VERSION = "1.0.0"
 
 # platformdirs 是第三方库，用于跨平台获取规范的「用户数据目录」。
 # 万一运行环境缺少该依赖，也不能让程序直接崩溃，所以这里做降级处理。

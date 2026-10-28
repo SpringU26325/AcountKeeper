@@ -12,6 +12,7 @@ from ctypes import wintypes
 import tkinter as tk
 
 import customtkinter as ctk
+from PIL import Image, ImageDraw
 
 from dialog_lifecycle import ManagedToplevel, _cancel_owned_tasks
 from popup_common import anchored_position, make_toggle_button
@@ -76,24 +77,34 @@ class FileMenu(ctk.CTkFrame):
     """维护入口、缓存窗和展开状态；动作名由调用方传入，不在这里实现导出/备份。"""
 
     def __init__(self, master: ctk.CTkBaseClass, actions: tuple[str, ...],
-                 command: Callable[[str], None]) -> None:
-        super().__init__(master, width=92, height=32, corner_radius=8, fg_color="#E3EAF2")
+                 command: Callable[[str], None], *, application: bool = False) -> None:
+        super().__init__(master, width=76 if application else 92, height=32, corner_radius=8, fg_color="#E3EAF2")
+        self._application = application
         self._actions, self._command = actions, command
         self._popup: _FileWindow | None = None
         self._open = False  # 会话守卫，不等于缓存窗是否存在；隐藏后窗口仍可复用。
         self._bindings: list[tuple[tk.Misc, str, str, str, str]] = []  # 登记 owner/tag/事件/命令 ID/守卫脚本，收尾两端都清。
         self._target: tuple[int, int, int, int] | None = None
-        # 固定92×32入口，文字和32px三角都可点击，工具栏布局不随选择项变宽。
+        # 文件保留双区域入口；应用使用一个完整按钮，文字与三角不会形成两个点击目标。
         self.grid_propagate(False)
         self.columnconfigure(0, weight=1)
         self.label_button = ctk.CTkButton(
-            self, text="文件", command=self.toggle, width=1, height=30, corner_radius=7,
+            self, text="应用" if application else "文件", command=self.toggle, width=1, height=30, corner_radius=7,
             fg_color="#E3EAF2", hover_color="#D2DEE9", text_color="#243447",
             font=("Microsoft YaHei UI", 11),
         )
-        self.label_button.grid(row=0, column=0, sticky="ew", padx=(1, 0), pady=1)
-        self.toggle_button = make_toggle_button(self, self.toggle, height=30, fg_color="#E3EAF2")
-        self.toggle_button.grid(row=0, column=1, padx=(0, 1), pady=1)
+        self.label_button.grid(row=0, column=0, sticky="ew", padx=1 if application else (1, 0), pady=1)
+        self.toggle_button = None
+        if application:
+            self._triangles = []
+            for points in (((4, 4), (44, 4), (24, 28)), ((4, 28), (44, 28), (24, 4))):
+                raster = Image.new("RGBA", (48, 32))
+                ImageDraw.Draw(raster).polygon(points, fill="#475569")  # 实心三角形不依赖字体，缩放后也不会替换成箭头字形。
+                self._triangles.append(ctk.CTkImage(light_image=raster, dark_image=raster, size=(9, 9)))  # 比例对齐相邻文件入口，保持紧凑实心三角外观。
+            self.label_button.configure(image=self._triangles[0], compound="right")
+        else:
+            self.toggle_button = make_toggle_button(self, self.toggle, height=30, fg_color="#E3EAF2")
+            self.toggle_button.grid(row=0, column=1, padx=(0, 1), pady=1)
         self.bind("<Destroy>", self._on_destroy, add=True)  # CTkFrame用布尔追加绑定，匹配参数类型并保留内部回调。
 
     def _ensure_window(self) -> _FileWindow:
@@ -107,14 +118,20 @@ class FileMenu(ctk.CTkFrame):
         window.transient(self.winfo_toplevel())
         window.configure(fg_color="#F0F4F8")
         window.resizable(False, False)
-        window.title("文件操作")
+        window.title("应用管理" if self._application else "文件操作")
         window.bind("<Configure>", window.round_corners, add="+")
-        # 每项32px、相邻4px行距、上下各10px；高度随实际文件操作数计算。
+        # 每项32px、相邻4px行距；卸载项另留分隔线的垂直空间，防止末行被裁掉。
         card = ctk.CTkFrame(window, corner_radius=8, fg_color="#FFFFFF")
         card.pack(fill="both", expand=True, padx=10, pady=10)
+        if self._application:
+            ctk.CTkLabel(card, text="应用管理", height=24, anchor="w", text_color="#607D8B",
+                         font=("Microsoft YaHei UI", 11)).pack(fill="x", padx=2, pady=(0, 4))
         for index, action in enumerate(self._actions):
+            danger = action == "卸载 AccountKeeper"
+            if danger:
+                ctk.CTkFrame(card, height=1, fg_color="#E0E7EF").pack(fill="x", padx=2, pady=(3, 6))
             # 首/末行盖住卡片上下边缘：外侧角露出灰底，内侧角仍白，避免把卡片画回方形。
-            top = "#F0F4F8" if index == 0 else "#FFFFFF"
+            top = "#F0F4F8" if index == 0 and not self._application else "#FFFFFF"
             bottom = "#F0F4F8" if index == len(self._actions) - 1 else "#FFFFFF"
             corner_colors = (top, top, bottom, bottom)
             ctk.CTkButton(
@@ -122,7 +139,7 @@ class FileMenu(ctk.CTkFrame):
                 corner_radius=8 if index in (0, len(self._actions) - 1) else 6, anchor="w",
                 background_corner_colors=corner_colors,  # type: ignore[reportArgumentType] # 库注解误写为单元素tuple，实际绘制依次读取四角。
                 font=("Microsoft YaHei UI", 11), fg_color="#FFFFFF",
-                hover_color="#D2DEE9", text_color="#455A64",
+                hover_color="#FFF1EE" if danger else "#D2DEE9", text_color="#B84035" if danger else "#455A64",
                 command=lambda chosen=action: self._choose(chosen),  # 钉住本行名称，避免循环闭包全部调用末项。
             ).pack(fill="x", pady=(0, 4 if index < len(self._actions) - 1 else 0))
         window.protocol("WM_DELETE_WINDOW", self.close)
@@ -150,11 +167,12 @@ class FileMenu(ctk.CTkFrame):
             self.close()
             return
         window = self._ensure_window()
+        self.update_idletasks()  # 弹出前先落实按钮布局，绝对坐标不能取自尚未完成缩放的中间位置。
         if window.closing or not self.winfo_exists():
             return  # 构建中的父窗关闭请求已兑现，不能重新显示被销毁的菜单。
         self._open = True
         self._target = None
-        self.toggle_button.configure(text="▲")
+        self._sync_indicator()
         root = self.winfo_toplevel()
         try:
             # 只在开着时监听，不grab；排除整个入口，避免同一次点击关后又开。
@@ -181,12 +199,23 @@ class FileMenu(ctk.CTkFrame):
             return
         scale = ctk.ScalingTracker.get_window_scaling(window)
         logical_height = 20 + 32 * len(self._actions) + 4 * max(0, len(self._actions) - 1)
-        width, height = round(180 * scale), round(logical_height * scale)
-        # winfo坐标与wm_geometry都是物理像素，只把逻辑宽高缩放一次。
-        x, y = anchored_position(
-            (self.winfo_rootx(), self.winfo_rooty(), self.winfo_height()),
-            (width, height), (window.winfo_screenwidth(), window.winfo_screenheight()),
-        )
+        if "卸载 AccountKeeper" in self._actions:
+            logical_height += 10  # 与分隔线1px及上下3/6px留白保持一致。
+        if self._application:
+            logical_height += 28  # 标题24px及下方4px留白，避免应用菜单末项被裁掉。
+        width, height = round((220 if self._application else 180) * scale), round(logical_height * scale)
+        if self._application:
+            button = self.label_button
+            screen_width = window.winfo_screenwidth()
+            # 按单按钮屏幕绝对坐标计算，不把父容器位置或CTk逻辑尺寸混入定位。
+            x = button.winfo_rootx() + button.winfo_width() - width
+            x = max(0, min(x, max(0, screen_width - width)))
+            y = button.winfo_rooty() + button.winfo_height()
+        else:
+            x, y = anchored_position(
+                (self.winfo_rootx(), self.winfo_rooty(), self.winfo_height()),
+                (width, height), (window.winfo_screenwidth(), window.winfo_screenheight()),
+            )
         target = (width, height, x, y)
         if target != self._target:
             self._target = target  # Configure可再次进入，只提交变化的几何避免无限重排。
@@ -239,11 +268,18 @@ class FileMenu(ctk.CTkFrame):
                 pass  # 原生父窗销毁可能先回收命令，仍需继续清理其他绑定。
         self._bindings.clear()
         try:
-            self.toggle_button.configure(text="▼")
+            self._sync_indicator()
             if self._popup is not None and self._popup.winfo_exists():
                 self._popup.withdraw()  # 关闭只隐藏，下一次复用同一控件树。
         except tk.TclError:
             pass  # 外部Destroy已回收子控件时不再设置死按钮或隐藏死窗口。
+
+    def _sync_indicator(self) -> None:
+        # 所有关闭路径共用状态同步，外点、Esc、隐藏和动作选择都恢复朝下三角。
+        if self._application:
+            self.label_button.configure(image=self._triangles[int(self._open)])
+        elif self.toggle_button is not None:
+            self.toggle_button.configure(text="▲" if self._open else "▼")
 
     def _on_destroy(self, event: tk.Event) -> None:
         if event.widget is self:

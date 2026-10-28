@@ -272,7 +272,9 @@ class UpdateFlow:
             self._show("自动检查已暂停", f"连续失败达到3次。\n最近原因：{reason}",
                        [("关闭", self._dismiss), ("仅重试本次", lambda: self.check(retry=True))])
         elif kind == "check" and self.manual:
-            self._show("检查更新", "当前已是最新版本。", [("关闭", self._dismiss)])
+            self._show("检查更新", f"当前已是最新版本 (v{self.version})，无需更新。", [("关闭", self._dismiss)])
+            if self.detail is not None:
+                self.detail.configure(text_color="#2F80ED")  # 无更新属于普通信息，使用蓝色避免与失败警示混淆。
         else:
             self._dismiss()
 
@@ -356,10 +358,15 @@ class UpdateFlow:
 
     def _show(self, title, text, actions, *, progress=False, error=False):
         from dialogs import center_dialog_on_parent
+        from config import RESOURCE_DIR
         self.building = True
         try:
             self._dismiss()
             window = self.window = ManagedToplevel(self.app, fg_color="#F0F4F8")
+            try:
+                window.iconbitmap(str(RESOURCE_DIR / "image" / "app_icon.ico"))
+            except Exception as icon_error:
+                print(f"设置更新窗口图标失败：{icon_error}")  # 图标失败仅诊断，不阻断检查/下载及取消操作。
             window.attributes("-alpha", 0.0)
             window.title("AccountKeeper 更新")
             window.geometry("460x280" if progress else "460x250")
