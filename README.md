@@ -31,9 +31,10 @@
 
 ## 📦 如何下载使用
 
-请前往发布页，下载最新的 `AccountKeeper.exe`，双击即可运行，无需安装 Python。
+请前往发布页，下载最新的 `AccountKeeper.exe`，双击即可运行，无需安装 Python。请保留程序文件名 `AccountKeeper.exe`，以便正常使用自动更新功能。
 
-请保留程序文件名 `AccountKeeper.exe`，以便正常使用自动更新功能。
+### ⚠️ 升级须知（针对老用户）
+如果您当前使用的是 **v0.1.9 或更早版本**，由于早期测试版底层的网络协议存在缺陷，可能无法通过软件内的“检查更新”直接升级。请您**手动下载 v1.0.0** 并覆盖原来的 exe 文件，您的账本数据不会丢失。从 v1.0.0 开始，后续版本均可通过软件内无缝自动更新。
 
 ### 账本在哪里？更新会影响数据吗？
 账本和偏好保存在 Windows 用户本地数据目录（AppData）中，通常位于：`%LOCALAPPDATA%\SpringU26325\AccountKeeper`。可通过软件右上角的“应用 -> 打开数据目录”查看。
@@ -41,22 +42,12 @@
 **账本与程序严格分开存放，更新失败或回退绝不会影响你的账本。** 自动更新也绝不会上传你的任何账目数据。
 
 ## 🐛 已知问题
+- **早期版本更新限制**：v0.1.9 及更早版本的内部更新功能因受 Gitee API 风控影响，已失效。升级至 v1.0.0 需手动下载一次。
 - 大批量密集退款对的导入预览仍可能出现秒级卡顿。
 - 外部账单的识别结果仍需人工核对。
 - 多实例并发修改同一笔记录时，可能存在后保存覆盖先保存的情况（后续版本引入乐观锁解决）。
 
 ## 🛠️ 技术栈
-- Python 3.13
-- CustomTkinter (GUI)
-- SQLite (数据库)
-- Matplotlib (图表)
-- openpyxl (XLSX 读取)
-- platformdirs (数据目录管理)
-
-## 📝 运行源码
-```bash
-pip install -r requirements.txt
-python account_keeper.py## 🛠️ 技术栈
 
 - Python 3.13
 - CustomTkinter (GUI)
@@ -70,7 +61,7 @@ python account_keeper.py## 🛠️ 技术栈
 
 如果你有 Python 环境，也可以克隆本仓库，安装依赖后直接运行：
 
-```
+```bash
 pip install -r requirements.txt
 python account_keeper.py
 ```
