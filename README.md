@@ -1,5 +1,5 @@
 <div align="center">
-  <img width="350" alt="蜗牛气泡框" src="https://github.com/user-attachments/assets/d7d61db3-37e8-42d6-a04c-bd0d46297e28" />
+  <img width="350" alt="蜗牛气泡框" src="./image/snail_for_README.png" />
 
 # AccountKeeper 本地记账软件
 
