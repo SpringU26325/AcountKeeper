@@ -38,6 +38,16 @@ from record_table import RecordTableFrame
 from update_ui import UpdateFlow, business_action
 
 
+def _amount_text(amount: Decimal) -> str:
+    """展示层补正号：收入显式 +，支出沿用数据层的负号。
+
+    数据库里的金额约定不变（正数=收入、负数=支出），这里只影响表格显示文本；
+    正号同时给色觉障碍用户提供第二重收支线索（#78）。
+    """
+    text = f"{amount:.2f}"
+    return f"+{text}" if amount > 0 else text
+
+
 class AccountKeeperApp(ctk.CTk):
     """协调收支录入、筛选和编辑；子控件管理自身状态，持久化交给注入的 store。"""
 
@@ -317,6 +327,8 @@ class AccountKeeperApp(ctk.CTk):
             if keyword and not matches:
                 continue
             # ID 不再显示为列，但 iid 仍保存主键，编辑/删除继续按同一个标识定位。
+            # 金额覆盖层按 iid 取符号，登记原始 Decimal 而不是解析展示文本。
+            self.table_frame.set_record_amount(str(record.record_id), record.amount)
             self.tree.insert(
                 "",
                 "end",
@@ -324,7 +336,7 @@ class AccountKeeperApp(ctk.CTk):
                 tags=("stripe",) if visible_row % 2 else (),
                 values=(
                     record.record_date,
-                    f"{record.amount:.2f}",
+                    _amount_text(record.amount),
                     # 插入前登记 iid → 完整 tuple，返回值仅作摘要；tooltip/徽标也不能从摘要反解析。
                     self.table_frame.set_record_tags(str(record.record_id), record.tags),
                     record.note,
@@ -334,7 +346,7 @@ class AccountKeeperApp(ctk.CTk):
 
         self._sync_record_actions()  # 删除并重建后原选择已失效，不能保留上一轮的按钮可用状态。
 
-        self.table_frame.tag_badges.request()  # 插入完成后再测量可见行，避免逐行触发布局。
+        self.table_frame.request_overlays()  # 插入完成后再测量可见行，避免逐行触发布局。
 
     def _selected_record_id(self) -> int | None:
         """只认当前仍存在的选中行 iid，不按可变行序或单元格文本定位记录。"""
@@ -580,8 +592,8 @@ class AccountKeeperApp(ctk.CTk):
     @business_action
     def export_csv(self) -> None:
         # 月份由月历弹窗点选（issues #3.2，不再手输），用户取消时返回 None。
-        # 第三个实参 prompt 已删：弹窗里不再有说明文字，标题栏 + 月历本身已自解释。
-        month = dialogs.ask_month(self, "导出账单")
+        # 锚点取本次点中的「导出 CSV」菜单项，弹窗贴着入口弹出（#60）。
+        month = dialogs.ask_month(self, "导出账单", anchor=self.toolbar.export_anchor())
         if month is None:
             return
 
@@ -636,33 +648,6 @@ class AccountKeeperApp(ctk.CTk):
             window.deiconify()
             window.lift()
             window.focus_set()
-
-    def ask_month(
-        self,
-        title: str,
-        initial_month: str | None = None,
-        anchor: tk.Misc | None = None,
-    ) -> str | None:
-        """保留旧接口，实际对话框由 dialogs 模块负责。
-
-        月份选择仍经dialogs转发；本层直接引用calendar_picker仅用于启动预创建及退出清理，
-        不在业务回调中另写一套选择逻辑。
-
-        Args:
-            title: 窗口标题栏文字，带语境（如「导出账单」）。
-            initial_month: 预选月份（YYYY-MM），同时决定初始展示的年份；
-                不传或字符串不合法时定位到今天所在月份。
-            anchor: 锚点控件（触发月份选择的按钮）：弹窗贴它的左下角弹出，
-                不传则屏幕居中；导出入口目前不传锚点。
-        """
-        # 可选项一律关键字透传：dialogs.ask_month 的形参顺序将来若有调整，
-        # 这里不会静默错位（例如把 initial_month 当 anchor 传下去）。
-        return dialogs.ask_month(
-            self,
-            title,
-            initial_month=initial_month,
-            anchor=anchor,
-        )
 
     def ask_edit_record(
         self,

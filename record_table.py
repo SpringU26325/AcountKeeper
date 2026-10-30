@@ -1,20 +1,23 @@
-"""账目表格、完整标签映射与悬停提示，只管理表现层状态。
+"""账目表格、完整标签映射、金额着色与悬停提示，只管理表现层状态。
 
 原生摘要与徽标共用 table_tag_badges.tag_layout，不能解析摘要还原业务数据。
-表格先创建 tooltip，再创建引用它的徽标层；任务和绑定由各自控制器清理。
-验收入口为 _probe/probe_table_visuals.py 和 _probe/probe_main_layout.py。
+金额列由 table_amount_colors 覆盖着色，行底色与原生单元格逐像素对齐。
+表格先创建 tooltip，再创建引用它的徽标层和金额层；任务和绑定由各自控制器清理。
+验收入口为 _probe/probe_table_visuals.py、_probe/probe_amount_colors_78.py 和 _probe/probe_main_layout.py。
 """
 
 from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from decimal import Decimal
 import tkinter as tk
 from typing import Callable
 from tkinter import ttk, font as tkfont
 
 import customtkinter as ctk
 
+from table_amount_colors import AmountColorRenderer
 from table_tag_badges import TagBadgeRenderer, tag_layout
 
 
@@ -75,6 +78,8 @@ class RecordTableFrame(ctk.CTkFrame):
         )
         # 仅映射当前插入行的 iid→完整标签，值来自 store 缓存；筛选重建时清空，不解析 cell 文本。
         self.record_tags: dict[str, tuple[str, ...]] = {}
+        # 金额着色按 iid 取原始 Decimal：符号来自数据层，不解析展示文本里的 + / -。
+        self.record_amounts: dict[str, Decimal] = {}
         self.tree.tag_configure("stripe", background="#F7FAFD")
         # show="headings" 表示隐藏默认的首列树形图标，只显示自定义表头。
         headings = (
@@ -100,7 +105,8 @@ class RecordTableFrame(ctk.CTkFrame):
         # 先建 tooltip 再建引用它的徽标层；滚动通知同时负责隐藏提示、同步滚动条和重绘覆盖层。
         self.tag_tooltip = TreeviewTagTooltip(self, scrollbar)
         self.tag_badges = TagBadgeRenderer(self, edit_callback)
-        self.tree.configure(yscrollcommand=self.tag_tooltip.scrolled)
+        self.amount_colors = AmountColorRenderer(self, edit_callback)
+        self.tree.configure(yscrollcommand=self._on_scroll)
         self.tree.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
         # 双击保留为快捷入口，常驻编辑按钮让新用户也能发现此功能。
@@ -114,10 +120,22 @@ class RecordTableFrame(ctk.CTkFrame):
         self.selection_label.configure(
             text=f"已选中记录 ID：{record_id}" if record_id is not None else "请选择一条记录")
 
+    def _on_scroll(self, first, last) -> None:
+        # 滚动时两类覆盖层的位置全部失效；提示/滚动条归 tooltip，金额层只补一次重绘请求。
+        self.tag_tooltip.scrolled(first, last)
+        self.amount_colors.request()
+
+    def request_overlays(self) -> None:
+        """插入/刷新完成后统一请求两类覆盖层，避免调用方漏掉其中一层。"""
+        self.tag_badges.request()
+        self.amount_colors.request()
+
     def _style_table(self) -> None:
         scale = self._get_widget_scaling()
         # CTk使用逻辑像素，Tk负字号使用物理像素，避免表格被再次按系统点数放大。
         font = ("Microsoft YaHei UI", -max(1, round(12 * scale)))
+        # 金额覆盖层直接复用原生字体描述符，字体不同会立刻表现为重影或宽度不一致。
+        self.cell_font = font
         # 中英文字宽必须按原生行的同一字号测量，否则最大 N 与 Canvas 实际占宽会不一致。
         self.tag_font.configure(family=font[0], size=font[1])
         style = ttk.Style(self)
@@ -136,6 +154,12 @@ class RecordTableFrame(ctk.CTkFrame):
             self._style_table()  # 动态缩放必须同步测量字体，不能只放大CTk外框。
             if hasattr(self, "tag_tooltip"):
                 self.tag_tooltip._layout()
+            if hasattr(self, "amount_colors"):
+                self.amount_colors.request()  # 字号与行高都变了，旧覆盖层必须按新 bbox 重画。
+
+    def set_record_amount(self, iid: str, amount: Decimal) -> None:
+        """登记原始金额供着色层取符号；展示文本仍由 ui 生成，不在这里格式化。"""
+        self.record_amounts[iid] = amount
 
     def set_record_tags(self, iid: str, tags: tuple[str, ...]) -> str:
         """保存完整标签并返回插入用摘要；列宽变化时也经此入口重新测量。"""
@@ -149,6 +173,9 @@ class RecordTableFrame(ctk.CTkFrame):
         # 此入口只清表现层会话；Treeview 行仍由 ui 删除，账本缓存仍归 store 管理。
         self.tag_tooltip.clear()
         self.tag_badges.clear()  # 重建前隐藏旧Canvas，不能让同iid短暂显示上一轮内容。
+        self.amount_colors.clear()
+        # 金额映射与标签映射同批失效：复用 iid 时不能把上一轮的符号带进新行。
+        self.record_amounts.clear()
 
 
 def _tooltip_work_area(root: tk.Misc) -> tuple[int, int, int, int] | None:

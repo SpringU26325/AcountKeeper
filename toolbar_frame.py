@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tkinter as tk
 from typing import Callable
 
 import customtkinter as ctk
@@ -105,6 +106,25 @@ class ToolbarFrame(ctk.CTkFrame):
     def _run_file_action(self, action: str) -> None:
         # FileMenu已先隐藏并恢复三角，再进入模态业务，重复选择不依赖标题值变化。
         self._file_callbacks[action]()
+
+    def export_anchor(self) -> tk.Misc:
+        """导出月份弹窗的锚点：优先刚点中的「导出 CSV」菜单项，坐标不可用时退回「文件」入口。
+
+        菜单关闭只是 withdraw，缓存窗口与菜单项都没销毁，绝对坐标仍可读取；若读到
+        尚未布局的尺寸或屏幕外坐标（缩放切换、父窗重建等），退回入口按钮保证贴靠不失效。
+        """
+        item = self.file_menu.last_action_widget
+        if item is not None:
+            try:
+                width, height = item.winfo_width(), item.winfo_height()
+                x, y = item.winfo_rootx(), item.winfo_rooty()
+                if (item.winfo_exists() and width > 1 and height > 1
+                        and 0 <= x < item.winfo_screenwidth()
+                        and 0 <= y < item.winfo_screenheight()):
+                    return item
+            except tk.TclError:
+                pass  # 菜单项可能已随父窗销毁，退回入口按钮继续工作。
+        return self.file_menu.label_button
 
     def _toggle_menu(self, chosen: FileMenu) -> None:
         for menu in (self.file_menu, self.app_menu):

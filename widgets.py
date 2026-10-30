@@ -13,4 +13,5 @@ from record_table import (
     summarize_tags as summarize_tags,
     tag_layout as tag_layout,
 )
+from table_amount_colors import AmountColorRenderer as AmountColorRenderer
 from toolbar_frame import ToolbarFrame as ToolbarFrame

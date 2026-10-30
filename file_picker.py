@@ -82,6 +82,8 @@ class FileMenu(ctk.CTkFrame):
         self._application = application
         self._actions, self._command = actions, command
         self._popup: _FileWindow | None = None
+        # 最近一次被点中的菜单项控件：菜单隐藏后窗口仍缓存未销毁，弹窗可拿它当锚点（#60）。
+        self.last_action_widget: tk.Misc | None = None
         self._open = False  # 会话守卫，不等于缓存窗是否存在；隐藏后窗口仍可复用。
         self._bindings: list[tuple[tk.Misc, str, str, str, str]] = []  # 登记 owner/tag/事件/命令 ID/守卫脚本，收尾两端都清。
         self._target: tuple[int, int, int, int] | None = None
@@ -134,14 +136,16 @@ class FileMenu(ctk.CTkFrame):
             top = "#F0F4F8" if index == 0 and not self._application else "#FFFFFF"
             bottom = "#F0F4F8" if index == len(self._actions) - 1 else "#FFFFFF"
             corner_colors = (top, top, bottom, bottom)
-            ctk.CTkButton(
+            item = ctk.CTkButton(
                 card, text=action, height=32, width=1,
                 corner_radius=8 if index in (0, len(self._actions) - 1) else 6, anchor="w",
                 background_corner_colors=corner_colors,  # type: ignore[reportArgumentType] # 库注解误写为单元素tuple，实际绘制依次读取四角。
                 font=("Microsoft YaHei UI", 11), fg_color="#FFFFFF",
                 hover_color="#FFF1EE" if danger else "#D2DEE9", text_color="#B84035" if danger else "#455A64",
-                command=lambda chosen=action: self._choose(chosen),  # 钉住本行名称，避免循环闭包全部调用末项。
-            ).pack(fill="x", pady=(0, 4 if index < len(self._actions) - 1 else 0))
+            )
+            # 回调钉住本行名称与按钮自身：既避免循环闭包全部调用末项，也让调用方拿得到触发项坐标。
+            item.configure(command=lambda chosen=action, widget=item: self._choose(chosen, widget))
+            item.pack(fill="x", pady=(0, 4 if index < len(self._actions) - 1 else 0))
         window.protocol("WM_DELETE_WINDOW", self.close)
         window.finish_setup()
         return window
@@ -249,9 +253,10 @@ class FileMenu(ctk.CTkFrame):
         if event.widget is self.winfo_toplevel():
             self.close()  # 主窗最小化或隐藏时菜单不能独自留在屏幕上。
 
-    def _choose(self, action: str) -> None:
+    def _choose(self, action: str, widget: tk.Misc | None = None) -> None:
         if not self._open:
             return  # 关闭后迟到的按钮事件不能重复执行导出或备份。
+        self.last_action_widget = widget  # 关闭前记下触发项，业务弹窗才能贴它定位。
         self.close()
         self._command(action)  # 回调可能打开模态对话框，必须在隐藏和解绑之后调用。
 
