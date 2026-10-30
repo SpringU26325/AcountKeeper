@@ -31,6 +31,13 @@ class AmountColorRenderer:
         # 每项保存（注册控件，事件，绑定 ID），精确解绑才能保留 CTk 和其他订阅者。
         self.bindings = []
         self.idle_job: str | None = None  # 合并绘制任务归 tree 注册，由 clear/destroy 取消。
+        # 渲染期间/排队期间又收到请求时置脏：最后一次几何变化不能被合并丢弃，否则会漏画底部行。
+        self._pending = False
+        # 新露出的行可能还没完成布局（bbox 为空），有限次延迟补画，避免底部行永久漏色。
+        self._retries = 0
+        self._retry_job: str | None = None  # 延迟补画任务，clear/destroy 必须取消，不能留到退出后。
+        # 布局可能滞后于事件：每次绘制后再做一次校验绘制，防止用旧高度画完后不再有事件而漏行。
+        self._verify_job: str | None = None
         self.closed = False  # 永久退出标记；普通刷新只 clear，之后仍可 request。
         for sequence, callback in (("<<TreeviewSelect>>", self.request),
                                    ("<Configure>", self.request),
@@ -40,11 +47,25 @@ class AmountColorRenderer:
 
     def request(self, _event=None) -> None:
         # ui 插入完成、滚动、选中和列宽变化都汇入这个重绘入口，一批通知只重绘一次。
-        if not self.closed and self.idle_job is None:
-            self.idle_job = self.tree.after_idle(self.render)
+        if self.closed:
+            return
+        if self.idle_job is not None:
+            # 已排队或正在绘制：只置脏位，等本轮结束后补画一次，不能直接丢弃这次请求。
+            self._pending = True
+            return
+        self.idle_job = self.tree.after_idle(self.render)
 
     def clear(self) -> None:
         """取消待绘制任务并隐藏槽位，保留控件与绑定供下一轮记录复用。"""
+        self._pending = False  # 刷新会重建映射，上一轮遗留的补画请求不能跨数据生效。
+        for slot in ("_retry_job", "_verify_job"):
+            job = getattr(self, slot)
+            if job is not None:
+                setattr(self, slot, None)
+                try:
+                    self.tree.after_cancel(job)
+                except tk.TclError:
+                    pass  # 父窗已取消所属任务时重复取消不抛错。
         if self.idle_job is not None:
             job, self.idle_job = self.idle_job, None
             try:
@@ -102,13 +123,15 @@ class AmountColorRenderer:
         self.tree.event_generate("<MouseWheel>", x=point.x, y=point.y, delta=event.delta, state=event.state)
         return "break"  # 已让原生 Treeview 处理滚轮，阻止宿主再处理一次。
 
-    def render(self) -> None:
+    def render(self, verify: bool = False) -> None:
         # 消耗便条时先释放句柄；未映射就跳过，后续显示/布局流程需重新 request。
         self.idle_job = None
         if self.closed or not self.tree.winfo_viewable():
+            self._pending = False  # 隐藏期间不补画，避免 after_idle 自循环；显现时 Configure 会再请求。
             return
         # y 扫描视口，index 只计需要着色的 cell；池大小不随账本总记录数增长。
         height, index, y = self.tree.winfo_height(), 0, 0
+        retry = False  # 本行命中记录但还没有 bbox：说明表格尚未完成本轮布局，结束后补画一次。
         while y < height:
             iid = self.tree.identify_row(y)
             if not iid:
@@ -116,10 +139,13 @@ class AmountColorRenderer:
                 continue
             box = self.tree.bbox(iid, "amount")
             if not box:
-                # 表头位置可能命中已滚出视口的上一行；跳过它，继续寻找下方可见行。
+                # 新露出的行在布局完成前 bbox 为空；跳过它，但要安排一次延迟补画。
+                retry = True
                 y += 1
                 continue
-            y = max(y + 1, box[1] + box[3])  # 即使边界高度异常也保证前进，避免空闲绘制卡死。
+            # 步进必须越过 cell 底边再 +1：identify_row 在边界像素上会再次返回上一行，
+            # 只加行高会让每行被画两次，槽位池被腰斩后从中间行开始漏色（#78 回归）。
+            y = max(y + 1, box[1] + box[3] + 1)
             amount = self.table.record_amounts.get(iid)
             if amount is None:
                 # 未登记金额的行（隔离宿主直接插入）保留原生文字，不猜颜色也不遮住内容。
@@ -147,6 +173,36 @@ class AmountColorRenderer:
             self._unbind(canvas)
             canvas.destroy()
         del self.canvases[limit:]
+        if self._pending:
+            # 本轮绘制期间又来了几何/数据通知：用最新 bbox 再画一轮，保证底部新露出的行不掉队。
+            self._pending = False
+            self.request()
+        elif retry and self._retries < 2:
+            # 表格还没为最新高度铺好行：稍后再扫一次，最多两次，避免无限自激。
+            self._retries += 1
+            self._retry_job = self.tree.after(30, self._retry_render)
+        else:
+            self._retries = 0
+        if not verify and (retry or index < len(self.canvases)):
+            # 只有出现“行没画完”或“槽位被撤下”时才补校验：普通绘制不再增加额外重绘。
+            # 事件触发的高度可能尚未落到控件上，校验轮用最新 bbox 再画一次即可收敛。
+            self._schedule_verify()
+
+    def _schedule_verify(self) -> None:
+        if self._verify_job is not None:
+            try:
+                self.tree.after_cancel(self._verify_job)
+            except tk.TclError:
+                pass  # 父窗已回收任务时重复取消不抛错。
+        self._verify_job = self.tree.after(60, self._verify_render)
+
+    def _verify_render(self) -> None:
+        self._verify_job = None
+        self.render(verify=True)
+
+    def _retry_render(self) -> None:
+        self._retry_job = None
+        self.request()
 
     @staticmethod
     def _color(amount: Decimal) -> str:

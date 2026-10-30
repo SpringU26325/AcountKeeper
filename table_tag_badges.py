@@ -128,7 +128,9 @@ class TagBadgeRenderer:
                 # 表头位置可能命中已滚出视口的上一行；跳过它，继续寻找下方可见行。
                 y += 1  # 单调推进且受视口高度限制，空边界不能截断整轮绘制。
                 continue
-            y = max(y + 1, box[1] + box[3])  # 即使边界高度异常也保证前进，避免空闲绘制卡死。
+            # 步进必须越过 cell 底边再 +1：identify_row 在边界像素上会再次返回上一行，
+            # 只加行高会让同一行占用两个槽位，视口内溢出行一多就会从底部开始漏画徽标。
+            y = max(y + 1, box[1] + box[3] + 1)
             prefix, rest = tag_layout(self.table.record_tags.get(iid, ()),
                                       box[2] - round(10 * scale), self.table.tag_font, scale)
             if not rest or box[0] >= self.tree.winfo_width():
