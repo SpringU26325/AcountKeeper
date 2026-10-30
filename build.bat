@@ -1,19 +1,20 @@
 @echo off
-:: 切换到 UTF-8 编码，防止中文乱码导致 cmd 解析出错
+:: Keep this file ASCII-only. cmd reads batch files in 512-character windows but
+:: advances the file pointer by bytes, so non-ASCII text makes the two drift and
+:: later lines get cut mid-character. Chinese output lives in release/build_release.py.
+:: Usage: run .\build.bat in the PyCharm terminal, or double-click this file.
 chcp 65001 >nul
-:: AccountKeeper 自动打包脚本
-:: 使用方式：在 PyCharm 终端里输入 .\build.bat 运行，或者直接双击本文件
 
 echo ==========================================
-echo   开始打包 AccountKeeper
+echo   Building AccountKeeper
 echo ==========================================
 
-:: 版本与构建参数统一交给 Python；失败时原样返回，不输出成功提示。
+:: Version and build arguments are owned by Python; failures pass through unchanged.
 "%~dp0.venv\Scripts\python.exe" -B -X utf8 "%~dp0release\build_release.py" %*
 if not "%errorlevel%"=="0" exit /b %errorlevel%
 
 echo ==========================================
-echo   打包完成！exe 位于 release/_staging/ 文件夹（包含 AccountKeeper.exe 和 update_helper.exe）
-echo   请前往 Gitee 上传附件，拿取 URL 后运行 release/sign_release.py 进行签名。
+echo   Done. AccountKeeper.exe and update_helper.exe are in release/_staging/
+echo   Upload them to Gitee, copy the URL, then run release\sign_release.py
 echo ==========================================
 pause

@@ -191,7 +191,7 @@
 - `settings` 模块自身只允许在控制台打印警告，不得引入任何 UI 依赖（不 import customtkinter）。
 
 #### 读取与写入时机
-- **启动**：`account_keeper.py` 的 `main()` 调用 `settings.get_last_export_dir()`，把拿到的目录交给 `AccountKeeperApp`（`last_export_dir` 参数）。启动过程**不弹任何提示框**。
+- **启动**：`account_keeper.py` 的 `main()` 调用 `settings.get_last_export_dir()`，把拿到的目录交给 `AccountKeeperApp`（`last_export_dir` 参数）。读取该配置的流程**不弹任何提示框**（打包版文件名校验失败时的阻断提示不在此列，见更新章节「文件名校验」）。
 - **导出时**：`ui.export_csv` 打开「另存为」对话框时传 `initialdir=str(self.last_export_dir)`（见 3.6）。
 - **导出成功后**：把用户实际选择的目录写回 `settings.json` 的 `last_export_dir`，并同步更新内存中的 `self.last_export_dir`；写回失败只在控制台警告。
 - **用户取消「另存为」**：不写配置。
@@ -491,6 +491,7 @@ CREATE INDEX IF NOT EXISTS idx_record_tags_tag ON record_tags(tag);   -- 支持�
 - **签名口径**：v1 只做自签名清单校验，不包含代码签名证书。
 - **渠道与替换边界**：只推 stable、客户端只接受 stable、不出现预发布字样；主 exe 文件名固定、不带版本号（版本号置于程序内部与发布标签）；仅支持同卷替换，不支持异卷。
 - **固定标识**：v1 沿用 AccountKeeper；主程序固定名为 AccountKeeper.exe，数据目录和包标识保持现有名称。
+- **文件名校验**：打包版在入口最先校验自身文件名，非 AccountKeeper.exe（忽略大小写）时弹系统级阻断提示「为了确保自动更新正常，请将程序重命名为 AccountKeeper.exe 后再运行。」并直接退出，不进入恢复派发、数据层、UI 或更新初始化；源码运行不受该限制。
 - **清单验证**：使用内置公钥进行 Ed25519 验签；下载失败或中断清理未完成文件，v1 不支持断点续传。
 - **检查入口**：恢复完成且主窗可用后延迟 2 秒后台检查，仅发现新版本弹窗；工具栏独立“应用”菜单提供“检查更新”，手动检查无更新时提示当前已是最新版本，源码运行提示不支持自动更新。更新弹窗使用应用图标，图标加载失败仅记录诊断，不阻断检查、下载或取消。
 - **无更新提示**：固定 Release 列表 API 返回 404、列表为空或无更高稳定版本时，沿用无更新结果；后续分页 404 保留已读候选。手动检查以蓝色提示“当前已是最新版本 (v当前版本)，无需更新。”；断网、500、格式损坏及更新附件 404 仍报错，不把检查失败当作已是最新。

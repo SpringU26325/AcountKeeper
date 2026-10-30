@@ -4,9 +4,28 @@
 恢复前只允许标准库与无导入副作用的helper接口，业务依赖在派发后加载。
 """
 
+import ctypes
+import os
 import sys
 from pathlib import Path
 from update_helper import bootstrap, native_notice, register_data
+
+
+def _enforce_exe_name() -> None:
+    """打包后强制文件名为 AccountKeeper.exe：自动更新按固定名替换，改名须在建窗前拦下。"""
+    if not getattr(sys, "frozen", False) or sys.platform != "win32":
+        return  # 源码运行、探针宿主与非 Windows 一律放行，开发环境不受文件名约束。
+    if os.path.basename(sys.executable).lower() == "accountkeeper.exe":
+        return  # 忽略大小写：资源管理器与快捷方式可能改出不同大小写形式。
+    # 这里早于 bootstrap：改名后 update_helper 的路径校验会抛异常且没有可操作指引，
+    # 先弹硬性阻断提示再退出。MB_ICONERROR 表明不可继续，MB_TOPMOST 保证无主窗时不被遮挡。
+    ctypes.windll.user32.MessageBoxW(
+        None,
+        "为了确保自动更新正常，请将程序重命名为 AccountKeeper.exe 后再运行。",
+        "AccountKeeper",
+        0x00000010 | 0x00040000,
+    )
+    sys.exit(1)
 
 
 def _run_app(context) -> None:
@@ -99,6 +118,7 @@ def _run_app(context) -> None:
 
 
 def main() -> None:
+    _enforce_exe_name()  # 最早执行：改名后不得进入任何 UI、数据或更新初始化。
     context = None  # bootstrap自身失败时也有明确的异常处理上下文。
     try:
         context = bootstrap()
@@ -108,7 +128,10 @@ def main() -> None:
         if context:
             context.failed(error)
         else:
-            native_notice(f"启动或恢复未完成，禁止打开账本：{error}")
+            # 程序被重命名时 update_helper 会拒绝启动；只补一句可执行指引，不改校验逻辑（冻结层）。
+            hint = ("\n如程序被重命名，请把文件名改回 AccountKeeper.exe 后重试。"
+                    if "AccountKeeper.exe" in str(error) else "")
+            native_notice(f"启动或恢复未完成，禁止打开账本：{error}{hint}")
 
 
 if __name__ == "__main__":
