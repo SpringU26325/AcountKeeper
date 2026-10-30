@@ -161,16 +161,24 @@ class InputFrame(ctk.CTkFrame):
 
     def set_remembered_tags(self, tags: tuple[str, ...]) -> None:
         self.tag_chips.set_tags(tags)
-        self.tag_memory_hint.configure(text="沿用上次" if tags else "")
+        self._set_tag_hint("沿用上次" if tags else "")
         self._sync_tag_controls()
+
+    def _set_tag_hint(self, text: str) -> None:
+        """提示文案没变就不 configure：CTk 每次 configure 都会触发一次重绘。"""
+        if self.tag_memory_hint.cget("text") != text:
+            self.tag_memory_hint.configure(text=text)
 
     def _sync_tag_controls(self) -> None:
         self._last_tag_text = self.tag_chips.tag_entry.get()
         populated = bool(self.tag_chips.get_tags() or self._last_tag_text)
-        self.clear_tags_button.configure(state="normal" if populated else "disabled")
+        state = "normal" if populated else "disabled"
+        # 状态没变时跳过 configure，避免连续添加时每笔都白重绘一次按钮。
+        if self.clear_tags_button.cget("state") != state:
+            self.clear_tags_button.configure(state=state)
 
     def _tag_input_changed(self) -> None:
-        self.tag_memory_hint.configure(text="")
+        self._set_tag_hint("")
         self._sync_tag_controls()
 
     def _tag_entry_changed(self, _event: tk.Event | None = None) -> None:

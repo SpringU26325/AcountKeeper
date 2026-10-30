@@ -140,7 +140,8 @@ class TagBadgeRenderer:
             index += 1
             selected = iid in self.tree.selection()
             # 覆盖层须复现原生行的选中/条纹底色，否则标签列会看起来像未选中。
-            background = "#D7E9FC" if selected else ("#F7FAFD" if "stripe" in self.tree.item(iid, "tags") else "#FFFFFF")
+            # 条纹 tag 已拆成两色且会全局换色，颜色只能问表格，不能按 tag 名猜（#19）。
+            background = "#D7E9FC" if selected else self.table.row_background(iid)
             canvas.configure(background=background)
             edge = 1 if box[2] > 2 else 0  # 极窄列不能把覆盖层移到cell之外，否则无法悬停。
             canvas.place(x=box[0] + edge, y=box[1], width=max(1, box[2] - edge * 2), height=box[3])

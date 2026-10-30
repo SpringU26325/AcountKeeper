@@ -8,15 +8,21 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+import threading
 from time import sleep
 from typing import Callable, Iterable
 
 from config import CATEGORY_PREFS_PATH, DEFAULT_TAGS, TAG_PREFS_PATH
 
 _SCHEMA_VERSION = 1
+
+# 收支方向与 tags.json 字段名的唯一映射；未登记的方向一律拒绝，避免跨方向串写。
+_DIRECTION_KEYS = {"支出": "expense", "收入": "income"}
+_KEY_DIRECTIONS = {key: direction for direction, key in _DIRECTION_KEYS.items()}
 
 
 def _warn(message: str) -> None:
@@ -129,21 +135,26 @@ def _remembered_tags(document: dict) -> dict[str, list[str]]:
 
 def load_remembered_tags(amount_type: str) -> tuple[str, ...]:
     """读取新增方向的完整标签；缺失或损坏均返回空元组，不修写原文件。"""
-    key = {"支出": "expense", "收入": "income"}.get(amount_type)
+    key = _DIRECTION_KEYS.get(amount_type)
     document = _read_tags_document()
     # 未知方向绝不能被当成默认支出，避免调用方错误造成跨方向回填。
     return tuple(_remembered_tags(document).get(key, ())) if document and key else ()
 
 
 def save_remembered_tags(amount_type: str, tags: tuple[str, ...]) -> bool:
-    """只更新指定方向；空元组代表用户明确取消该方向的默认记忆。"""
-    key = {"支出": "expense", "收入": "income"}.get(amount_type)
+    """只更新指定方向；空元组代表用户明确取消该方向的默认记忆。
+
+    这是同步入口，供"清空记忆"这类需要立刻知道成败的路径使用；新增记录的
+    连续写盘走 queue_remembered_tags，主线程不再等磁盘。
+    """
+    key = _DIRECTION_KEYS.get(amount_type)
     if key is None:
         return False
-    # JSON对象同时包含标签列表和分组字典，不能按新建分支推断成只有列表值。
+    # 同步值优先：先作废该方向排队中的后台批次，避免旧值晚到覆盖新值。
+    _supersede(key)
+    # 不让一次可选记忆写入覆盖损坏文件内尚可人工恢复的常用列表。
     document: dict[str, object] | None = _read_tags_document()
     if document is None:
-        # 不让一次可选记忆写入覆盖损坏文件内尚可人工恢复的常用列表。
         if TAG_PREFS_PATH.exists():
             return False
         document = {"tags": []}
@@ -169,6 +180,12 @@ def _replace_tag_file(temporary: Path) -> None:
 
 def _write_document(document: dict) -> bool:
     """共同保存候选与方向记忆，临时文件替换避免写入失败截断原偏好。"""
+    # 同步入口与后台线程可能同时写同一个文件，临时文件替换必须串行化。
+    with _file_lock:
+        return _write_document_locked(document)
+
+
+def _write_document_locked(document: dict) -> bool:
     payload: dict = {"version": _SCHEMA_VERSION, "tags": _tags_list(document)}
     if "last_used_tags" in document:
         payload["last_used_tags"] = _remembered_tags(document)
@@ -192,6 +209,92 @@ def _write_document(document: dict) -> bool:
             except OSError as error:
                 _warn(f"临时标签文件清理失败（{error}）。")  # 清理失败不覆盖实际保存结果。
     return True
+
+
+# ---------- 后台写盘（#87 输入区卡顿） ----------
+# 每添加一笔都要更新"沿用上次"，而 tags.json 的临时文件替换在 Windows 上可能被
+# 杀软占用并重试 50/100ms（见 _replace_tag_file）；这段等待绝不能压在 UI 主线程上。
+_file_lock = threading.RLock()  # 串行化全部写入；可重入，供 _commit_batch 内部复用
+_pending: dict[str, tuple[tuple[str, ...], int]] = {}  # 方向 -> (待写标签, 版本号)
+_generation: dict[str, int] = {}  # 方向 -> 最新版本号，用于丢弃过期批次
+_pending_cond = threading.Condition()  # 保护上面两个字典并唤醒写线程
+_writer: threading.Thread | None = None
+
+
+def _supersede(key: str) -> None:
+    """登记新版本并丢掉该方向的排队值；后台批次按版本号自检，过期即丢弃。"""
+    with _pending_cond:
+        _generation[key] = _generation.get(key, 0) + 1
+        _pending.pop(key, None)
+
+
+def queue_remembered_tags(amount_type: str, tags: tuple[str, ...]) -> None:
+    """把"沿用上次"交给后台线程写盘：主线程只登记最新值，绝不等待磁盘。
+
+    同一方向连续登记只保留最后一次（防抖），因此连点添加不会产生多次写盘。
+    """
+    key = _DIRECTION_KEYS.get(amount_type)
+    if key is None:
+        return
+    cleaned = tuple(_clean_list(list(tags), f"last_used_tags.{key}"))
+    global _writer
+    with _pending_cond:
+        _generation[key] = _generation.get(key, 0) + 1
+        _pending[key] = (cleaned, _generation[key])
+        if _writer is None or not _writer.is_alive():
+            # daemon：进程退出不该被可选偏好写入拖住，收尾由 atexit 兜底。
+            _writer = threading.Thread(target=_writer_loop, name="tag-prefs-writer", daemon=True)
+            _writer.start()
+        _pending_cond.notify()
+
+
+def _writer_loop() -> None:
+    """单写线程：取走整批排队值后一次落盘，避免每个方向各写一遍文件。"""
+    while True:
+        with _pending_cond:
+            while not _pending:
+                _pending_cond.wait()
+            batch = dict(_pending)
+            _pending.clear()
+        try:
+            _commit_batch(batch)
+        except Exception as error:  # 后台线程抛异常会静默杀死写盘能力，必须自己接住。
+            _warn(f"标签记忆后台写入异常（{error}），本次未保存。")
+
+
+def _commit_batch(batch: dict[str, tuple[tuple[str, ...], int]]) -> bool:
+    """合并写入一批方向记忆；已在排队期间被同步入口取代的键直接丢弃。"""
+    with _file_lock:
+        with _pending_cond:
+            fresh = {key: tags for key, (tags, gen) in batch.items()
+                     if _generation.get(key) == gen}
+        if not fresh:
+            return True  # 全部过期：同步入口已写入更新的值。
+        document = _read_tags_document()
+        if document is None:
+            if TAG_PREFS_PATH.exists():
+                _warn(f"{TAG_PREFS_PATH.name} 不可读，本次记忆未写入。")
+                return False
+            document = {"tags": []}
+        remembered = _remembered_tags(document)
+        # 队列里存的是 tuple（不可变、便于防抖比较），落盘必须是 list，
+        # 否则 _remembered_tags 会把非列表当脏项丢弃，记忆静默变成空列表。
+        remembered.update({key: list(tags) for key, tags in fresh.items()})
+        document["last_used_tags"] = remembered
+        return _write_document(document)
+
+
+def flush_remembered_tags() -> None:
+    """把排队中的记忆立刻落盘；供退出与测试收尾使用，主线程等待可接受。"""
+    with _pending_cond:
+        batch = dict(_pending)
+        _pending.clear()
+    if batch:
+        _commit_batch(batch)
+
+
+# 退出时后台线程可能还没跑完，必须在解释器收尾前补写一次，否则最后一次记忆丢失。
+atexit.register(flush_remembered_tags)
 
 
 def _apply(name: str, change: Callable[[str, list[str]], bool]) -> bool:

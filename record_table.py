@@ -49,6 +49,10 @@ class RecordTableFrame(ctk.CTkFrame):
         self.selection_label.pack(side="left")
         ctk.CTkLabel(footer, text="双击记录也可编辑", height=20, font=font_small,
                      text_color="#64748B").pack(side="right")
+        # 截断提示居中放在底栏：只在超出视图上限时出现，不挤占左右两处常驻文案。
+        self.truncation_label = ctk.CTkLabel(
+            footer, text="", height=20, font=font_small, text_color="#B45309")
+        self.truncation_label.place(relx=0.5, rely=0.5, anchor="center")
         table_inner = ctk.CTkFrame(self, fg_color="transparent")
         table_inner.pack(fill="both", expand=True, padx=10, pady=(8, 6))
         # 列 key 用 tags 而不是 category（#62）：这一列现在装的是多值标签串，
@@ -80,7 +84,15 @@ class RecordTableFrame(ctk.CTkFrame):
         self.record_tags: dict[str, tuple[str, ...]] = {}
         # 金额着色按 iid 取原始 Decimal：符号来自数据层，不解析展示文本里的 + / -。
         self.record_amounts: dict[str, Decimal] = {}
-        self.tree.tag_configure("stripe", background="#F7FAFD")
+        # 条纹拆成两个 tag（#19）：奇偶行各挂一个，增删后换色即可全局翻转，不必逐行重贴。
+        # 顺序固定为 [偶数行色, 奇数行色]：偶数行白底、奇数行浅蓝，与原单 tag 方案视觉一致。
+        self._stripe_colors = ["#FFFFFF", "#F7FAFD"]
+        self.tree.tag_configure("stripe0", background=self._stripe_colors[0])
+        self.tree.tag_configure("stripe1", background=self._stripe_colors[1])
+        # 换色后 tag 与位置奇偶的对应关系整体反相，必须记住当前是否处于反相状态。
+        self._stripe_flipped = False
+        # 选中行要临时摘掉条纹 tag，否则 tag 背景会盖住选中底色；这里记住上一行的 iid。
+        self._selected_iid: str | None = None
         # show="headings" 表示隐藏默认的首列树形图标，只显示自定义表头。
         headings = (
             ("date", "日期", 120),
@@ -119,6 +131,18 @@ class RecordTableFrame(ctk.CTkFrame):
         # 使用稳定的主键反馈选择对象，筛选/刷新清空选择时同时撤掉旧提示。
         self.selection_label.configure(
             text=f"已选中记录 ID：{record_id}" if record_id is not None else "请选择一条记录")
+        self._apply_selection_tags(None if record_id is None else str(record_id))
+
+    def _apply_selection_tags(self, iid: str | None) -> None:
+        """选中行摘掉条纹 tag，让选中底色生效；换选时按当前奇偶把上一行贴回去。
+
+        两个 stripe tag 都带背景色，ttk 中 tag 背景优先于选中态映射，不摘 tag 就看不到选中高亮。
+        """
+        previous, self._selected_iid = self._selected_iid, iid
+        if previous and previous != iid and self.tree.exists(previous):
+            self.tree.item(previous, tags=(self.stripe_tag_for(self.tree.index(previous)),))
+        if iid and self.tree.exists(iid):
+            self.tree.item(iid, tags=())
 
     def _on_scroll(self, first, last) -> None:
         # 滚动时两类覆盖层的位置全部失效；提示/滚动条归 tooltip，金额层只补一次重绘请求。
@@ -176,6 +200,69 @@ class RecordTableFrame(ctk.CTkFrame):
         self.amount_colors.clear()
         # 金额映射与标签映射同批失效：复用 iid 时不能把上一轮的符号带进新行。
         self.record_amounts.clear()
+        # 全量重建后旧选中行已不存在，换色状态也随之回到初始，避免下一轮条纹从反相开始。
+        self._selected_iid = None
+        self._stripe_colors = ["#FFFFFF", "#F7FAFD"]
+        self._stripe_flipped = False
+        self.tree.tag_configure("stripe0", background=self._stripe_colors[0])
+        self.tree.tag_configure("stripe1", background=self._stripe_colors[1])
+
+    def drop_record(self, iid: str) -> None:
+        """单行删除时同步摘掉两个映射，避免旧 iid 的标签/金额被下一轮行复用。"""
+        self.record_tags.pop(iid, None)
+        self.record_amounts.pop(iid, None)
+
+    def set_truncation(self, shown: int, total: int) -> None:
+        """超出视图上限时提示已截断；未截断时清空，避免常驻干扰底栏。"""
+        self.truncation_label.configure(
+            text=f"已显示最新 {shown} 条（共 {total} 条），输入关键词查看更多"
+            if total > shown else "")
+
+    def stripe_tag_for(self, index: int) -> str:
+        """返回 index 行当前应挂的条纹 tag；换色后同一位置要挂相反 tag 才能保持颜色归属。"""
+        parity = (index + int(self._stripe_flipped)) % 2
+        return "stripe0" if parity == 0 else "stripe1"
+
+    def row_background(self, iid: str) -> str:
+        """返回该行当前实际渲染的条纹底色，供金额/标签覆盖层与原生行对齐。
+
+        tag 名字不再等于颜色（换色后 stripe0 也可能被配成浅蓝），所以覆盖层不能再看 tag 名，
+        统一走这里按位置取当前配色。
+        """
+        tag = self.stripe_tag_for(self.tree.index(iid))
+        return self._stripe_colors[0] if tag == "stripe0" else self._stripe_colors[1]
+
+    def swap_stripe_colors(self) -> None:
+        """交换两色并翻转映射：两次 tag 配置就让整表条纹反相，不碰任何一行。"""
+        self._stripe_colors.reverse()
+        self._stripe_flipped = not self._stripe_flipped
+        self.tree.tag_configure("stripe0", background=self._stripe_colors[0])
+        self.tree.tag_configure("stripe1", background=self._stripe_colors[1])
+
+    def restripe(self, start: int, end: int) -> None:
+        """把 [start, end) 行重贴成各自位置应有的 tag；选中行跳过，选中态本就不显示条纹。"""
+        children = self.tree.get_children()
+        for index in range(max(0, start), min(end, len(children))):
+            iid = children[index]
+            if iid == self._selected_iid:
+                continue  # 选中行保持无 tag，否则 tag 背景会盖掉选中底色。
+            self.tree.item(iid, tags=(self.stripe_tag_for(index),))
+
+    def restripe_after_change(self, start: int, old_count: int, new_count: int) -> None:
+        """单行增删后修正条纹：变化行数为偶数时无需处理，奇数时换色并只重贴较小一侧。
+
+        换色是全局翻转（两次 tag 配置），因此只需把被带反的那一侧贴回去；
+        新增记录几乎总在顶部，此时前缀只有 1 行，代价接近零。
+        """
+        if (new_count - old_count) % 2 == 0:
+            return  # 行数奇偶未变，各行位置奇偶也没变。
+        # 插入时新行自身也要跟着换 tag，前缀多算一行；删除时没有新行。
+        prefix = start + (1 if new_count > old_count else 0)
+        if prefix <= new_count - start:
+            self.swap_stripe_colors()  # 换色后 [start, new) 一次到位
+            self.restripe(0, prefix)  # 只把被带反的前缀（含新行）贴回去
+        else:
+            self.restripe(start, new_count)  # 后缀更短时不换色，直接重贴后缀
 
 
 def _tooltip_work_area(root: tk.Misc) -> tuple[int, int, int, int] | None:
@@ -225,6 +312,8 @@ class TreeviewTagTooltip:
         self.current: str | None = None  # 悬停行 iid；列固定为 tags，同 iid 移动不重启计时。
         self.position = (0, 0)  # 始终是 Treeview 局部坐标，Canvas 事件须先转换。
         self.closed = False  # 永久退出守卫，避免销毁重入再次安排布局。
+        # 最近一次重算摘要用的标签列宽；None 表示还没算过，首轮 Configure 必须算一次。
+        self._summary_width: int | None = None
         self.bindings = []  # 每项保存注册控件、事件名、绑定 ID，销毁时在原控件上精确解绑。
         # 原生绑定追加安装，记录自己的ID；关闭时不影响编辑及其他订阅者。
         # 进入/离开由 cell 边界判断；点击、滚动、失焦、Unmap 隐藏，布局变化另排摘要重算。
@@ -365,6 +454,12 @@ class TreeviewTagTooltip:
 
     def _reflow(self) -> None:
         self.idle_job = None
+        # 列宽没变时摘要必然与上一轮逐字相同，直接跳过（#19）：
+        # 单笔增删也会触发 <Configure>，不设守卫就是每次操作都重算 1000 行、几千次 Tcl 往返。
+        width = self.tree.column("tags", "width")
+        if width == self._summary_width:
+            return
+        self._summary_width = width
         # 本轮重算当前表格映射里的行（可含视口外行），Canvas 随后的 render 只扫描可见视口。
         # 必须从完整 tuple 重算，不能在已经缩略的 cell 文本上继续缩略；普通 Motion 不走此循环。
         for iid, tags in self.table.record_tags.items():

@@ -79,25 +79,30 @@ class TagChipsFrame(ctk.CTkFrame):
             tag = (name or "").strip()
             if not tag or tag in self._tag_buttons:
                 continue
-            button = ctk.CTkButton(
-                self.chips_frame,
-                text=f"{tag} ×",
-                command=lambda target=tag: self._remove_tag(target),
-                # 按文字请求宽度排布，短标签不再占默认 140px，避免无意义换行。
-                width=0,
-                height=_CHIP_HEIGHT,
-                corner_radius=_CHIP_CORNER_RADIUS,
-                fg_color="#E3EAF2",
-                hover_color="#D2DEE9",
-                text_color="#243447",
-                font=("Microsoft YaHei UI", 11),
-            )
-            self._tag_buttons[tag] = button
+            self._create_chip(tag)
             self._tags.append(tag)
             added = True
         if added:
             self._schedule_relayout()
         return added
+
+    def _create_chip(self, tag: str) -> ctk.CTkButton:
+        """按名字登记一颗 chip；样式只在此处定义，新增与整体替换共用同一份。"""
+        button = ctk.CTkButton(
+            self.chips_frame,
+            text=f"{tag} ×",
+            command=lambda target=tag: self._remove_tag(target),
+            # 按文字请求宽度排布，短标签不再占默认 140px，避免无意义换行。
+            width=0,
+            height=_CHIP_HEIGHT,
+            corner_radius=_CHIP_CORNER_RADIUS,
+            fg_color="#E3EAF2",
+            hover_color="#D2DEE9",
+            text_color="#243447",
+            font=("Microsoft YaHei UI", 11),
+        )
+        self._tag_buttons[tag] = button
+        return button
 
     def _remove_tag(self, name: str) -> None:
         """删除当前记录的一颗 chip，不触碰常用标签池。"""
@@ -111,6 +116,8 @@ class TagChipsFrame(ctk.CTkFrame):
 
     def _schedule_relayout(self) -> None:
         """等新 chip 完成几何测量后再重排，避免按未测量的 1px 宽度换行。"""
+        # 必须每次排一轮：刚上屏那一轮宽度还测不出来，行数会算成 1，
+        # 需要后面这一轮按真实宽度收敛（实测合并成单轮会把三行视口算成一行）。
         self.chips_view.grid()
         self.chips_frame.grid()
         self.after_idle(self._relayout_tags)
@@ -124,6 +131,8 @@ class TagChipsFrame(ctk.CTkFrame):
 
     def _relayout_tags(self) -> None:
         """按当前宽度流式换行；仅行数变化时通知外层调整高度。"""
+        if not self.winfo_exists():
+            return  # 父窗已销毁时不再动控件，避免退出期 TclError。
         if not self._tag_buttons:
             self.chips_view.grid_remove()
             self.chips_frame.grid_remove()
@@ -195,10 +204,27 @@ class TagChipsFrame(ctk.CTkFrame):
         self._schedule_relayout()
 
     def set_tags(self, tags: tuple[str, ...]) -> None:
-        """用给定标签整体替换 chips，供编辑弹窗按记录值初始化。"""
-        self.clear_tags()
-        # 复用批量添加的去重、布局调度，确保初始化与用户输入遵循同一规则。
-        self._add_tags(tags)
+        """用给定标签整体替换 chips：只销毁多余、只新建缺少，内容一致时完全不动。
+
+        新增记录成功后按本次提交的标签回填，此时集合通常与现有 chips 完全一致，
+        旧实现"全部 destroy 再逐颗重建"在这里白付一整轮 CTk 控件创建与布局成本。
+        """
+        target = tuple(dict.fromkeys(
+            tag for tag in ((name or "").strip() for name in tags) if tag))
+        self._revision += 1  # 整体替换后，选择器在途的旧结果一律失效。
+        if self.tag_entry.get():
+            self.tag_entry.delete(0, "end")  # 保持旧语义：整体替换同时清掉手输残留。
+        if target == tuple(self._tags):
+            return  # 常见路径：只回填记忆，不动控件、不重排、不触发高度重算。
+        keep = set(target)
+        for name in [tag for tag in self._tags if tag not in keep]:
+            self._tag_buttons.pop(name).destroy()
+        self._tags = [tag for tag in self._tags if tag in keep]
+        for name in target:
+            if name not in self._tag_buttons:
+                self._create_chip(name)
+        self._tags = [tag for tag in target if tag in self._tag_buttons]
+        self._schedule_relayout()
 
     def _pick_tags(self) -> None:
         """仅在 picker 返回完成结果时合并所选标签与输入框残留。"""

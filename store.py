@@ -3,10 +3,11 @@
 初始化顺序为建基础表、迁移标签到版本 2、迁移导入批次到版本 3、load 完整缓存。
 金额按带符号 Decimal 接收、以两位小数 TEXT 写入；数据层不再根据收支按钮赋符号。
 record_tags 是记录标签来源，accounts.category 仅供历史迁移；常用候选由 tag_prefs 管理。
-单笔 add/delete/update 提交后自行 load；批次导入/撤销只提交，由调用方另行 load 并刷新 UI。
-缓存读取顺序按记录 ID，界面日期排序、标签摘要及筛选由表现层处理。
+单笔 add/delete/update 提交后只在有序缓存里增删改并返回变更记录；批次导入/撤销只提交，
+由调用方另行 load 并刷新 UI。缓存读取顺序按记录 ID，界面日期排序、标签摘要及筛选由表现层处理。
 """
 
+import bisect
 import csv
 import re
 from contextlib import closing, contextmanager
@@ -563,6 +564,31 @@ class AccountStore:
         # 真正插入以 lastrowid 为准；缓存可能跳过脏行或尚未刷新，不能把估算值当数据库 ID。
         return max((record.record_id for record in self.records), default=0) + 1
 
+    def _cache_index(self, record_id: int) -> int:
+        """在按主键升序的缓存里二分定位，返回插入点（该位置的主键可能不等于目标）。
+
+        load() 用 ORDER BY id 填充，add 只往尾部追加（自增主键必为最大值），
+        update/delete 不改变主键，因此 records 始终按 record_id 升序，二分结论才成立。
+        """
+        return bisect.bisect_left(self.records, record_id, key=lambda item: item.record_id)
+
+    def _cache_record(
+        self, record_id: int, record_date: str, amount: Decimal, tags: tuple[str, ...], note: str
+    ) -> Account:
+        """按 load() 的同一口径构造缓存对象，保证局部维护与整表重读结果逐字段一致。
+
+        金额取两位小数字符串再解析，标签按字典序（对应 load() 的 ORDER BY tag），
+        备注去掉首尾空白（对应写库时的 note.strip()），三者任一不一致都会让界面
+        在下次全量刷新时「悄悄跳一下」，所以口径必须收在这一处。
+        """
+        return Account(
+            record_id,
+            record_date,
+            Decimal(f"{amount:.2f}"),
+            tuple(sorted(tags)),
+            note.strip(),
+        )
+
     @staticmethod
     def _is_valid_amount(amount: Decimal) -> bool:
         """金额必须是可比较、可汇总的有限数，且不能为 0。
@@ -638,8 +664,11 @@ class AccountStore:
     @_business_write
     def add(
         self, record_date: str, amount: Decimal, tags: tuple[str, ...], note: str
-    ) -> None:
-        """写主记录及完整标签，提交后重载缓存；日期和金额方向由提交入口先处理。"""
+    ) -> Account | None:
+        """写主记录及完整标签，提交后把新记录追加进缓存并返回；日期和金额方向由提交入口先处理。
+
+        返回 None 只在拿不到自增主键的极端情况下出现，调用方须回退全量刷新。
+        """
         # 入库前先校验金额，非法金额直接拒绝写入，绝不允许 NaN / Infinity 污染账本。
         if not self._is_valid_amount(amount):
             raise ValueError(f"非法金额：{amount!r}")
@@ -664,12 +693,16 @@ class AccountStore:
             # 也绝不能把标签挂到一个错的 record_id 上；记录本身照常插入、后面照常 load()。
             if new_id is not None:
                 self._replace_tags(connection, new_id, tags)
-        # 写库成功后重新加载缓存，使内存数据与数据库立刻保持一致。
-        self.load()
+        if new_id is None:
+            return None  # 拿不到主键就不猜缓存位置：交给调用方回退全量刷新。
+        # 写库已提交，按同一口径构造缓存对象；自增主键必为当前最大值，尾部追加仍保持升序。
+        record = self._cache_record(new_id, record_date, amount, tags, note)
+        self.records.append(record)
+        return record
 
     @_business_write
-    def delete(self, record_id: int) -> bool:
-        """按主键原子删除记录及标签；找不到返回 False，成功后重载缓存。"""
+    def delete(self, record_id: int) -> Account | None:
+        """按主键原子删除记录及标签；找不到返回 None，成功则从缓存摘除并返回被删记录。"""
         with self._connect() as connection:
             cursor = connection.execute("DELETE FROM accounts WHERE id = ?", (record_id,))
             # rowcount 为 0 说明该 ID 不存在，交由调用方提示「找不到该记录」。
@@ -684,9 +717,13 @@ class AccountStore:
                     "DELETE FROM record_tags WHERE record_id = ?", (record_id,)
                 )
         if not deleted:
-            return False
-        self.load()
-        return True
+            return None
+        # 删除只改主键集合、不动其余顺序：二分摘除后列表仍严格升序。
+        index = self._cache_index(record_id)
+        if index < len(self.records) and self.records[index].record_id == record_id:
+            return self.records.pop(index)
+        # 数据库删掉了但缓存里没有（例如外部进程改库）：不假装成功，让界面提示找不到。
+        return None
 
     @_business_write
     def update(
@@ -696,11 +733,11 @@ class AccountStore:
         amount: Decimal,
         tags: tuple[str, ...],
         note: str,
-    ) -> bool:
-        """整份更新记录及标签，保留主键/批次归属；金额非法、缺记录或写库失败返回 False。"""
-        # 与 add 同源：金额非法一律按「更新失败」处理，返回 False 让 UI 弹提示而不是崩溃。
+    ) -> Account | None:
+        """整份更新记录及标签，保留主键/批次归属；金额非法、缺记录或写库失败返回 None。"""
+        # 与 add 同源：金额非法一律按「更新失败」处理，返回 None 让 UI 弹提示而不是崩溃。
         if not self._is_valid_amount(amount):
-            return False
+            return None
         # 与 add 同款：形参是 tags 元组，裸字符串会被护栏拒绝（理由见 _normalize_tags）。
         tags = self._normalize_tags(tags)
         try:
@@ -724,13 +761,19 @@ class AccountStore:
                 if updated:
                     self._replace_tags(connection, record_id, tags)
         except sqlite3.Error:
-            # 更新失败属于可恢复错误（例如数据库文件被占用），返回 False 让 UI 弹提示而不是崩溃。
-            return False
+            # 更新失败属于可恢复错误（例如数据库文件被占用），返回 None 让 UI 弹提示而不是崩溃。
+            return None
         if not updated:
-            return False
-        # 写事务已提交；load 的读取异常仍向外传播，不能把后续缓存失败说成数据库已回滚。
-        self.load()
-        return True
+            return None
+        # 写事务已提交；主键不变，原地替换即可保持升序，不需要整表重读。
+        record = self._cache_record(record_id, record_date, amount, tags, note)
+        index = self._cache_index(record_id)
+        if index < len(self.records) and self.records[index].record_id == record_id:
+            self.records[index] = record
+        else:
+            # 缓存里缺这条（外部改库或缓存曾被整表替换）：按二分位置补进去，不丢新数据。
+            self.records.insert(index, record)
+        return record
 
     def export_month_csv(self, month: str, save_path: Path) -> Path:
         """现读指定月份导出 CSV，不依赖筛选后的表格或缓存，路径及失败提示由调用方管理。"""

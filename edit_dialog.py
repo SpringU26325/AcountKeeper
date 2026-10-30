@@ -233,7 +233,7 @@ def _prefill_edit(dialog: _EditWindow, record: Account) -> None:
     valid = record.amount.is_finite() and record.amount != 0
     dialog.amount_type_var.set("支出" if not valid or record.amount < 0 else "收入")  # 方向独立复位，不借主窗或上次编辑值。
     dialog.amount_var.set(f"{abs(record.amount):.2f}" if valid else str(record.amount))  # 非有限历史值保留修正入口，不比较NaN。
-    dialog.tag_chips.set_tags(record.tags)  # 同时清手输残留和旧chips，再按本条记录顺序重建。
+    dialog.tag_chips.set_tags(record.tags)  # 清手输残留并把 chips 调成本条记录的标签与顺序，未变化的控件复用。
     dialog.note_var.set(record.note)  # 空备注也必须覆盖，不能用“非空才填”造成串记录。
     dialog.error_var.set("")  # 校验提示属于上次输入，新的完整会话没有旧错误。
     for entry in dialog.entries:

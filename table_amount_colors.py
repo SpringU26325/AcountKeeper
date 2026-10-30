@@ -15,9 +15,8 @@ from types import SimpleNamespace
 EXPENSE_COLOR = "#B84035"
 INCOME_COLOR = "#1E7A46"
 # 与 record_table._style_table / table_tag_badges 保持同一组行底色，覆盖层不能自成一套。
+# 条纹两色已收进 RecordTableFrame 并会随换色互换，这里不再另存一份副本（#19）。
 SELECTED_BG = "#D7E9FC"
-STRIPE_BG = "#F7FAFD"
-PLAIN_BG = "#FFFFFF"
 
 
 class AmountColorRenderer:
@@ -154,8 +153,8 @@ class AmountColorRenderer:
             index += 1
             selected = iid in self.tree.selection()
             # 覆盖层须复现原生行的选中/条纹底色，否则金额格会像未选中或被切出一块白条。
-            background = SELECTED_BG if selected else (
-                STRIPE_BG if "stripe" in self.tree.item(iid, "tags") else PLAIN_BG)
+            # 条纹 tag 已拆成两色且会全局换色，颜色只能问表格，不能按 tag 名猜（#19）。
+            background = SELECTED_BG if selected else self.table.row_background(iid)
             canvas.configure(background=background)
             # 严丝合缝盖住整个 cell：差一个像素就会露出原生文字，形成重影。
             canvas.place(x=box[0], y=box[1], width=max(1, box[2]), height=max(1, box[3]))

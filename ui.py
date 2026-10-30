@@ -1,7 +1,7 @@
 """主窗口组装与业务回调：输入校验、收支符号转换及调用 store，不直接执行 SQL。
 
 store.records 是完整账本缓存，搜索和编辑从中取值；表格仅持有当前筛选行的展示状态。
-刷新顺序为撤销旧提示/映射/覆盖层、重建 Treeview 行、同步操作按钮、请求徽标重绘。
+全量刷新按上限只插最新一段，单笔增删改走增量路径，两条路径共用同一个插行函数。
 摘要及字体测量归 record_table/table_tag_badges，不能反解析显示文本来还原标签或主键。
 表格交互验收入口为 _probe/probe_table_visuals.py；用隔离宿主，避免连接真实账本。
 """
@@ -48,6 +48,20 @@ def _amount_text(amount: Decimal) -> str:
     return f"+{text}" if amount > 0 else text
 
 
+# 单次渲染上限：逐行 tree.insert 加字体测量约 100µs，6 万行会占满主线程近 6 秒（#19）。
+MAX_DISPLAY_ROWS = 1000
+
+
+def _matches(record: Account, keyword: str) -> bool:
+    """日期、备注或任一标签命中即算匹配；空关键词视为全部命中。"""
+    return (
+        not keyword
+        or keyword in record.record_date.lower()
+        or keyword in record.note.lower()
+        or any(keyword in tag.lower() for tag in record.tags)
+    )
+
+
 class AccountKeeperApp(ctk.CTk):
     """协调收支录入、筛选和编辑；子控件管理自身状态，持久化交给注入的 store。"""
 
@@ -71,6 +85,8 @@ class AccountKeeperApp(ctk.CTk):
         self.import_workflow = None  # 延迟加载导入依赖，主页面启动不读取外部账单。
         # store 由外部注入，方便测试时替换成临时数据库，避免测试污染真实账本。
         self.store = store
+        # 当前已插入表格的记录（筛选 + 日期倒序），增量增删改靠它定位插入点。
+        self._displayed: list[Account] = []
         # last_export_dir 由启动流程注入，带默认值保证单独构造窗口时仍可用：
         # 默认值取 config 常量，避免本层再写一份「用哪个目录」的判断（配置读取只归 settings 模块管）。
         # 它只是「另存为」对话框的起始目录；导出成功后会被更新为用户实际所选的目录。
@@ -302,7 +318,7 @@ class AccountKeeperApp(ctk.CTk):
             messagebox.showinfo("数据目录", f"数据目录位于：\n{DATA_DIR}")
 
     def filter_records(self, *_args: str) -> None:
-        """从完整缓存筛选并重建展示行；不改缓存、原始 tags 元组或记录主键。"""
+        """从完整缓存筛选并按上限重建展示行；不改缓存、原始 tags 元组或记录主键。"""
         # 用 *_args 吸收事件对象/回调参数，使同一函数既能当事件回调也能被直接调用。
         # 搜索框未绑定 textvariable，直接读取控件作为唯一来源；粘贴的触发及延迟读取归 ToolbarFrame。
         keyword = self.search_entry.get().strip().lower()
@@ -311,42 +327,146 @@ class AccountKeeperApp(ctk.CTk):
         for item in self.tree.get_children():
             self.tree.delete(item)
         # 按日期倒序 + ID 倒序排列，让最新记录总是出现在最上面。
-        visible_row = 0  # 条纹按筛选后顺序计数，不能按主键奇偶给行着色。
-        for record in sorted(
-            self.store.records,
-            key=lambda item: (item.record_date, item.record_id),
-            reverse=True,
-        ):
-            # 始终匹配完整 tags，摘要隐藏的标签乃至只显示计数的行也必须可被搜索。
-            # 日期、备注或任一标签单独命中即可；逐标签比较避免拼接符两侧被误当成连续文字。
-            matches = (
-                keyword in record.record_date.lower()
-                or keyword in record.note.lower()
-                or any(keyword in tag.lower() for tag in record.tags)
-            )
-            if keyword and not matches:
-                continue
-            # ID 不再显示为列，但 iid 仍保存主键，编辑/删除继续按同一个标识定位。
-            # 金额覆盖层按 iid 取符号，登记原始 Decimal 而不是解析展示文本。
-            self.table_frame.set_record_amount(str(record.record_id), record.amount)
-            self.tree.insert(
-                "",
-                "end",
-                iid=str(record.record_id),
-                tags=("stripe",) if visible_row % 2 else (),
-                values=(
-                    record.record_date,
-                    _amount_text(record.amount),
-                    # 插入前登记 iid → 完整 tuple，返回值仅作摘要；tooltip/徽标也不能从摘要反解析。
-                    self.table_frame.set_record_tags(str(record.record_id), record.tags),
-                    record.note,
-                ),
-            )
-            visible_row += 1
-
+        matched = [
+            record for record in sorted(
+                self.store.records,
+                key=lambda item: (item.record_date, item.record_id),
+                reverse=True,
+            ) if _matches(record, keyword)
+        ]
+        # 只插入最新的一段：逐行 Tcl 往返是刷新耗时的主体，行数必须封顶（#19）。
+        self._displayed = matched[:MAX_DISPLAY_ROWS]
+        for index, record in enumerate(self._displayed):
+            self._insert_row(index, record)
+        self.table_frame.set_truncation(len(self._displayed), len(matched))
         self._sync_record_actions()  # 删除并重建后原选择已失效，不能保留上一轮的按钮可用状态。
-
         self.table_frame.request_overlays()  # 插入完成后再测量可见行，避免逐行触发布局。
+
+    def _insert_row(self, index: int, record: Account) -> None:
+        """把一条记录插到第 index 行并登记映射；全量与增量两条路径共用，避免口径分叉。"""
+        iid = str(record.record_id)
+        # ID 不再显示为列，但 iid 仍保存主键，编辑/删除继续按同一个标识定位。
+        self.tree.insert(
+            "",
+            index,
+            iid=iid,
+            tags=(self.table_frame.stripe_tag_for(index),),
+            values=(
+                record.record_date,
+                _amount_text(record.amount),
+                # 插入前登记 iid → 完整 tuple，返回值仅作摘要；tooltip/徽标不能反解析摘要。
+                self.table_frame.set_record_tags(iid, record.tags),
+                record.note,
+            ),
+        )
+        # 金额覆盖层按 iid 取符号，登记原始 Decimal 而不是解析展示文本。
+        self.table_frame.set_record_amount(iid, record.amount)
+
+    def _displayed_index(self, record: Account) -> int:
+        """在已显示列表里按 (日期, 主键) 倒序找插入点；列表至多 1000 条，线性扫描足够快。"""
+        key = (record.record_date, record.record_id)
+        for index, item in enumerate(self._displayed):
+            if (item.record_date, item.record_id) < key:
+                return index
+        return len(self._displayed)
+
+    def _insert_displayed(self, record: Account) -> None:
+        """新增一条后的单行刷新；满上限时挤掉末尾一行，保持恒 1000 条。"""
+        if self.search_entry.get().strip():
+            self.filter_records()  # 有关键词时还要判断是否命中，直接走已受上限约束的全量。
+            return
+        index = self._displayed_index(record)
+        if index >= MAX_DISPLAY_ROWS:
+            # 新记录排在可见 1000 条之后：不进表，只更新截断提示里的总数。
+            self.table_frame.set_truncation(len(self._displayed), len(self.store.records))
+            return
+        old_count = len(self._displayed)
+        self._insert_row(index, record)
+        self._displayed.insert(index, record)
+        self.table_frame.restripe_after_change(index, old_count, old_count + 1)
+        if len(self._displayed) > MAX_DISPLAY_ROWS:
+            tail = self._displayed.pop()  # 满额后挤掉最旧一条，行数仍等于上限。
+            self.tree.delete(str(tail.record_id))
+            self.table_frame.drop_record(str(tail.record_id))
+        self.table_frame.set_truncation(len(self._displayed), len(self.store.records))
+        self.table_frame.request_overlays()
+
+    def _remove_displayed(self, record: Account) -> None:
+        """删除一条后的单行刷新；腾出空位时从缓存补回一条，避免表格无声少一行。"""
+        if self.search_entry.get().strip():
+            self.filter_records()
+            return
+        index = next(
+            (i for i, item in enumerate(self._displayed) if item.record_id == record.record_id),
+            None,
+        )
+        if index is None:
+            return  # 该记录本就超出上限没显示，表格无需改动。
+        old_count = len(self._displayed)
+        self._displayed.pop(index)
+        self.tree.delete(str(record.record_id))
+        self.table_frame.drop_record(str(record.record_id))
+        self.table_frame.restripe_after_change(index, old_count, old_count - 1)
+        self._backfill_tail()
+        self.table_frame.set_truncation(len(self._displayed), len(self.store.records))
+        self._sync_record_actions()
+        self.table_frame.request_overlays()
+
+    def _backfill_tail(self) -> None:
+        """补位：缓存里还有没显示的记录时，取排名最高的一条补到末尾。
+
+        只在删除后触发；代价是一次全缓存扫描（数万次比较），远低于整表重建的成本。
+        """
+        if len(self._displayed) >= MAX_DISPLAY_ROWS or len(self.store.records) <= len(self._displayed):
+            return  # 没到上限或缓存已全显示，无需补位。
+        shown = {record.record_id for record in self._displayed}
+        best = None
+        for record in self.store.records:
+            if record.record_id in shown:
+                continue
+            if best is None or (record.record_date, record.record_id) > (best.record_date, best.record_id):
+                best = record
+        if best is None:
+            return
+        # 末尾追加不改变其他行的位置奇偶，只需给新行贴 tag，不必整段重贴。
+        self._insert_row(len(self._displayed), best)
+        self._displayed.append(best)
+
+    def _update_displayed(self, record: Account) -> None:
+        """编辑一条后的单行刷新；日期变化导致换位时按删除加插入处理并修正条纹。"""
+        if self.search_entry.get().strip():
+            self.filter_records()
+            return
+        iid = str(record.record_id)
+        old_index = next(
+            (i for i, item in enumerate(self._displayed) if item.record_id == record.record_id),
+            None,
+        )
+        if old_index is None:
+            self._insert_displayed(record)  # 该记录不在可见区间，交给新增路径判断是否入表。
+            return
+        count = len(self._displayed)
+        self._displayed.pop(old_index)
+        new_index = self._displayed_index(record)
+        if new_index == old_index:
+            # 位置没变（典型是只改金额/备注/标签）：只更新单元格与映射，条纹无需动。
+            self._displayed.insert(old_index, record)
+            self.tree.item(iid, values=(
+                record.record_date,
+                _amount_text(record.amount),
+                self.table_frame.set_record_tags(iid, record.tags),
+                record.note,
+            ))
+            self.table_frame.set_record_amount(iid, record.amount)
+            self.table_frame.request_overlays()
+            return
+        self.tree.delete(iid)
+        self.table_frame.restripe_after_change(old_index, count, count - 1)
+        self._displayed.insert(new_index, record)
+        self._insert_row(new_index, record)
+        self.table_frame.restripe_after_change(new_index, count - 1, count)
+        self._sync_record_actions()
+        self.table_frame.request_overlays()
 
     def _selected_record_id(self) -> int | None:
         """只认当前仍存在的选中行 iid，不按可变行序或单元格文本定位记录。"""
@@ -426,25 +546,32 @@ class AccountKeeperApp(ctk.CTk):
         # store.add 内部还会再校验一次金额（数据层最后防线）。正常流程下这里不会触发，
         # 但万一上层校验被改动绕过，也只会弹出提示而不会让程序崩溃。
         try:
-            self.store.add(
+            record = self.store.add(
                 record_date.isoformat(), amount, tags, self.note_var.get()
             )
         except ValueError:
             messagebox.showerror("输入错误", "日期格式应为 YYYY-MM-DD，金额必须是数字。")
             return
         # 只在账本写入成功之后记忆本次方向，校验或入账失败不能污染默认值。
-        tag_prefs.save_remembered_tags(amount_type, tags)
+        # 写盘交给后台线程：tags.json 的临时文件替换在 Windows 上可能被占用并重试
+        # 上百毫秒，压在主线程就是每次添加都能感觉到的顿挫（#87）。
+        tag_prefs.queue_remembered_tags(amount_type, tags)
         # 清空金额/备注但保留日期与当前方向记忆，方便用户连续录入。
         # 金额框使用的是 placeholder_text 而非 textvariable，控件内容必须单独清空，
         # 否则下一次提交会把上一次的金额重复带进去。
         self.amount_entry.delete(0, "end")
-        self._restore_tag_memory()  # 同时清手输残留；回填依据当前方向，而非缓存窗的旧值。
+        # 回填直接用本次提交的标签，不再回读 tags.json：后台写入还没落盘，读文件会
+        # 拿回上一笔的旧值；标签集合一致时 chips 走"不重建"快路径，顺带清掉手输残留。
+        self.input_frame.set_remembered_tags(tags)
         self.note_var.set("")
         # 需求 3.13：这里不再需要「重新查历史标签 + 刷新候选」。
         # 候选改由 tag_prefs 在每次点 ▼ 时现算，弹窗里点「+ 保存」把标签写进
         # tags.json 之后，弹窗自己会重画列表，这一层什么都不用做；同时少了一个
         # 必守的「新增成功后记得刷新」约定，也就少一类「忘了刷新」的 bug。
-        self.refresh_records()
+        if record is None:
+            self.refresh_records()  # 极端情况拿不到主键：回退全量刷新，保证界面与库一致。
+        else:
+            self._insert_displayed(record)  # 单行插入，不再整表重建。
 
     @business_action
     def delete_record(self) -> None:
@@ -457,10 +584,11 @@ class AccountKeeperApp(ctk.CTk):
         if not dialogs.confirm_delete(self):
             return
         # 数据库里已不存在该行（例如被其它窗口删掉），提示用户而不是假装成功。
-        if not self.store.delete(record_id):
+        removed = self.store.delete(record_id)
+        if removed is None:
             messagebox.showinfo("删除记录", "找不到该记录")
             return
-        self.refresh_records()
+        self._remove_displayed(removed)  # 单行摘除，不再整表重建。
 
     def edit_selected_record(self) -> None:
         """常驻按钮按当前选中主键打开同一编辑流程。"""
@@ -501,10 +629,11 @@ class AccountKeeperApp(ctk.CTk):
         # 编辑提交入口已转换收支符号并收集完整标签元组；原样透传，不二次取负或包装标签。
         record_date, amount, tags, note = edited_values
         # 主键不参与修改，编辑只更新内容字段（需求 3.5.1）。
-        if not self.store.update(record_id, record_date, amount, tags, note):
+        updated = self.store.update(record_id, record_date, amount, tags, note)
+        if updated is None:
             messagebox.showerror("编辑失败", "找不到该记录或记录更新失败。")
             return
-        self.refresh_records()
+        self._update_displayed(updated)  # 单行更新，不再整表重建。
 
     def _confirm_backup_overwrite(self, save_path: Path) -> bool:
         # 与删除确认共用受管理的 CTkToplevel 生命周期；原生 messagebox 不适合危险操作。
