@@ -202,6 +202,7 @@ class SnailManager:
         self._running = True
         # 原生 bind 返回可精确移除的句柄；add 保留窗口和 CTk 原来的同名回调。
         self._bind(self.master, "<Map>", self._on_window_shown)
+        self._bind(self.master, "<Unmap>", self._on_window_hidden)
         self._bind(self.master, "<FocusOut>", self._on_focus_out)
         self._bind(self.master, "<FocusIn>", self._on_focus_in)
         for widget in (self.master, self.title_block, self.snail_label):
@@ -324,7 +325,17 @@ class SnailManager:
             self._layout_speech_bubble()
 
     def _on_focus_out(self, event: tk.Event) -> None:
+        if self._is_active() and self._widget_exists(event.widget):
+            if event.widget.winfo_toplevel() == self.master:
+                self._cancel_after("snail_animation_id")  # 最终焦点检查可恢复内部切焦，先终止旧链。
         self._on_focus_in(event)  # 两种事件都查询最终焦点，内部切焦不能按事件名称直接暂停。
+
+    def _on_window_hidden(self, event: tk.Event) -> None:
+        if event.widget is self.master:
+            self.snail_paused = True
+            self._cancel_after("snail_animation_id")
+            self._cancel_after("_geometry_after_id")
+            self._queue_focus_check()
 
     def _on_focus_in(self, event: tk.Event) -> None:
         if not self._is_active() or not self._widget_exists(event.widget):
@@ -350,13 +361,19 @@ class SnailManager:
             self._window_focused = False  # 外部窗口或销毁中的焦点对象无法解析时视作失焦。
         # 按顶层窗口判定：主窗内输入框换焦不暂停，编辑/图表等子顶层持焦仍按主窗失焦处理。
         # 只有主窗口实际持焦且没有活动气泡时才恢复，切回窗口不能让气泡与蜗牛错位。
-        self.snail_paused = not self._window_focused or self._bubble_canvas is not None
+        self.snail_paused = (not self._window_focused or not self.master.winfo_viewable()
+                             or self._bubble_canvas is not None)
+        if self.snail_paused:
+            self._cancel_after("snail_animation_id")
+        elif self.snail_animation_id is None:
+            self.snail_animation_id = self.master.after(30, self._animate_snail)
 
     def _on_window_shown(self, event: tk.Event) -> None:
         """窗口真正显示后补一次入口摆放：只有这时 winfo_width() 才是真实宽度。"""
         if not self._is_active() or event.widget is not self.master:
             return  # 子控件 Map 会沿顶层绑定传播，不能用它提前触发主窗口入场。
         self._window_shown = True
+        self._queue_focus_check()
         # 已经入场过就不再摆：从最小化恢复同样会触发 <Map>，那时应保持蜗牛当前位置。
         if not self.snail_started:
             self._enter_from_right(self.master.winfo_width())
@@ -414,9 +431,8 @@ class SnailManager:
         if not self._is_active():
             self.stop()
             return  # 销毁检查必须先于暂停心跳，已停止时不能再续期任何动画任务。
-        # 暂停时只维持定时器心跳，不做位移，这样恢复时能立刻接着爬。
+        # 暂停时不续约；恢复由最终焦点或气泡关闭通知启动单链，不补后台帧。
         if self.snail_paused:
-            self.snail_animation_id = self.master.after(30, self._animate_snail)
             return
         # 窗口尚未真正显示时 winfo_width() 会谎报 Tk 默认的 200（不是 1），
         # 据此摆放会让蜗牛从窗口偏左处冒出来，所以必须先等 <Map> 事件把 _window_shown 置位。
@@ -464,6 +480,7 @@ class SnailManager:
             # 气泡关闭后让蜗牛继续爬行；连点蜗牛时传 False 可保持暂停，避免动画闪跳。
             # 窗口已失焦时也不恢复：否则用户切走后气泡到点自动关闭，蜗牛又会在后台爬。
             self.snail_paused = False
+            self._queue_focus_check()
 
     def _show_speech_bubble(self, message: str) -> None:
         """在主窗口内创建一个跟随蜗牛的圆角气泡 Canvas。"""

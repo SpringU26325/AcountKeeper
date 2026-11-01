@@ -19,6 +19,7 @@ import customtkinter as ctk
 
 from table_amount_colors import AmountColorRenderer
 from table_tag_badges import TagBadgeRenderer, tag_layout
+from layout_coordinator import LayoutCoordinator
 
 
 def summarize_tags(tags: tuple[str, ...], width: int, font: tkfont.Font, scale: float = 1.0) -> str:
@@ -118,6 +119,7 @@ class RecordTableFrame(ctk.CTkFrame):
         self.tag_tooltip = TreeviewTagTooltip(self, scrollbar)
         self.tag_badges = TagBadgeRenderer(self, edit_callback)
         self.amount_colors = AmountColorRenderer(self, edit_callback)
+        self.layout_coordinator = LayoutCoordinator(self)
         self.tree.configure(yscrollcommand=self._on_scroll)
         self.tree.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -314,6 +316,7 @@ class TreeviewTagTooltip:
         self.closed = False  # 永久退出守卫，避免销毁重入再次安排布局。
         # 最近一次重算摘要用的标签列宽；None 表示还没算过，首轮 Configure 必须算一次。
         self._summary_width: int | None = None
+        self._root_size = None  # 激活/移动也可能发Configure，只有尺寸变化才进入布局。
         self.bindings = []  # 每项保存注册控件、事件名、绑定 ID，销毁时在原控件上精确解绑。
         # 原生绑定追加安装，记录自己的ID；关闭时不影响编辑及其他订阅者。
         # 进入/离开由 cell 边界判断；点击、滚动、失焦、Unmap 隐藏，布局变化另排摘要重算。
@@ -414,6 +417,8 @@ class TreeviewTagTooltip:
         window.lift()
 
     def _cancel(self, name: str) -> None:
+        if hasattr(self.table, "layout_coordinator"):
+            self.table.layout_coordinator.cancel(self, name)
         job = getattr(self, name)
         if job is not None:
             setattr(self, name, None)  # 先清身份再取消 Tcl 任务，重复收尾不会拿旧句柄再次取消。
@@ -444,13 +449,23 @@ class TreeviewTagTooltip:
     def _root_layout(self, event: tk.Event) -> None:
         # 主窗绑定也会收到子控件的几何事件；只认主窗自身，避免把表格等子控件布局误当成主窗变化。
         if event.widget is self.root:
+            size = (event.width, event.height)
+            if size == self._root_size:
+                return  # 同尺寸通知不得触发摘要重算或覆盖层绘制。
+            self._root_size = size
             self._layout(event)
 
     def _layout(self, _event=None) -> None:
         # 旧提示位置/摘要宽度已失效；等本轮几何通知结束后再合并测量，避免边拖列边反复计算。
         self.hide()
         if not self.closed and self.idle_job is None:
-            self.idle_job = self.tree.after_idle(self._reflow)
+            coordinator = self.table.layout_coordinator
+            coordinator.changed()
+            # 摘要遍历所有已加载行，留到稳定期；可见徽标仍随坐标即时跟进。
+            # 松开列分隔线代表本次拖动已结束，无需等待静默期。
+            released = _event is not None and _event.type == tk.EventType.ButtonRelease
+            coordinator.schedule(self, "idle_job", self._reflow, None if released else 80)
+            self.table.request_overlays()
 
     def _reflow(self) -> None:
         self.idle_job = None

@@ -48,15 +48,21 @@ class AmountColorRenderer:
         # ui 插入完成、滚动、选中和列宽变化都汇入这个重绘入口，一批通知只重绘一次。
         if self.closed:
             return
+        coordinator = self.table.layout_coordinator
+        if (_event is not None and _event.type == tk.EventType.Configure
+                and not coordinator.suspended and coordinator.geometry() == coordinator.signature):
+            return  # 重新激活可产生同尺寸Configure，不据此重画整层。
         if self.idle_job is not None:
             # 已排队或正在绘制：只置脏位，等本轮结束后补画一次，不能直接丢弃这次请求。
             self._pending = True
             return
-        self.idle_job = self.tree.after_idle(self.render)
+        self.table.layout_coordinator.schedule(self, "idle_job", self.render)
 
     def clear(self) -> None:
         """取消待绘制任务并隐藏槽位，保留控件与绑定供下一轮记录复用。"""
         self._pending = False  # 刷新会重建映射，上一轮遗留的补画请求不能跨数据生效。
+        for slot in ("idle_job", "_retry_job", "_verify_job"):
+            self.table.layout_coordinator.cancel(self, slot)
         for slot in ("_retry_job", "_verify_job"):
             job = getattr(self, slot)
             if job is not None:
@@ -77,7 +83,8 @@ class AmountColorRenderer:
 
     def _canvas(self, index: int) -> tk.Canvas:
         if index == len(self.canvases):
-            canvas = tk.Canvas(self.tree, highlightthickness=0, borderwidth=0, takefocus=0)
+            # 创建时即有有效底色；显示前仍按实际行更新，不能依赖系统默认灰底。
+            canvas = tk.Canvas(self.tree, background="#FFFFFF", highlightthickness=0, borderwidth=0, takefocus=0)
             self.canvases.append(canvas)
             # 每个槽位只绑定一次；滚动只替换内容，不积累订阅和控件。
             for sequence, callback in (("<ButtonPress>", self._click), ("<Double-1>", self._double),
@@ -155,15 +162,21 @@ class AmountColorRenderer:
             # 覆盖层须复现原生行的选中/条纹底色，否则金额格会像未选中或被切出一块白条。
             # 条纹 tag 已拆成两色且会全局换色，颜色只能问表格，不能按 tag 名猜（#19）。
             background = SELECTED_BG if selected else self.table.row_background(iid)
-            canvas.configure(background=background)
-            # 严丝合缝盖住整个 cell：差一个像素就会露出原生文字，形成重影。
-            canvas.place(x=box[0], y=box[1], width=max(1, box[2]), height=max(1, box[3]))
-            tk.Misc.lift(canvas)  # Canvas.lift 是图元抬升，覆盖窗口必须调用 Misc 的窗口抬升。
-            canvas.delete("all")
+            if canvas.cget("background") != background:
+                canvas.configure(background=background)
             # 直接复读原生值：覆盖层与单元格必须逐字一致，不在这里重新格式化金额。
             text = self.tree.set(iid, "amount")
-            canvas.create_text(box[2] / 2, box[3] / 2, text=text, font=self.table.cell_font,
-                               anchor="center", fill=self._color(amount))
+            # 每个槽位只创建一次文字图元，缩放只移动坐标并更新样式。
+            items = canvas.find_all()
+            item = items[0] if items else canvas.create_text(0, 0, anchor="center")
+            canvas.coords(item, box[2] / 2, box[3] / 2)
+            canvas.itemconfigure(item, text=text, font=self.table.cell_font, fill=self._color(amount))
+            # 底色和图元准备完才提交几何；不重复提交相同尺寸，减少原生窗口失效区域。
+            geometry = (box[0], box[1], max(1, box[2]), max(1, box[3]))
+            placed = canvas.place_info()
+            if tuple(int(placed.get(key, -1)) for key in ("x", "y", "width", "height")) != geometry:
+                canvas.place_configure(x=geometry[0], y=geometry[1], width=geometry[2], height=geometry[3])
+            # Canvas 是 tree 的直接子窗口，各 cell 不重叠；父窗口重绘不要求对子窗口反复 lift。
         for canvas in self.canvases[index:]:
             canvas.place_forget()  # 只隐藏不再使用的槽位，活动 cell 不反复 Unmap 造成闪烁。
         # 视口行数外加两槽容纳边界处的部分可见行，缩窗后也不保留曾经较大的控件池。
@@ -179,7 +192,7 @@ class AmountColorRenderer:
         elif retry and self._retries < 2:
             # 表格还没为最新高度铺好行：稍后再扫一次，最多两次，避免无限自激。
             self._retries += 1
-            self._retry_job = self.tree.after(30, self._retry_render)
+            self.table.layout_coordinator.schedule(self, "_retry_job", self._retry_render, 30)
         else:
             self._retries = 0
         if not verify and (retry or index < len(self.canvases)):
@@ -193,7 +206,7 @@ class AmountColorRenderer:
                 self.tree.after_cancel(self._verify_job)
             except tk.TclError:
                 pass  # 父窗已回收任务时重复取消不抛错。
-        self._verify_job = self.tree.after(60, self._verify_render)
+        self.table.layout_coordinator.schedule(self, "_verify_job", self._verify_render, 60)
 
     def _verify_render(self) -> None:
         self._verify_job = None

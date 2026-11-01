@@ -120,14 +120,23 @@ class TagChipsFrame(ctk.CTkFrame):
         # 需要后面这一轮按真实宽度收敛（实测合并成单轮会把三行视口算成一行）。
         self.chips_view.grid()
         self.chips_frame.grid()
-        self.after_idle(self._relayout_tags)
+        coordinator = getattr(self, "layout_coordinator", None)
+        if coordinator is None:
+            self.after_idle(self._relayout_tags)
+        else:
+            coordinator.schedule(self, "_layout_job", self._relayout_tags)
 
     def _on_chips_configure(self, event: tk.Event) -> None:
         """容器宽度改变才重排，掐断高度变化造成的 Configure 自激。"""
         if event.width == self._chips_width:
             return
         self._chips_width = event.width
-        self._relayout_tags()
+        coordinator = getattr(self, "layout_coordinator", None)
+        if coordinator is None:
+            self._relayout_tags()
+        else:
+            coordinator.changed()
+            coordinator.schedule(self, "_layout_job", self._relayout_tags)
 
     def _relayout_tags(self) -> None:
         """按当前宽度流式换行；仅行数变化时通知外层调整高度。"""

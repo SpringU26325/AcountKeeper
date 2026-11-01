@@ -36,6 +36,7 @@ from widgets import InputFrame
 from toolbar_frame import ToolbarFrame
 from record_table import RecordTableFrame
 from update_ui import UpdateFlow, business_action
+from window_rendering import configure_rendering
 
 
 def _amount_text(amount: Decimal) -> str:
@@ -70,7 +71,8 @@ class AccountKeeperApp(ctk.CTk):
         store: AccountStore,
         last_export_dir: Path = DEFAULT_EXPORT_DIR,
     ) -> None:
-        super().__init__()
+        # 构造时就同步 CTk 配色和原生 Tk 底色，首次显示前也有统一浅灰底。
+        super().__init__(fg_color="#F0F4F8")
         self.update_flow = None
         self._business_depth = 0
         self._update_exiting = False
@@ -95,8 +97,12 @@ class AccountKeeperApp(ctk.CTk):
         self.geometry("960x680")
         # 设置最小尺寸，防止用户把窗口拖得过小导致输入区和表格控件被挤成一团。
         self.minsize(820, 560)
-        self.configure(fg_color="#F0F4F8")
+        configure_rendering(self)  # 实验模式仅影响本进程主窗，默认保持系统绘制方式。
         self._build_widgets()
+        for card in (self.input_frame, self.table_frame):
+            # 圆角外缘沿用主窗浅灰；原生矩形 Frame 以白色托住尚未绘制的卡片内部。
+            card.configure(bg_color="#F0F4F8")
+            tk.Frame.configure(card, background="#FFFFFF")
         # 先渲染一次数据，保证窗口一出现就能看到历史记录。
         self.refresh_records()
         # 蜗牛必须等 title_block 建好之后再创建，因为它需要以标题位置作为爬行边界。
@@ -280,6 +286,8 @@ class AccountKeeperApp(ctk.CTk):
         self.table_frame = RecordTableFrame(self, self.edit_record)
         self.table_frame.pack(fill="both", expand=True, padx=24, pady=(0, 8))
         self.tree = self.table_frame.tree
+        self.table_frame.layout_coordinator.chips = self.input_frame.tag_chips
+        self.input_frame.tag_chips.layout_coordinator = self.table_frame.layout_coordinator
         # 单选、取消选择及重建列表都同步按钮，避免操作上一轮筛选留下的记录。
         self.tree.bind("<<TreeviewSelect>>", self._sync_record_actions, add="+")
         self._sync_record_actions()

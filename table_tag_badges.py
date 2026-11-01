@@ -47,10 +47,11 @@ class TagBadgeRenderer:
     def request(self, _event=None) -> None:
         # ui 插入完成、tooltip 的滚动/列宽处理和原生选择事件都汇入这个重绘入口。
         if not self.closed and self.idle_job is None:
-            self.idle_job = self.tree.after_idle(self.render)  # 滚动/选择的一批通知只重绘一次。
+            self.table.layout_coordinator.schedule(self, "idle_job", self.render)
 
     def clear(self) -> None:
         """取消待绘制任务并隐藏槽位，保留控件与绑定供下一轮记录复用。"""
+        self.table.layout_coordinator.cancel(self, "idle_job")
         if self.idle_job is not None:
             job, self.idle_job = self.idle_job, None
             try:
@@ -64,7 +65,8 @@ class TagBadgeRenderer:
 
     def _canvas(self, index: int) -> tk.Canvas:
         if index == len(self.canvases):
-            canvas = tk.Canvas(self.tree, highlightthickness=0, borderwidth=0, takefocus=0)
+            # 创建即设底色，首次显示前会替换为真实条纹色或选中蓝色。
+            canvas = tk.Canvas(self.tree, background="#FFFFFF", highlightthickness=0, borderwidth=0, takefocus=0)
             self.canvases.append(canvas)
             # 每个可见槽位只绑定一次；滚动只替换内容，不不断积累订阅和控件。
             for sequence, callback in (("<Motion>", self._motion), ("<Leave>", self.tip._leave),
@@ -142,29 +144,41 @@ class TagBadgeRenderer:
             # 覆盖层须复现原生行的选中/条纹底色，否则标签列会看起来像未选中。
             # 条纹 tag 已拆成两色且会全局换色，颜色只能问表格，不能按 tag 名猜（#19）。
             background = "#D7E9FC" if selected else self.table.row_background(iid)
-            canvas.configure(background=background)
+            if canvas.cget("background") != background:
+                canvas.configure(background=background)
             edge = 1 if box[2] > 2 else 0  # 极窄列不能把覆盖层移到cell之外，否则无法悬停。
-            canvas.place(x=box[0] + edge, y=box[1], width=max(1, box[2] - edge * 2), height=box[3])
-            # 覆盖几乎整个 cell，遮住其原生摘要以免重复出现前缀/+N；Treeview 的值本身不改。
-            tk.Misc.lift(canvas)  # Canvas.lift是图元抬升，覆盖窗口必须调用Misc的窗口抬升。
-            canvas.delete("all")
             font, text, padding = self.table.tag_font, f"+{rest}", round(6 * scale)
             # 与 tag_layout 共用字体和 6px 逻辑间距；改绘制预算时必须同步摘要测量预算。
             badge_width = font.measure(text) + 2 * padding
             gap, prefix_width = (round(6 * scale) if prefix else 0), font.measure(prefix)
             left = max(round(5 * scale) - edge, (box[2] - edge * 2 - prefix_width - gap - badge_width) / 2)
             middle = box[3] / 2
-            if prefix:
-                canvas.create_text(left, middle, text=prefix, font=font, anchor="w", fill="#243447" if selected else "#334155")
+            # 固定五个图元；前缀为空时更新为空串，避免缩放时整格清空重建。
+            items = canvas.find_all()
+            if not items:
+                items = (canvas.create_text(0, 0, anchor="w"), canvas.create_oval(0, 0, 0, 0, outline=""),
+                         canvas.create_rectangle(0, 0, 0, 0, outline=""),
+                         canvas.create_oval(0, 0, 0, 0, outline=""), canvas.create_text(0, 0))
+            canvas.coords(items[0], left, middle)
+            canvas.itemconfigure(items[0], text=prefix, font=font, fill="#243447" if selected else "#334155",
+                                 state="normal" if prefix else "hidden")
             left += prefix_width + gap
             badge_height = min(box[3] - 2, font.metrics("linespace") + round(4 * scale))
             top, bottom, right = middle - badge_height / 2, middle + badge_height / 2, left + badge_width
             radius = min(badge_height / 2, badge_width / 2)
             # 两端圆弧加中间矩形，只有胶囊背景着色，文字仍使用同一字体测量。
-            canvas.create_oval(left, top, left + radius * 2, bottom, fill="#EAF2FF", outline="")
-            canvas.create_rectangle(left + radius, top, right - radius, bottom, fill="#EAF2FF", outline="")
-            canvas.create_oval(right - radius * 2, top, right, bottom, fill="#EAF2FF", outline="")
-            canvas.create_text((left + right) / 2, middle, text=text, font=font, fill="#426B9F")
+            for item, coords in zip(items[1:4], ((left, top, left + radius * 2, bottom),
+                    (left + radius, top, right - radius, bottom), (right - radius * 2, top, right, bottom))):
+                canvas.coords(item, *coords)
+                canvas.itemconfigure(item, fill="#EAF2FF")
+            canvas.coords(items[4], (left + right) / 2, middle)
+            canvas.itemconfigure(items[4], text=text, font=font, fill="#426B9F")
+            # 全部内容准备好再显示/扩容，避免新槽位先以空白窗口占位。
+            geometry = (box[0] + edge, box[1], max(1, box[2] - edge * 2), box[3])
+            placed = canvas.place_info()
+            if tuple(int(placed.get(key, -1)) for key in ("x", "y", "width", "height")) != geometry:
+                canvas.place_configure(x=geometry[0], y=geometry[1], width=geometry[2], height=geometry[3])
+            # 各覆盖层同为 tree 子窗口且互不重叠，无须每次重画都重排窗口层级。
         for canvas in self.canvases[index:]:
             canvas.place_forget()  # 只隐藏不再使用的槽位，活动cell不反复Unmap造成提示闪烁。
         # 视口行数外加两槽容纳边界处的部分可见行，缩窗后也不保留曾经较大的控件池。
