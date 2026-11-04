@@ -82,6 +82,11 @@ class UpdateFlow:
 
     def startup(self):
         if self.target is not None and not self.closing and self.start_job is None:
+            try:
+                from update_cleanup_ui import start
+                start(self.app, self.target)  # 只派发后台清扫，既有更新定时器不等待检测结果。
+            except Exception:
+                pass  # 可选清扫模块不可用不得改变启动或更新判定。
             self.start_job = self.app.after(2000, self._automatic)
 
     def _automatic(self):

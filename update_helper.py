@@ -1081,27 +1081,60 @@ def reconcile_sqlite(j):
     return True
 
 
+def _validate_commit_receipt(j, state):
+    target = Path(j["target"])
+    actual = digest(target)
+    if actual != j["new_sha"]:
+        raise UpdateFailure("提交包与物理目标不符")
+    binding = {key: j[key] for key in ("work", "data_dir", "old_sha", "new_sha")}
+    last = state["last"] or {}
+    attempt = state["active"] or last.get("attempt") or {}
+    if attempt.get("binding") is not None and (attempt["binding"] != binding
+            or any(attempt.get(k) != j["attempt"][k] for k in ("id", "seq"))):
+        raise UpdateFailure("终态日志不能掩盖另一安装尝试")  # 有日志也不能绕过新安装绑定。
+    receipt = state.get("committed")
+    if receipt is None:
+        return  # 首次发布没有旧凭据；仍已核对主包与现存安装绑定。
+    if receipt["transaction"] == j["transaction"]:
+        # 同一事务重放只认原凭据，不得用日志修复被篡改的摘要或身份。
+        if (receipt["sha256"] != actual or receipt["data_dir"] != j["data_dir"]
+                or receipt["token"] != j["token"]):
+            raise UpdateFailure("终态安装凭据与当前事务不符")
+        return
+    # 换代必须由旧凭据old_sha、本事务new_sha和持久绑定证明，不能只凭事务号不同。
+    previous_attempt = last.get("attempt") or {}
+    if (receipt["sha256"] != j["old_sha"] or j["old_sha"] == actual
+            or receipt["data_dir"] != j["data_dir"] or receipt["token"] == j["token"]
+            or last.get("outcome") != "success" or state["settled"] != j["attempt"]["seq"]
+            or any(previous_attempt.get(k) != j["attempt"][k] for k in ("id", "seq"))
+            or previous_attempt.get("binding") != binding):
+        raise UpdateFailure("终态凭据换代依据不足")
+    # 存量用户可能刚提交新版、尚未覆盖旧凭据；仅完整提交标记和验签允许此窗口。
+    if not committed(j):
+        raise UpdateFailure("终态凭据换代缺少提交标记")
+    verify_materials(j)
+
+
 def record_commit(j):
     with FileLock(Path(j["target"]), "state"):
         state = read_state(j["target"])
+        _validate_commit_receipt(j, state)  # 持锁复核后才写凭据，拒绝时保留原记录。
         state["committed"] = dict(target=j["target"], sha256=j["new_sha"], data_dir=j["data_dir"],  # 状态允许写入committed凭据字典，read_state也校验该结构。
                                   transaction=j["transaction"], token=j["token"])
         atomic_json(state_path(j["target"]), state)  # 独立终态凭据先落盘，材料目录被删除后仍能核实当前安装。
 
 
 def retire_committed(j):
-    if digest(Path(j["target"])) != j["new_sha"]:
-        raise UpdateFailure("提交包与物理目标不符")  # 哈希核验必须先于所有尽力清理，不能被except吞掉。
+    with FileLock(Path(j["target"]), "state"):
+        _validate_commit_receipt(j, read_state(j["target"]))  # 结算及可选清理之前拒绝，不吞安全错误。
     settle_attempt(j["target"], j["attempt"], "success", "入口提交补记")
     record_commit(j)
     release_data(j)
     try:
-        if not helper_alive(j):
-            with FileLock(Path(j["target"]), "install", 0):
-                current = load_journal(j["target"])
-                if current["transaction"] == j["transaction"] and current["phase"] == "committed":
-                    journal_path(j["target"]).unlink()
-    except (OSError, UpdateFailure) as error:
+        # 终态安全判定已完成；后台先补删材料，全部收尾成功后才移除日志，失败保留重试依据。
+        from update_cleanup import defer_committed
+        defer_committed(j)
+    except Exception as error:  # 仅清理派发容错，不能覆盖上面的主包核验、结算或解锁错误。
         log_line(j["target"], f"终态日志清理待重试：{error}")  # 可信终态已持久化，旧材料或清理失败不得阻断业务。
 
 
