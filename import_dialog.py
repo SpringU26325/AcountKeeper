@@ -2,6 +2,7 @@
 
 import tkinter as tk
 
+from dialog_common import _apply_app_icon
 from dialog_lifecycle import ManagedToplevel
 from import_dialog_view import ImportDialogView
 from import_pagination import ImportPagination
@@ -15,6 +16,8 @@ class ImportDialog(ManagedToplevel):
         self.session, self.on_confirm, self.mapping_path = session, on_confirm, mapping_path
         self.accepted_result = None
         self.title("导入外部账单")
+        # 预览窗显式使用应用图标，避免采用 CustomTkinter 的默认图标。
+        _apply_app_icon(self)
         self.geometry("1220x740")
         self.minsize(980, 660)
         self.font = ("Microsoft YaHei UI", 12)

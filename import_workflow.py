@@ -10,6 +10,7 @@ from typing import TypeGuard, TypeVar
 import customtkinter as ctk
 
 from config import RESOURCE_DIR
+from dialog_common import _apply_app_icon
 from dialog_lifecycle import ManagedToplevel
 import dialogs
 from import_dialog import ImportDialog
@@ -37,6 +38,8 @@ class FlowWindow(ManagedToplevel):
     def __init__(self, parent, title, size="680x440"):
         super().__init__(parent, fg_color="#F0F4F8")
         self.title(title)
+        # 读取、完成及批次窗口共用同一图标，构建时统一设置。
+        _apply_app_icon(self)
         self.geometry(size)
         self.transient(parent)
         self.font = ("Microsoft YaHei UI", 12)

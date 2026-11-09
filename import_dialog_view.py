@@ -5,6 +5,7 @@ import tkinter as tk
 
 import customtkinter as ctk
 
+from dialog_common import _apply_app_icon
 from dialog_lifecycle import ManagedToplevel
 from import_preview_controls import PreviewControls, PreviewSelect
 
@@ -347,6 +348,8 @@ class ImportDialogView:
     def _popup(self, title):
         popup = ManagedToplevel(self.window, fg_color="#F0F4F8")
         popup.title(title)
+        # 帮助和多列选择独立建窗，也使用同一应用图标。
+        _apply_app_icon(popup)
         popup.geometry("680x390")
         popup.transient(self.window)
         popup.protocol("WM_DELETE_WINDOW", popup.destroy)
