@@ -17,6 +17,7 @@ class HeaderState:
     enabled: bool
     ready: bool
     count: int
+    has_decisions: bool
 
 
 class ImportPreviewTable:
@@ -44,7 +45,7 @@ class ImportPreviewTable:
                 ("Treeheading.padding", {"sticky": "nswe", "children": [("Treeheading.text", {"sticky": "we"})]})]})])
         scale = self.details._get_widget_scaling()
         font = ("Microsoft YaHei UI", -round(12 * scale))
-        style.configure("ImportPreview.Treeview", font=font, rowheight=round(32 * scale), borderwidth=0,
+        style.configure("ImportPreview.Treeview", font=font, rowheight=round(36 * scale), borderwidth=0,
                         background="white", fieldbackground="white", foreground="#334155",
                         bordercolor="white", lightcolor="white", darkcolor="white")
         style.configure("ImportPreview.Treeview.Heading", font=(*font, "bold"), background="#EAF2FA",
@@ -90,10 +91,14 @@ class ImportPreviewTable:
             title += " · 续（本页继续核对）" if continuation(pair) else ""
             self._processing_header(section, title, None, pair, historical)
         tree = ttk.Treeview(section, columns=("row", "date", "amount", "note", "result"),
+                            displaycolumns=("row", "note", "date", "amount", "result"),
                             show="headings", height=1, style="ImportPreview.Treeview", selectmode="browse")
-        for key, title, width in zip(tree["columns"], ("原始行", "本地日期", "带符号金额", "备注", "处理结果"), (65, 95, 95, 160, 220)):
+        scale = self.details._get_widget_scaling()
+        for key, title, width in zip(tree["columns"], ("原始行", "本地日期", "带符号金额", "备注", "处理结果"), (45, 90, 85, 170, 170)):
             tree.heading(key, text=title)
-            tree.column(key, width=width, minwidth=45, stretch=True)
+            # 原生Treeview按物理像素计算列宽，须与表头字体使用同一缩放，避免高DPI文字相连。
+            tree.column(key, width=round(width * scale),
+                        minwidth=round((45 if key == "row" else 70) * scale), stretch=key in ("note", "result"))
         tree.tag_configure("obsolete", foreground="#84909E", background="#F0F4F8")
         tree.tag_configure("handled", foreground="#64748B", background="#F0F4F8")
         tree.pack(fill="x", pady=3)
@@ -140,15 +145,25 @@ class ImportPreviewTable:
             clear = self.controls.button(frame, "清除本组决定", lambda: self.on_clear(group), width=115)
             clear.grid(row=1, column=1, sticky="e", padx=9, pady=2)
             clear.configure(state="normal" if enabled else "disabled")
+            if not selection.explicit and not selection.has_decisions:
+                clear.grid_remove()  # 没有决定时收起清除入口，避免与当前选择争夺注意力。
         controls = {"menu": menu, "confirm": confirm, "clear": clear, "status": status,
                     "status_label": status_label, "caption": caption}
         (self.pair_controls if pair else self.group_controls)[pair or group] = controls
         if group:
-            explanation = {"疑似退款对": "相似记录金额相反，请核对两笔", "规则冲突": "不同信息给出了不一致的处理结果，请核对原因",
-                           "已识别退款": "请确认是否将退款作为收入记入账本", "未知状态": "无法自动决定是否入账，请查看原始内容"}.get(group, "")
-            count = selection.count
-            self.controls.label(parent, f"{explanation}\n批量处理本组（{count} 笔）：包含已处理及筛选隐藏的记录。",
-                        anchor="w", justify="left", wraplength=570).pack(fill="x", padx=6)
+            self.controls.label(parent,
+                f"批量处理本组 {selection.count} 笔，包含已处理及筛选隐藏的记录。",
+                anchor="w", justify="left", wraplength=420, text_color="#64748B").pack(fill="x", padx=6)
+
+        def reflow(event):
+            # 窄栏把操作移至独立行，标题和按钮均留在窗口内，明细始终可定位。
+            narrow = event.width / frame._get_widget_scaling() < 560
+            action_area.grid(row=2 if narrow else 0, column=0 if narrow else 1,
+                             columnspan=2 if narrow else 1, sticky="w" if narrow else "e")
+            if clear is not None and clear.winfo_manager():
+                clear.grid(row=3 if narrow else 1)
+        frame.bind("<Configure>", reflow, add="+")
+
 
     def append_rows(self, rows, *, historical, pending, source, display_values, continuation):
         # 只插入门面已核验令牌的当前批次，本组件不注册异步任务。

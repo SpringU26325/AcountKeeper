@@ -78,8 +78,12 @@ class ImportDialog(ManagedToplevel):
         actions = ("两笔都跳过", "只记支出", "两笔都记", "只记退款") if pair else self.session.group_actions(group)
         ready = self._preview_current() and self._preview_ready == (
             "pair" if pair else "group", pair or group, self.session.version)
+        # 逐笔处理可能没有整组候选，清除入口仍应反映本组已存在的决定。
+        members = set(source.groups.get(group, ()))
+        decided = bool(members.intersection(source.row_actions)) or any(
+            members.intersection(key) for key in source.pair_actions)
         return HeaderState(selection.value, selection.state, selection.explicit, actions,
-            not historical and not self.session.busy, ready, len(source.groups.get(group, ())))
+            not historical and not self.session.busy, ready, len(members), decided)
 
     def _run(self, operation):
         try:
@@ -193,7 +197,10 @@ class ImportDialog(ManagedToplevel):
         suffix = " · 历史回看（已作废）" if historical else ""
         self.view.view_title.configure(text=f"{self.session.current_view} · 共 {len(full)} 笔{suffix}" +
             (f"，当前展示前 5 笔" if summary and len(full) > 5 else ""))
+        # 摘要视图保留完整入口，普通明细的数量由分页栏统一说明。
+        self.view.view_title.grid() if summary or historical else self.view.view_title.grid_remove()
         self.view.all_button.configure(state="normal" if summary and len(full) > 5 else "disabled")
+        self.view.all_button.pack(side="left") if summary and len(full) > 5 else self.view.all_button.pack_forget()
         self.view.update_pager(self.pagination)
         if not rows:
             self.view.controls.label(self.view.details, "未找到匹配记录" if self.session.search_text else "当前视图无记录").grid(row=0, column=0)
@@ -301,7 +308,7 @@ class ImportDialog(ManagedToplevel):
         # 最终内容在只读核对区呈现，原确认按钮就是明确决定，不额外再弹确认框。
         members = set(ids)
         rows = [row for row in self.session.preview.rows if row.row_number in members]
-        self.view.show_inspection(True)
+        self.view.show_inspection(True, row_actions=kind == "row")
         self.view.inspect_title.configure(text=f"正在处理：原始第 {target} 行" if kind == "row" else f"最终处理预览 · {'本对' if kind == 'pair' else '本组'}共 {len(ids)} 笔")
         self.view.set_raw(self._inspection_text(rows, final=True))
         self.view.row_hint.configure(text="核对入账后内容，再点「此笔入账」；不记这笔可点「跳过此笔」。" if kind == "row" else
@@ -341,7 +348,7 @@ class ImportDialog(ManagedToplevel):
         self.session.located_row = number
         historical = self.session.result is None
         notice = "已作废（映射已变，决定不能应用）\n" if historical else ""
-        self.view.show_inspection(True)
+        self.view.show_inspection(True, row_actions=True)
         self.view.inspect_title.configure(text=f"{'历史回看' if historical else '正在处理'}：原始第 {number} 行")
         self.view.set_raw(notice + self._inspection_text((row,)))
         self._set_row_state(row, historical)

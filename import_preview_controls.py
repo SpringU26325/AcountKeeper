@@ -17,11 +17,12 @@ class PreviewSelect(ctk.CTkFrame):
         self._entry_pressed = False
         self.grid_columnconfigure(0, weight=1)
         self.label = ctk.CTkButton(self, text=self.value, command=self.open, font=font,
-            width=max(60, width - 36), height=32, anchor="w", fg_color="transparent",
+            width=max(60, width - 40), height=26, anchor="w", fg_color="transparent",
             hover_color="#D2DEE9", text_color="#243447", corner_radius=7)
-        self.label.grid(row=0, column=0, sticky="ew", padx=(1, 0), pady=1)
-        self.toggle = make_toggle_button(self, self.open, height=32)
-        self.toggle.grid(row=0, column=1, padx=1, pady=1)
+        # 子按钮底层仍是矩形画布；四周留足圆角空间，避免遮住外框描边。
+        self.label.grid(row=0, column=0, sticky="ew", padx=(4, 0), pady=4)
+        self.toggle = make_toggle_button(self, self.open, height=26)
+        self.toggle.grid(row=0, column=1, padx=(0, 4), pady=4)
         self.bind("<Destroy>", self._destroyed, add="+")  # type: ignore[reportArgumentType] # Tk 的 add 实际接受 "+"，CTk 存根标成 bool。
         # 单个键盘焦点覆盖整个选择框，回车/空格展开，上下键在弹层内移动。
         self.label._canvas.configure(takefocus=1)
