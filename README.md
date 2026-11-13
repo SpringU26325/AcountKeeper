@@ -3,24 +3,23 @@
 
 # AccountKeeper 本地记账软件
 
-**中文摘要：** AccountKeeper 是一款轻量、开源的本地记账软件，支持日常收支记录、账单导入、可视化财务分析和数据备份。v1.0.1 带来了极致的性能飞跃与交互细节打磨，毫秒级响应，让记账更顺滑。
+**中文摘要：** AccountKeeper 是一款轻量、开源的本地记账软件，支持日常收支记录、账单导入、可视化财务分析和数据备份。v1.0.2 带来了导入外部账单体验的全面重塑，弹窗图标统一、布局重构、高分屏适配，让导入更顺手。
 
-**English summary:** AccountKeeper is a lightweight, open-source desktop app for personal bookkeeping, with local data storage, bill imports, interactive charts, and backups. Version 1.0.1 delivers extreme performance improvements and polished interactions for a smoother bookkeeping experience.
+**English summary:** AccountKeeper is a lightweight, open-source desktop app for personal bookkeeping, with local data storage, bill imports, interactive charts, and backups. Version 1.0.2 delivers a fully reworked bill-import experience with unified window icons, rebuilt layout, and high-DPI polish for smoother imports.
 
 🎉 我的第一个独立使用 vibe-coding 开发的记账软件，正式跨入 1.0 时代！
 </div>
 
-## 🆕 v1.0.1 重磅更新
+## 🆕 v1.0.2 重磅更新
 
-本次更新聚焦于 **「极致性能」** 与 **「细节打磨」**，让你的记账体验如丝般顺滑。
+本次更新聚焦于 **「导入体验」** 的全面重塑，让导入外部账单不再只是「能用」，而是「好用」。
 
-- **⚡ 性能极限飞跃**：重构了底层数据加载与表格渲染逻辑。5 万笔大账本的主界面刷新从 5 秒直降至 **0.1 秒**，输入框复位仅需 **12 毫秒**。彻底告别卡顿！
-- **🎨 金额视觉着色**：表格新增红绿金额着色，支出标红，收入标绿，并补全正号。账目盈亏一眼可见。
-- **⚠️ 文件名安全拦截**：如果用户随意重命名 `AccountKeeper.exe`，程序启动时会弹出明确的原生提示，阻止运行，避免小白用户因改名导致“软件打不开”的困惑。
-- **🛡️ 金融级数据防误删**：
-  - 导出 CSV 时，拦截覆盖账本数据库的致命操作。
-  - 导入 XLSX 时，增加 10 万行/50 万单元格的硬限制，防止恶意超大文件撑爆内存。
-  - 强化金额精度校验，彻底杜绝 `0.001` 被静默转成 `0.00` 的风险。
+- **🖼️ 弹窗图标统一**：修复了导入预览窗、流程窗口、帮助及多列选择窗显示默认蓝色图标的问题，所有弹窗与主程序图标一致。
+- **🎨 导入窗口布局重构**：双栏设计、字段前置、明细收纳、分页后置，操作动线一气呵成。
+- **🧠 冲突组三态交互**：未选/已选/已确认三种状态清晰分层，试算与确认门槛严格执行，避免误操作。
+- **📝 备注列前置**：原备注紧跟原始数据，无需横向滚动。
+- **📐 高分屏适配**：100% / 125% 缩放下完成视觉验收，修复表头挤压与下拉框描边残缺。
+- **🧮 自适应计数格**：窄窗下自动从 1×4 切换为 2×2，任何尺寸都不截断。
 
 ## ✨ 功能特性
 
@@ -38,8 +37,8 @@
 请前往发布页，下载最新的 `AccountKeeper.exe`，双击即可运行，无需安装 Python。请保留程序文件名 `AccountKeeper.exe`，以便正常使用自动更新功能。
 
 ### ⚠️ 升级须知
-如果您当前使用的是 **v1.0.0**，可直接在软件内通过“检查更新”平滑升级。
-如果您使用的是 **v0.1.9 或更早版本**，由于早期测试版网络协议限制，请**手动下载 v1.0.1** 覆盖原文件（账本数据绝对不会丢失）。
+如果您当前使用的是 **v1.0.0 或 v1.0.1**，可直接在软件内通过“检查更新”平滑升级。
+如果您使用的是 **v0.1.9 或更早版本**，由于早期测试版网络协议限制，请**手动下载 v1.0.2** 覆盖原文件（账本数据绝对不会丢失）。
 
 ### 账本在哪里？更新会影响数据吗？
 账本和偏好保存在 Windows 用户本地数据目录（AppData）中，通常位于：`%LOCALAPPDATA%\SpringU26325\AccountKeeper`。可通过软件右上角的“应用 -> 打开数据目录”查看。
