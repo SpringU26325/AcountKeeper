@@ -11,6 +11,7 @@ from threading import Event, Thread
 
 import customtkinter as ctk
 
+from chart_details import ChartDetails
 from dialog_lifecycle import ManagedToplevel, _cancel_owned_tasks
 from config import RESOURCE_DIR
 from file_picker import FileMenu
@@ -67,6 +68,9 @@ class StatsWindow(ManagedToplevel):
         self.direction = "支出"
         self.canvas = None
         self.figure = None
+        self.detail_window: ChartDetails | None = None
+        self.detail_click = None
+        self._opening_details = False
         self.render_job = None
         self.revision = 0
         self.card_values = []
@@ -253,7 +257,7 @@ class StatsWindow(ManagedToplevel):
         self.insight.configure(text="正在读取账本缓存…")
         try:
             # Account 可变，必须复制字段，后台不能读取共享对象或跨线程调用 store。
-            snapshot = tuple(StatsRecord(row.record_id, row.record_date, row.amount, tuple(row.tags))
+            snapshot = tuple(StatsRecord(row.record_id, row.record_date, row.amount, tuple(row.tags), row.note)
                              for row in self.records_provider())
             _put_latest(self.jobs, (self.generation, snapshot, self.month, date.today()))
         except Exception as error:
@@ -341,6 +345,7 @@ class StatsWindow(ManagedToplevel):
         if self.closing:
             return
         self.revision += 1
+        self._close_details()  # 画面条件已变化，立即作废明细和旧点击，不等延时绘图。
         if self.render_job is not None:
             self.after_cancel(self.render_job)
         # 仅合并连续操作，不把 after 宣称为后台绘图；TkAgg 严格在主线程运行。
@@ -349,6 +354,9 @@ class StatsWindow(ManagedToplevel):
 
     def _clear_chart(self):
         if self.canvas is not None:
+            if self.detail_click is not None:
+                self.canvas.mpl_disconnect(self.detail_click)
+                self.detail_click = None
             widget = self.canvas.get_tk_widget()
             # 主动切页也先取消画布自己的 idle，避免 Tcl 在销毁后调用旧命令。
             _cancel_owned_tasks(widget)
@@ -383,8 +391,8 @@ class StatsWindow(ManagedToplevel):
                              text_color="#FFFFFF", text_color_disabled="#94A3B8", border_width=1,
                              border_color="#2563EB" if enabled else "#E2E8F0")
         notes = {
-            "收支标签": "多标签记录分别计入各项，标签合计可能大于当月总额。未分类表示没有标签的记录。",
-            "每日趋势": "日均支出 = 当月总支出 ÷ 当月已过天数（含今天）；历史月份按整月天数。",
+            "收支标签": "点击柱子查看明细。多标签记录分别计入各项，标签合计可能大于当月总额。未分类表示没有标签的记录。",
+            "每日趋势": "点击日期点查看当天支出。日均支出 = 当月总支出 ÷ 当月已过天数（含今天）；历史月份按整月天数。",
             "近半年": "收入向上，支出向下；纵轴负值仅表示支出方向。",
         }
         note = notes[page]
@@ -420,16 +428,20 @@ class StatsWindow(ManagedToplevel):
             for edge in ("top", "right", "left"):
                 ax.spines[edge].set_visible(False)
             ax.spines["bottom"].set_color(BORDER)
+            tag_bars, daily_line = (), None
             if page == "收支标签":
-                self._draw_tags(ax, rows[self.tag_page * 6:(self.tag_page + 1) * 6], font)
+                visible = rows[self.tag_page * 6:(self.tag_page + 1) * 6]
+                tag_bars = tuple(zip(self._draw_tags(ax, visible, font), visible))
             elif page == "每日趋势":
-                self._draw_daily(ax, data, font)
+                daily_line = self._draw_daily(ax, data, font)
             else:
                 self._draw_half_year(ax, font)
             # 字体仅作用于本图，不改全局 rcParams，避免污染其他窗口。
             for tick in [*ax.get_xticklabels(), *ax.get_yticklabels()]:
                 tick.set_fontproperties(font)
             self.canvas = FigureCanvasTkAgg(self.figure, master=host)
+            if data is not None and (tag_bars or daily_line is not None):
+                self._bind_detail_click(self.canvas, ax, tag_bars, daily_line, data, revision)
             self.canvas.get_tk_widget().pack(fill="both", expand=True)
             self.canvas.draw_idle()
         except (ImportError, RuntimeError, ValueError, tk.TclError) as error:
@@ -439,11 +451,59 @@ class StatsWindow(ManagedToplevel):
             self.note.configure(text=f"图表加载失败：{error}")
             print(f"财务分析图表加载失败：{error}")
 
+    def _bind_detail_click(self, canvas, ax, tag_bars, daily_line, data, revision):
+        from matplotlib.backend_bases import MouseButton
+
+        month, direction = self.month, self.direction
+
+        def open_at(event):
+            if (self.closing or self.revision != revision or event.button != MouseButton.LEFT
+                    or event.inaxes is not ax):
+                return
+            if daily_line is not None:
+                # 只命中实际日期点。用画布像素算距离，在缩放后也不会把日均线或线段误认成点。
+                points = ax.transData.transform(daily_line.get_xydata())
+                distance, index = min(((x - event.x) ** 2 + (y - event.y) ** 2, index)
+                                      for index, (x, y) in enumerate(points))
+                if distance <= (7 * canvas.figure.dpi / 72) ** 2:
+                    day = f"{month}-{index + 1:02d}"
+                    self._show_details(f"{day} · 支出", data.day_expenses(day), data.daily[index], revision)
+                return
+            for bar, (tag, amount) in tag_bars:
+                if bar.contains(event)[0]:
+                    rows = data.tag_records(tag, expense=direction == "支出")
+                    self._show_details(f"{month} · {tag} · {direction}", rows, amount, revision)
+                    return
+
+        self.detail_click = canvas.mpl_connect("button_press_event", open_at)
+
+    def _show_details(self, title, rows, amount, revision):
+        if self._opening_details:
+            return
+        window = self.detail_window
+        if window is None or window.closing:
+            # CTk 建窗期间可能处理事件；防止重入创建两个窗口，或让旧图在切页后抢回焦点。
+            self._opening_details = True
+            try:
+                window = ChartDetails(self)
+            finally:
+                self._opening_details = False
+            if window.closing or self.closing or self.revision != revision:
+                window.destroy()
+                return
+            self.detail_window = window
+        window.show_rows(title, rows, amount)
+
+    def _close_details(self):
+        window, self.detail_window = self.detail_window, None
+        if window is not None:
+            window.destroy()
+
     def _draw_tags(self, ax, rows, font):
         names, amounts = zip(*rows)
         values = [float(amount) for amount in amounts]  # 仅渲染边界转 float，不参与业务汇总。
         color = BLUE if self.direction == "支出" else GREEN
-        ax.barh(range(len(names)), values, height=0.55, color=color, alpha=0.86)
+        bars = ax.barh(range(len(names)), values, height=0.55, color=color, alpha=0.86)
         ax.set_yticks(range(len(names)), names)
         ax.invert_yaxis()
         ax.set_xlim(0, max(values) * 1.18)
@@ -452,12 +512,13 @@ class StatsWindow(ManagedToplevel):
         for index, value in enumerate(values):
             ax.text(value + max(values) * 0.015, index, f"{value:,.2f}",
                     va="center", color=INK, fontproperties=font)
+        return bars
 
     def _draw_daily(self, ax, data, font):
         values = [float(amount) for amount in data.daily]
         days = range(1, len(values) + 1)
-        ax.plot(days, values, color=BLUE, marker="o", markersize=3.5,
-                linewidth=1.8, label="每日支出")
+        line, = ax.plot(days, values, color=BLUE, marker="o", markersize=3.5,
+                        linewidth=1.8, label="每日支出")
         ax.fill_between(days, values, color=BLUE, alpha=0.055)
         average = float(data.average) if data.average is not None else 0
         if data.average is not None:
@@ -472,6 +533,7 @@ class StatsWindow(ManagedToplevel):
         ax.set_ylabel("金额（元）", fontproperties=font, color=MUTED, labelpad=20)
         ax.legend(loc="lower right", bbox_to_anchor=(1, 1.04), ncol=2,
                   borderaxespad=0, frameon=False, prop=font)
+        return line
 
     def _draw_half_year(self, ax, font):
         data = self.data
@@ -511,5 +573,6 @@ class StatsWindow(ManagedToplevel):
             if self.render_job is not None:
                 self.after_cancel(self.render_job)
                 self.render_job = None
+            self._close_details()
             self._clear_chart()
         super().destroy()

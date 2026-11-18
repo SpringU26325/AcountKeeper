@@ -46,6 +46,11 @@ class RecordTotals:
     by_tag: dict[str, TagTotals]
 
 
+def _record_tags(record: Account | StatsRecord) -> tuple[str, ...]:
+    # 汇总和逐笔明细共用虚拟桶规则，避免「未分类」柱子与明细分组不同。
+    return record.tags or ("未分类",)
+
+
 @_money_precision
 def aggregate_records_by_tag(records: Iterable[Account | StatsRecord]) -> RecordTotals:
     """按完整 tags 聚合当前输入；不按摘要统计，也不在这里筛选日期或排序标签。"""
@@ -68,9 +73,8 @@ def aggregate_records_by_tag(records: Iterable[Account | StatsRecord]) -> Record
 
         # 无标签记录只能进入虚拟桶；多标签记录则对每个标签分别计入整笔金额。
         # 「未分类」仅是本次结果的分组名，不补写 record.tags、record_tags 或 tags.json。
-        tags = record.tags if record.tags else ("未分类",)
         # 正常写库已去重，此处再防御调用方构造的重复标签，避免同名桶重复计入一笔。
-        for tag in dict.fromkeys(tags):
+        for tag in dict.fromkeys(_record_tags(record)):
             bucket = buckets.setdefault(tag, [Decimal("0"), Decimal("0")])
             if amount > 0:
                 bucket[0] += amount
@@ -94,6 +98,7 @@ class StatsRecord:
     record_date: str
     amount: Decimal
     tags: tuple[str, ...]
+    note: str = ""
 
 
 @dataclass(frozen=True)
@@ -110,6 +115,15 @@ class MonthStats:
     skipped_count: int
     future_count: int
     months: tuple[str, ...]
+    records: tuple[StatsRecord, ...]
+
+    def tag_records(self, tag: str, *, expense: bool) -> tuple[StatsRecord, ...]:
+        # 一笔钱可出现在不同标签内，同一个标签的明细只列一次。
+        return tuple(row for row in self.records
+                     if (row.amount < 0 if expense else row.amount > 0) and tag in _record_tags(row))
+
+    def day_expenses(self, day: str) -> tuple[StatsRecord, ...]:
+        return tuple(row for row in self.records if row.record_date == day and row.amount < 0)
 
 
 def offset_month(month: str, offset: int) -> str:
@@ -203,4 +217,5 @@ def build_month_stats(records: Iterable[StatsRecord], month: str, today: date) -
         daily=tuple(daily), half_year=tuple((key, half[key][0], half[key][1]) for key in months),
         largest=largest, record_count=len(selected), skipped_count=skipped,
         future_count=future, months=tuple(sorted(available, reverse=True)),
+        records=tuple(selected),  # 复用已校验的当月记录，不让明细重新解释原始缓存。
     )
