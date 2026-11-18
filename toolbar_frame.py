@@ -81,6 +81,12 @@ class ToolbarFrame(ctk.CTkFrame):
             border_color="#D8E1EA", fg_color="#FFFFFF", font=font_small,
             placeholder_text="搜索日期/标签/备注")
         self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        def focus_search(_event: tk.Event) -> str:
+            self.search_entry.focus_set()
+            self.search_entry.select_range(0, tk.END)
+            return "break"
+        master.bind("<Control-f>", focus_search, add="+")  # 只绑定主窗，独立弹窗保留自己的焦点。
         # 虚拟事件先于 Tk 插入/剪切执行，延后读取才能让鼠标粘贴同样实时筛选。
         self.search_entry.bind("<KeyRelease>", filter_callback, add=True)
         for sequence in ("<<Paste>>", "<<PasteSelection>>", "<<Cut>>", "<<Clear>>"):
