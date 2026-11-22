@@ -39,7 +39,7 @@
 如果您使用的是 **v0.1.9 或更早版本**，请手动下载 v1.1.0 的 `AccountKeeper.exe` 替换旧程序。
 
 ### 账本在哪里？更新会影响数据吗？
-账本和偏好保存在 Windows 用户本地数据目录（AppData）中，通常位于：`%LOCALAPPDATA%\SpringU26325\AccountKeeper`。可通过软件右上角的“应用 -> 打开数据目录”查看。
+账本和偏好保存在 Windows 用户本地数据目录（AppData）中，通常位于：`%LOCALAPPDATA%\SpringU26325\AccountKeeper`。可通过软件右上角的“文件 → 打开数据目录”查看。
 
 **账本与程序严格分开存放，更新失败或回退绝不会影响你的账本。** 自动更新也绝不会上传你的任何账目数据。
 
