@@ -3,23 +3,21 @@
 
 # AccountKeeper 本地记账软件
 
-**中文摘要：** AccountKeeper 是一款轻量、开源的本地记账软件，支持日常收支记录、账单导入、可视化财务分析和数据备份。v1.0.2 带来了导入外部账单体验的全面重塑，弹窗图标统一、布局重构、高分屏适配，让导入更顺手。
+**中文摘要：** AccountKeeper 是一款轻量、开源的本地记账软件，支持日常收支记录、账单导入、可视化财务分析和数据备份。v1.1.0 加入月度总预算和标签预算，记账时可查看超额提醒。
 
-**English summary:** AccountKeeper is a lightweight, open-source desktop app for personal bookkeeping, with local data storage, bill imports, interactive charts, and backups. Version 1.0.2 delivers a fully reworked bill-import experience with unified window icons, rebuilt layout, and high-DPI polish for smoother imports.
+**English summary:** AccountKeeper is a lightweight, open-source desktop app for personal bookkeeping, with local data storage, bill imports, interactive charts, and backups. Version 1.1.0 adds monthly and per-tag budgets, plus alerts when spending crosses a budget threshold.
 
 🎉 我的第一个独立使用 vibe-coding 开发的记账软件，正式跨入 1.0 时代！
 </div>
 
-## 🆕 v1.0.2 重磅更新
+## 🆕 v1.1.0 预算管理
 
-本次更新聚焦于 **「导入体验」** 的全面重塑，让导入外部账单不再只是「能用」，而是「好用」。
+- **月度预算**：设置总预算和单个标签预算，查看剩余额度和逐笔明细，也可以一键补齐上月额度。
+- **预算外支出**：新增或编辑支出时可勾选「不计入预算」，账目仍保留在账本与财务分析中。
+- **跨档提醒**：保存支出后，接近上限、已用完或超支时，录入区与蜗牛气泡同步提示。
+- **图表明细和搜索**：可从财务分析的标签图和每日趋势查看组成金额的账目，主窗按 `Ctrl+F` 聚焦搜索。
 
-- **🖼️ 弹窗图标统一**：修复了导入预览窗、流程窗口、帮助及多列选择窗显示默认蓝色图标的问题，所有弹窗与主程序图标一致。
-- **🎨 导入窗口布局重构**：双栏设计、字段前置、明细收纳、分页后置，操作动线一气呵成。
-- **🧠 冲突组三态交互**：未选/已选/已确认三种状态清晰分层，试算与确认门槛严格执行，避免误操作。
-- **📝 备注列前置**：原备注紧跟原始数据，无需横向滚动。
-- **📐 高分屏适配**：100% / 125% 缩放下完成视觉验收，修复表头挤压与下拉框描边残缺。
-- **🧮 自适应计数格**：窄窗下自动从 1×4 切换为 2×2，任何尺寸都不截断。
+详见 [v1.1.0 更新日志](release_note/1.1.0_release_note.md)。
 
 ## ✨ 功能特性
 
@@ -37,8 +35,8 @@
 请前往发布页，下载最新的 `AccountKeeper.exe`，双击即可运行，无需安装 Python。请保留程序文件名 `AccountKeeper.exe`，以便正常使用自动更新功能。
 
 ### ⚠️ 升级须知
-如果您当前使用的是 **v1.0.0 或 v1.0.1**，可直接在软件内通过“检查更新”平滑升级。
-如果您使用的是 **v0.1.9 或更早版本**，由于早期测试版网络协议限制，请**手动下载 v1.0.2** 覆盖原文件（账本数据绝对不会丢失）。
+如果您当前使用的是 **v1.0.0 至 v1.0.2**，可在软件内通过「检查更新」升级。
+如果您使用的是 **v0.1.9 或更早版本**，请手动下载 v1.1.0 的 `AccountKeeper.exe` 替换旧程序。
 
 ### 账本在哪里？更新会影响数据吗？
 账本和偏好保存在 Windows 用户本地数据目录（AppData）中，通常位于：`%LOCALAPPDATA%\SpringU26325\AccountKeeper`。可通过软件右上角的“应用 -> 打开数据目录”查看。

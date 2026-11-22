@@ -39,7 +39,10 @@ def _put_latest(queue, value):
 class StatsWindow(ManagedToplevel):
     """独立的 CTk 窗口，TkAgg 的创建、绘制和销毁均由主线程执行。"""
 
-    def __init__(self, master: tk.Misc, records_provider: Callable[[], Iterable[Account]]) -> None:
+    def __init__(
+        self, master: tk.Misc, records_provider: Callable[[], Iterable[Account]],
+        *, load_skipped_count_provider: Callable[[], int] | None = None,
+    ) -> None:
         super().__init__(master, fg_color=BG)
         self.title("财务分析")
         icon_path = RESOURCE_DIR / "image" / "app_icon.ico"
@@ -56,6 +59,7 @@ class StatsWindow(ManagedToplevel):
         self.minsize(960, 700)
         self.month = date.today().strftime("%Y-%m")
         self.records_provider = records_provider
+        self.load_skipped_count_provider = load_skipped_count_provider
         self.data: MonthStats | None = None
         self.error = ""
         self.generation = 0
@@ -259,7 +263,9 @@ class StatsWindow(ManagedToplevel):
             # Account 可变，必须复制字段，后台不能读取共享对象或跨线程调用 store。
             snapshot = tuple(StatsRecord(row.record_id, row.record_date, row.amount, tuple(row.tags), row.note)
                              for row in self.records_provider())
-            _put_latest(self.jobs, (self.generation, snapshot, self.month, date.today()))
+            # 加载失败笔数与账目在主线程一同取快照，避免后台读到后来刷新的计数。
+            skipped = self.load_skipped_count_provider() if self.load_skipped_count_provider else 0
+            _put_latest(self.jobs, (self.generation, snapshot, self.month, date.today(), skipped))
         except Exception as error:
             # 明确显示取数失败，不能继续显示上一次金额冒充当前账本。
             self._set_error(f"账本读取失败：{error}")
@@ -278,9 +284,9 @@ class StatsWindow(ManagedToplevel):
             job = self.jobs.get()
             if job is None:
                 return
-            generation, records, month, today = job
+            generation, records, month, today, load_skipped_count = job
             try:
-                result = build_month_stats(records, month, today)
+                result = build_month_stats(records, month, today, load_skipped_count=load_skipped_count)
             except Exception as error:
                 # 线程中的异常必须回传为可见错误，不能使界面永远停在加载中。
                 result = error

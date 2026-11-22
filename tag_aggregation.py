@@ -8,12 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from calendar import monthrange
+from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal, localcontext
 from functools import wraps
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable, Iterator
 
-from store import Account
+if TYPE_CHECKING:
+    from store import Account
 
 MULTI_TAG_TOTALS_NOTE = (
     "一条记录有多个标签时会分别计入各项，故各项之和可能大于当期总额；"
@@ -21,12 +23,18 @@ MULTI_TAG_TOTALS_NOTE = (
 )
 
 
+@contextmanager
+def money_precision() -> Iterator[None]:
+    # 预算与财务分析共用局部精度，保留调用者已有的更高精度。
+    with localcontext() as context:
+        context.prec = max(context.prec, 100)
+        yield
+
+
 def _money_precision(method):
     @wraps(method)
     def precise(*args, **kwargs):
-        # Decimal上下文按线程隔离；每个入口建立局部精度，不依赖主线程的全局设置。
-        with localcontext() as context:
-            context.prec = max(context.prec, 100)
+        with money_precision():
             return method(*args, **kwargs)
     return precise
 
@@ -46,7 +54,7 @@ class RecordTotals:
     by_tag: dict[str, TagTotals]
 
 
-def _record_tags(record: Account | StatsRecord) -> tuple[str, ...]:
+def record_tag_keys(record: Account | StatsRecord) -> tuple[str, ...]:
     # 汇总和逐笔明细共用虚拟桶规则，避免「未分类」柱子与明细分组不同。
     return record.tags or ("未分类",)
 
@@ -74,7 +82,7 @@ def aggregate_records_by_tag(records: Iterable[Account | StatsRecord]) -> Record
         # 无标签记录只能进入虚拟桶；多标签记录则对每个标签分别计入整笔金额。
         # 「未分类」仅是本次结果的分组名，不补写 record.tags、record_tags 或 tags.json。
         # 正常写库已去重，此处再防御调用方构造的重复标签，避免同名桶重复计入一笔。
-        for tag in dict.fromkeys(_record_tags(record)):
+        for tag in dict.fromkeys(record_tag_keys(record)):
             bucket = buckets.setdefault(tag, [Decimal("0"), Decimal("0")])
             if amount > 0:
                 bucket[0] += amount
@@ -101,6 +109,16 @@ class StatsRecord:
     note: str = ""
 
 
+def valid_record_date(record: Account | StatsRecord) -> date | None:
+    try:
+        day = date.fromisoformat(record.record_date)
+    except (ValueError, TypeError):
+        return None  # 日期错误只排除于统计，不能改写原账本。
+    if day.isoformat() != record.record_date or not isinstance(record.amount, Decimal) or not record.amount.is_finite():
+        return None
+    return day
+
+
 @dataclass(frozen=True)
 class MonthStats:
     """一个请求的完整统计结果，所有金额保持 Decimal。"""
@@ -120,7 +138,7 @@ class MonthStats:
     def tag_records(self, tag: str, *, expense: bool) -> tuple[StatsRecord, ...]:
         # 一笔钱可出现在不同标签内，同一个标签的明细只列一次。
         return tuple(row for row in self.records
-                     if (row.amount < 0 if expense else row.amount > 0) and tag in _record_tags(row))
+                     if (row.amount < 0 if expense else row.amount > 0) and tag in record_tag_keys(row))
 
     def day_expenses(self, day: str) -> tuple[StatsRecord, ...]:
         return tuple(row for row in self.records if row.record_date == day and row.amount < 0)
@@ -159,7 +177,9 @@ def describe_change(current: Decimal | None, previous: Decimal | None) -> tuple[
 
 
 @_money_precision
-def build_month_stats(records: Iterable[StatsRecord], month: str, today: date) -> MonthStats:
+def build_month_stats(
+    records: Iterable[StatsRecord], month: str, today: date, *, load_skipped_count: int = 0,
+) -> MonthStats:
     """仅聚合传入快照；不查库、不接触控件，不修改旧数据。"""
     first = date.fromisoformat(month + "-01")
     if first.strftime("%Y-%m") != month:
@@ -169,17 +189,12 @@ def build_month_stats(records: Iterable[StatsRecord], month: str, today: date) -
     half = {key: [Decimal("0"), Decimal("0")] for key in months}
     selected, previous = [], []
     available = set()
-    skipped = future = 0
+    skipped = load_skipped_count  # 无法加载的账目没有进入快照，单独计入排除笔数。
+    future = 0
     largest = None
     for record in records:
-        # 日期必须可解析且规范；脏数据只排除于本次统计，绝不补写原账本。
-        try:
-            record_day = date.fromisoformat(record.record_date)
-        except (ValueError, TypeError):
-            skipped += 1
-            continue
-        if (record_day.isoformat() != record.record_date
-                or not isinstance(record.amount, Decimal) or not record.amount.is_finite()):
+        record_day = valid_record_date(record)
+        if record_day is None:
             skipped += 1
             continue
         key = record.record_date[:7]

@@ -26,6 +26,7 @@ account_export_*.csv
 导入外部账单执行计划.md
 
 # ---------- 本地工作流文件（不进仓库） ----------
+/docs/plan/
 docs/_issues.txt
 docs/_提示词生成要求.txt
 docs/audit.md

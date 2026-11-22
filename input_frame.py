@@ -7,6 +7,7 @@ import tkinter as tk
 from typing import Callable
 
 import customtkinter as ctk
+from PIL import Image, ImageDraw, ImageTk
 import tag_picker
 
 from calendar_picker import ask_date
@@ -30,7 +31,7 @@ class _InputTagChips(TagChipsFrame):
 
     def __init__(self, master: ctk.CTkBaseClass, on_change: Callable[[], None]) -> None:
         self._on_change = on_change
-        super().__init__(master, placeholder_text="输入标签后回车，或点 ▼ 选择")
+        super().__init__(master, placeholder_text="输入标签后回车，或点 ▼ 选择", inline=True)
 
     def _schedule_relayout(self) -> None:
         super()._schedule_relayout()
@@ -48,22 +49,23 @@ class InputFrame(ctk.CTkFrame):
     """双行录入卡片，收支符号仍交给逻辑层处理。"""
 
     def __init__(self, master: ctk.CTk, add_callback: Callable[[], None],
-                 clear_tags_callback: Callable[[], None] | None = None) -> None:
+                 clear_tags_callback: Callable[[], None] | None = None, *,
+                 budgets_available: bool = False) -> None:
         super().__init__(master, corner_radius=14, fg_color="#FFFFFF",
                          border_width=1, border_color="#E0E8F0")
         self.date_var = tk.StringVar(value=date.today().isoformat())
         self.amount_type_var = tk.StringVar(value="支出")
         self.note_var = tk.StringVar()
+        self.budget_excluded_var = tk.BooleanVar(master=self)
         self.columnconfigure(0, weight=1)
-        # 紧凑标题与上下留白给最小窗口保留记录行，不靠缩小输入框来腾空间。
-        ctk.CTkLabel(self, text="记一笔", height=20, font=("Microsoft YaHei UI", 13, "bold"),
-                     text_color="#243447", anchor="w").grid(
-            row=0, column=0, sticky="ew", padx=16, pady=(8, 6))
+        ctk.CTkLabel(self, text="记一笔", height=24, font=("Microsoft YaHei UI", 16, "bold"),
+                     text_color="#172F54", anchor="w").grid(row=0, column=0, sticky="w", padx=16, pady=(5, 2))
 
-        # 第一行让日期、金额分配弹性空间，收支与添加保持固定尺寸和输入框基线。
+        # 日期和金额吸收窗口余量，收支按钮与两个输入框对齐。
         first_row = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
-        first_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
-        first_row.columnconfigure((0, 1), weight=1, uniform="primary_field")
+        first_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 4))
+        first_row.columnconfigure(0, weight=3, uniform="primary_field")
+        first_row.columnconfigure(1, weight=4, uniform="primary_field")
         date_field = _field_column(first_row, "日期")
         date_field.grid(row=0, column=0, sticky="new", padx=(0, 12))
         self.date_surface, self.date_entry = _entry_surface(date_field, self.date_var)
@@ -76,12 +78,20 @@ class InputFrame(ctk.CTkFrame):
         # 金额不用 textvariable，保留占位提示；“元”只是单位，不参与正负号转换。
         self.amount_surface, self.amount_entry = _entry_surface(
             amount_field, placeholder_text="请输入金额")
+        # 原画布只承载这一张轮廓图，尺寸或焦点变化时更新同一个图元。
+        self._amount_outline = self.amount_surface._canvas.create_image(0, 0, anchor="nw")
+        self._amount_outline_style = None
+        self._amount_outline_photo: ImageTk.PhotoImage | None = None
+        tk.Misc.bind(self.amount_surface, "<Configure>", self._draw_amount_outline, add="+")
         self.amount_surface.grid(row=1, column=0, sticky="ew")
+        # 焦点反馈画在现有外框上，保留内部金额框原有的键盘和占位行为。
+        self.amount_entry.bind("<FocusIn>", lambda _event: self._set_amount_focus(True), add="+")
+        self.amount_entry.bind("<FocusOut>", lambda _event: self._set_amount_focus(False), add="+")
         ctk.CTkLabel(self.amount_surface, text="元", width=28, height=38,
                      font=("Microsoft YaHei UI", 11), text_color="#64748B").grid(
-            row=0, column=1, padx=(0, 3), pady=1)
+            row=0, column=1, padx=(0, 8), pady=1)  # 内缩到圆角以内，单位底色不会盖住右侧描边。
         type_field = _field_column(first_row, "收支类型")
-        type_field.grid(row=0, column=2, sticky="n", padx=(0, 12))
+        type_field.grid(row=0, column=2, sticky="n")
         self.amount_type_button = ctk.CTkSegmentedButton(
             type_field, values=["支出", "收入"], variable=self.amount_type_var,
             width=120, height=40, dynamic_resizing=False, corner_radius=8,
@@ -90,16 +100,10 @@ class InputFrame(ctk.CTkFrame):
             unselected_color="#F0F3F7", unselected_hover_color="#E2E8F0",
             text_color="#243447")
         self.amount_type_button.grid(row=1, column=0)
-        self.add_button = ctk.CTkButton(
-            first_row, text="添加记录", command=add_callback, width=104, height=40,
-            corner_radius=8, fg_color="#2F80ED", hover_color="#256BC7",
-            font=("Microsoft YaHei UI", 11))
-        self.add_button.grid(row=0, column=3, sticky="se")
-
         # 第二行标签与备注按 2:3 分配；标签增加仅向下展开，不推动输入框和备注。
         second_row = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
         # 收紧卡片留白，为最小窗口展开三行标签后保留表格的可视高度。
-        second_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        second_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 4))
         second_row.columnconfigure(0, weight=2, uniform="secondary_field")
         second_row.columnconfigure(1, weight=3, uniform="secondary_field")
         tags_field = ctk.CTkFrame(second_row, fg_color="transparent", corner_radius=0)
@@ -129,16 +133,101 @@ class InputFrame(ctk.CTkFrame):
         for sequence in ("<<Paste>>", "<<Cut>>"):
             self.tag_chips.tag_entry.bind(sequence, self._queue_tag_entry_changed, add="+")
         ctk.CTkLabel(second_row, text="备注（可选）", height=20, anchor="w",
-                     font=("Microsoft YaHei UI", 11), text_color="#64748B").grid(
-            row=0, column=1, sticky="ew", pady=(0, 6))
+                     font=("Microsoft YaHei UI", 11), text_color="#64748B").grid(row=0, column=1, sticky="ew", pady=(0, 6))
         note_field = ctk.CTkFrame(second_row, fg_color="transparent", corner_radius=0)
         note_field.columnconfigure(0, weight=1)
         note_field.grid(row=1, column=1, sticky="new")
         self.note_surface, self.note_entry = _entry_surface(note_field, self.note_var)
         self.note_surface.grid(row=0, column=0, sticky="ew")
+
+        # 底栏始终给操作保留同一高度，升档只填入左侧反馈，长文可以用滚轮读取。
+        ctk.CTkFrame(self, height=1, corner_radius=0, fg_color="#DCE6F3").grid(
+            row=3, column=0, sticky="ew", padx=16)
+        footer = ctk.CTkFrame(self, height=38, fg_color="transparent", corner_radius=0)
+        footer.grid_propagate(False)
+        footer.grid(row=4, column=0, sticky="ew", padx=16, pady=(2, 3))
+        footer.columnconfigure(1, weight=1)
+        footer.rowconfigure(0, weight=1)
+        self.budget_notice_mark = ctk.CTkLabel(
+            footer, text="✓", width=18, height=18, corner_radius=9, fg_color="#187045",
+            text_color="#FFFFFF", font=("Microsoft YaHei UI", 11, "bold"))
+        # 用原生文本的一整行请求高度，折行后滚轮逐行展示，避免露出半行字。
+        self.budget_notice = ctk.CTkTextbox(
+            footer, width=1, height=1, corner_radius=0, border_spacing=0,
+            fg_color="#FFFFFF", text_color="#854D0E", font=("Microsoft YaHei UI", 12),
+            activate_scrollbars=False, wrap="word", state="disabled", takefocus=0, padx=2, pady=2)
+        self.budget_notice._textbox.tag_configure("saved", foreground="#172F54")
+        if budgets_available:
+            self.budget_checkbox = ctk.CTkCheckBox(
+                footer, text="不计入预算", variable=self.budget_excluded_var,
+                width=0, height=20, checkbox_width=16, checkbox_height=16,
+                border_width=2, border_color="#94A3B8", text_color="#475569",
+                font=("Microsoft YaHei UI", 12))
+            self.budget_checkbox.grid(row=0, column=2, sticky="e", padx=(8, 10))
+            self.amount_type_var.trace_add("write", self._sync_budget_checkbox)
+        self.add_button = ctk.CTkButton(
+            footer, text="添加记录", command=add_callback, width=110, height=36,
+            corner_radius=8, fg_color="#205FD4", hover_color="#1B4FB0",
+            font=("Microsoft YaHei UI", 12, "bold"))
+        self.add_button.grid(row=0, column=3, sticky="e")
         # 只处理主页面入口的外侧圆角，避免共享chips在编辑窗里跟着改外观。
         for button in (self.date_button, self.tag_chips.tag_button):
             button.configure(background_corner_colors=("#F8FAFC", "#FFFFFF", "#FFFFFF", "#F8FAFC"))
+
+    def set_budget_notice(self, message: str) -> None:
+        notice = self.budget_notice
+        if not message and not notice.winfo_manager():
+            return  # 常规保存不反复重绘隐藏的提示控件。
+        notice.configure(state="normal")
+        notice.delete("1.0", "end")
+        if message:
+            notice.insert("1.0", "已保存 · ", "saved")
+            notice.insert("end", message)
+        notice.configure(state="disabled")
+        if message:
+            self.budget_notice_mark.grid(row=0, column=0, padx=(0, 5))
+            notice.grid(row=0, column=1, sticky="ew")
+            notice.yview_moveto(0)
+        else:
+            notice.grid_forget()  # 清除 CTk 保存的网格参数，缩放时不会重新显示空提示。
+            self.budget_notice_mark.grid_forget()
+
+    def _sync_budget_checkbox(self, *_args: str) -> None:
+        # 切到收入时清空本次标记，避免切回支出后误用上一种输入的勾选。
+        spending = self.amount_type_var.get() == "支出"
+        if not spending:
+            self.budget_excluded_var.set(False)
+        self.budget_checkbox.configure(state="normal" if spending else "disabled")
+
+    def _set_amount_focus(self, focused: bool) -> None:
+        self.amount_surface.configure(border_color="#2367DA" if focused else "#D8E1EA")
+        self._draw_amount_outline()
+
+    def _draw_amount_outline(self, _event: tk.Event | None = None) -> None:
+        surface = self.amount_surface
+        width, height = surface.winfo_width(), surface.winfo_height()
+        if width <= 1 or height <= 1:
+            return  # 首次布局前的占位尺寸不参与绘制。
+        scale = surface._get_widget_scaling()
+        radius = round(surface.cget("corner_radius") * scale)
+        stroke = max(1, round(surface.cget("border_width") * scale))
+        background, fill, border = (
+            surface._apply_appearance_mode(surface.cget(name)) for name in ("bg_color", "fg_color", "border_color")
+        )
+        canvas = surface._canvas
+        style = (width, height, radius, stroke, background, fill, border)
+        if style != self._amount_outline_style:
+            # 在实际像素的四倍尺寸上绘制完整圆角矩形，再按像素覆盖率缩回，四角共用同一个轮廓。
+            factor = 4
+            image = Image.new("RGB", (width * factor, height * factor), background)
+            ImageDraw.Draw(image).rounded_rectangle(
+                (0, 0, image.width - 1, image.height - 1),
+                radius=radius * factor, fill=fill, outline=border, width=stroke * factor)
+            self._amount_outline_photo = ImageTk.PhotoImage(
+                image.resize((width, height), Image.Resampling.BOX), master=surface)
+            canvas.itemconfigure(self._amount_outline, image=self._amount_outline_photo)
+            self._amount_outline_style = style
+        canvas.tag_raise(self._amount_outline)  # CTk 重新绘制底层时，金额框仍以完整轮廓为准。
 
     def _pick_date(self) -> None:
         """日历仍贴日期字段弹出，取消时保留原值。"""

@@ -12,7 +12,7 @@ import csv
 import re
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 from pathlib import Path
@@ -21,6 +21,7 @@ import sqlite3
 from time import monotonic
 from typing import Iterable, Iterator
 
+from budget_logic import BudgetLimit, budget_month_start, normalize_budget_tag
 from config import CSV_FIELDS, DB_PATH
 
 
@@ -34,7 +35,8 @@ def _csv_safe_cell(value: object) -> object:
 
 # 历史标签迁移固定到 2；不能把目标改成 3，否则已迁过的库会再次补 legacy 标签。
 _MULTI_TAG_USER_VERSION = 2
-_SCHEMA_USER_VERSION = 3
+_IMPORT_BATCH_USER_VERSION = 3
+_SCHEMA_USER_VERSION = 4
 
 
 def _business_write(method):
@@ -62,6 +64,7 @@ class Account:
     # 此处始终保存完整标签，不挂 category 展示属性；表格可做摘要，CSV 另按竖线连接。
     tags: tuple[str, ...]
     note: str
+    budget_excluded: bool = False
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,7 @@ class AccountStore:
         self._business_ready = not strict_migrations
         # 内存缓存：UI 的筛选与汇总都读它，避免用户每敲一个字就查一次数据库。
         self.records: list[Account] = []
+        self._unparsed_record_ids: set[int] = set()
         # 先建表、再把数据读进内存，这个顺序不能颠倒。
         # 旧 CSV 迁移逻辑已在 #40 中整体删除（项目还没有真实用户从旧版本升级，迁移属于纯负债）。
         self._initialize_database()
@@ -107,7 +111,8 @@ class AccountStore:
         self._migrate_to_multi_tag()
         # 前一步失败时不跨级；基础账本仍可启动，批次接口通过就绪标记拒绝使用。
         self.import_batches_available = self._migrate_to_import_batches()
-        if strict_migrations and not self.import_batches_available:
+        self.budgets_available = self.import_batches_available and self._migrate_to_budgets()
+        if strict_migrations and not self.budgets_available:
             raise sqlite3.DatabaseError("更新初始化要求全部迁移成功")
         self.load()
 
@@ -321,9 +326,9 @@ class AccountStore:
                 # 默认 sqlite3 不会为 DDL 自动开事务，必须先锁定并开启，才能整段回滚。
                 connection.execute("BEGIN IMMEDIATE")
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
-                if version < 2 or version > 3:
+                if not _MULTI_TAG_USER_VERSION <= version <= _SCHEMA_USER_VERSION:
                     return False  # 旧迁移未完成或未来结构，不猜测、不跨级、不降低版本。
-                if version == 2:
+                if version == _MULTI_TAG_USER_VERSION:
                     connection.execute(
                         "CREATE TABLE IF NOT EXISTS import_batches ("
                         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -348,9 +353,9 @@ class AccountStore:
                         "ON accounts(import_batch_id)"
                     )
                 self._validate_import_schema(connection)
-                if version == 2:
-                    # 最后升版本；任何前置 DDL 或此语句失败，都与 schema 一起回滚。
-                    connection.execute(f"PRAGMA user_version = {_SCHEMA_USER_VERSION}")
+                if version == _MULTI_TAG_USER_VERSION:
+                    # 批次迁移只升到 3，预算迁移有独立的提交和回滚点。
+                    connection.execute(f"PRAGMA user_version = {_IMPORT_BATCH_USER_VERSION}")
             return True
         except sqlite3.Error as error:
             if self.strict_migrations:
@@ -389,6 +394,100 @@ class AccountStore:
         # 缓存可读不代表批次表已就绪，所有批次入口都先过这个门槛，防止降级后继续写入。
         if not self.import_batches_available:
             raise sqlite3.DatabaseError("导入批次数据库尚未就绪。")
+
+    def _migrate_to_budgets(self) -> bool:
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")  # 表、字段和版本一起提交，失败保住原库。
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if version not in (_IMPORT_BATCH_USER_VERSION, _SCHEMA_USER_VERSION):
+                    return False
+                columns = {row[1]: row for row in connection.execute("PRAGMA table_info(accounts)")}
+                if version == _IMPORT_BATCH_USER_VERSION:
+                    # 空标签键专指总预算，NOT NULL 让复合主键也能拦住重复的月总额。
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS monthly_budgets ("
+                        "month TEXT NOT NULL, tag TEXT NOT NULL, amount TEXT NOT NULL, "
+                        "PRIMARY KEY(month, tag)) WITHOUT ROWID"
+                    )
+                    if "budget_excluded" not in columns:
+                        connection.execute(
+                            "ALTER TABLE accounts ADD COLUMN budget_excluded INTEGER "
+                            "NOT NULL DEFAULT 0 CHECK(budget_excluded IN (0, 1))"
+                        )  # 旧账和导入的账默认计入，无需逐笔改写旧数据。
+                        columns = {row[1]: row for row in connection.execute("PRAGMA table_info(accounts)")}
+                flag = columns.get("budget_excluded")
+                limits = {row[1]: (row[2], row[3], row[5])
+                          for row in connection.execute("PRAGMA table_info(monthly_budgets)")}
+                if (flag is None or flag[2:5] != ("INTEGER", 1, "0") or limits != {
+                    "month": ("TEXT", 1, 1), "tag": ("TEXT", 1, 2), "amount": ("TEXT", 1, 0),
+                }):
+                    raise sqlite3.DatabaseError("预算 schema 不完整，不能启用预算。")
+                if version == _IMPORT_BATCH_USER_VERSION:
+                    connection.execute(f"PRAGMA user_version = {_SCHEMA_USER_VERSION}")
+            return True
+        except sqlite3.Error as error:
+            # 普通启动保留记账和导入，严格更新必须回退，不能把部分迁移标记为健康。
+            if self.strict_migrations:
+                raise
+            print(f"警告：预算迁移未就绪，下次启动重试：{error}")
+            return False
+
+    def _require_budgets(self) -> None:
+        if not self.budgets_available:
+            raise sqlite3.DatabaseError("预算数据库尚未就绪。")
+
+    def list_budgets(self, month: str) -> tuple[BudgetLimit, ...]:
+        self._require_budgets()
+        budget_month_start(month)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT tag, amount FROM monthly_budgets WHERE month = ? ORDER BY tag", (month,),
+            ).fetchall()
+        try:
+            return tuple(BudgetLimit(month, Decimal(amount), tag or None) for tag, amount in rows)
+        except (InvalidOperation, ValueError, TypeError) as error:
+            # 异常额度要显式报错，不能悄悄当成用户没有设置预算。
+            raise sqlite3.DatabaseError("预算额度数据无效。") from error
+
+    @_business_write
+    def set_budget(self, month: str, amount: Decimal, *, tag: str | None = None) -> BudgetLimit:
+        self._require_budgets()
+        limit = BudgetLimit(month, amount, tag)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO monthly_budgets (month, tag, amount) VALUES (?, ?, ?) "
+                "ON CONFLICT(month, tag) DO UPDATE SET amount = excluded.amount",
+                (month, limit.tag or "", format(limit.amount, "f")),
+            )
+        return limit
+
+    @_business_write
+    def delete_budget(self, month: str, *, tag: str | None = None) -> bool:
+        self._require_budgets()
+        budget_month_start(month)
+        with self._connect() as connection:
+            cursor = connection.execute("DELETE FROM monthly_budgets WHERE month = ? AND tag = ?",
+                                        (month, normalize_budget_tag(tag) or ""))
+            deleted = cursor.rowcount > 0
+        return deleted
+
+    @_business_write
+    def copy_previous_budgets(self, month: str) -> int:
+        self._require_budgets()
+        first = budget_month_start(month)
+        if first.year == 1 and first.month == 1:
+            return 0  # 合法的最早月份没有上月。
+        previous = (first - timedelta(days=1)).isoformat()[:7]
+        with self._connect() as connection:
+            # 单语句补齐缺项，让另一个实例刚写入的本月额度也不会被复制覆盖。
+            cursor = connection.execute(
+                "INSERT INTO monthly_budgets (month, tag, amount) "
+                "SELECT ?, tag, amount FROM monthly_budgets WHERE month = ? "
+                "ON CONFLICT(month, tag) DO NOTHING", (month, previous),
+            )
+            copied = cursor.rowcount
+        return copied
 
     def list_import_batches(self) -> list[ImportBatch]:
         """现读批次原始数量快照，按批次 ID 倒序；不从当前记录数反推导入笔数。"""
@@ -497,14 +596,21 @@ class AccountStore:
         # 一次性冻结成 tuple：调用方拿到的是不可变值，不可能被原地修掉。
         return {record_id: tuple(tags) for record_id, tags in grouped.items()}
 
+    @property
+    def load_skipped_count(self) -> int:
+        """当前缓存因金额无法解析而缺少的账目笔数。"""
+        return len(self._unparsed_record_ids)
+
     def load(self) -> None:
         """重建完整缓存，不写回数据库；金额无法解析的行仅从本轮缓存排除。"""
         with self._connect() as connection:
             # 两条 SELECT 复用连接减少开关成本；这里未显式 BEGIN，不能承诺并发写入下的共同快照。
             # category 列已从 SELECT 里去掉（#58 Step 2c-2）：标签的真源只有 record_tags，
             # 旧列不再参与任何读取，少一列就少一次「到底以哪边为准」的歧义。
+            # 迁移失败时仍用旧结构读账，预算接口由就绪标记单独关闭。
+            flag_column = "budget_excluded" if self.budgets_available else "0"
             account_rows = connection.execute(
-                "SELECT id, record_date, amount, note FROM accounts ORDER BY id"
+                f"SELECT id, record_date, amount, note, {flag_column} FROM accounts ORDER BY id"
             ).fetchall()
             # ORDER BY record_id, tag：一条记录的多个标签顺序由 SQL 定，落到 tags 里
             # 就是**字典序**（不是用户打字顺序）。DDL 没有顺序列，这是直接后果，
@@ -519,7 +625,8 @@ class AccountStore:
         # Decimal() 会抛出 InvalidOperation，而 load() 是在 __init__ 里调用的，
         # 一旦抛出就会让整个程序在启动阶段闪退（用户只看到「双击没反应」）。
         records: list[Account] = []
-        for record_id, record_date, amount, note in account_rows:
+        unparsed_record_ids: set[int] = set()
+        for record_id, record_date, amount, note, budget_excluded in account_rows:
             try:
                 parsed_amount = Decimal(amount)
             except (InvalidOperation, TypeError, ValueError) as error:
@@ -527,6 +634,7 @@ class AccountStore:
                 print(
                     f"警告：记录 ID {record_id} 的金额无法解析（{amount!r}），已跳过该行：{error}"
                 )
+                unparsed_record_ids.add(record_id)  # 保留主键供统计提示，后续修正或删除时可移除。
                 continue
             # 能解析的 NaN/Infinity 仍会进入缓存；此方法不做有限性筛除，写入及聚合另有护栏。
             records.append(
@@ -537,9 +645,11 @@ class AccountStore:
                     # 关联表里没有行的记录在这里是 ()，即 Q2 允许的「0 个标签」。
                     tags_by_id.get(record_id, ()),
                     note,
+                    bool(budget_excluded),
                 )
             )
-        self.records = records  # 全部构造完才替换列表；持有旧列表的调用方须重新读取本属性。
+        # 缓存与异常主键按同一轮加载结果重建，重复加载不会累加异常。
+        self.records, self._unparsed_record_ids = records, unparsed_record_ids
 
     def get_tags(self) -> list[str]:
         """返回库里所有用过的标签（去重、按字典序）。
@@ -573,7 +683,8 @@ class AccountStore:
         return bisect.bisect_left(self.records, record_id, key=lambda item: item.record_id)
 
     def _cache_record(
-        self, record_id: int, record_date: str, amount: Decimal, tags: tuple[str, ...], note: str
+        self, record_id: int, record_date: str, amount: Decimal, tags: tuple[str, ...], note: str,
+        budget_excluded: bool,
     ) -> Account:
         """按 load() 的同一口径构造缓存对象，保证局部维护与整表重读结果逐字段一致。
 
@@ -587,6 +698,7 @@ class AccountStore:
             Decimal(f"{amount:.2f}"),
             tuple(sorted(tags)),
             note.strip(),
+            budget_excluded,
         )
 
     @staticmethod
@@ -663,7 +775,8 @@ class AccountStore:
 
     @_business_write
     def add(
-        self, record_date: str, amount: Decimal, tags: tuple[str, ...], note: str
+        self, record_date: str, amount: Decimal, tags: tuple[str, ...], note: str,
+        *, budget_excluded: bool = False,
     ) -> Account | None:
         """写主记录及完整标签，提交后把新记录追加进缓存并返回；日期和金额方向由提交入口先处理。
 
@@ -672,6 +785,11 @@ class AccountStore:
         # 入库前先校验金额，非法金额直接拒绝写入，绝不允许 NaN / Infinity 污染账本。
         if not self._is_valid_amount(amount):
             raise ValueError(f"非法金额：{amount!r}")
+        if type(budget_excluded) is not bool:
+            raise ValueError("预算外标记必须是布尔值。")
+        budget_excluded = budget_excluded and amount < 0  # 收入不参与预算，无需保存标记。
+        if budget_excluded:
+            self._require_budgets()
         # 标签按完整序列清理，空元组合法；清理保留输入顺序，重载后才按字典序展示。
         tags = self._normalize_tags(tags)
         # 金额统一格式化为两位小数后再入库，避免出现 "5.0" 与 "5.00" 混用的情况。
@@ -689,6 +807,11 @@ class AccountStore:
             )
             # lastrowid 是刚插入行的自增主键，用它把标签挂到正确的记录上。
             new_id = cursor.lastrowid
+            if budget_excluded:
+                if new_id is None:
+                    raise sqlite3.DatabaseError("无法为新增支出保存预算外标记。")
+                # 与账目和标签共用事务，避免支出保存成功但漏掉预算外标记。
+                connection.execute("UPDATE accounts SET budget_excluded = 1 WHERE id = ?", (new_id,))
             # lastrowid 类型上可能为 None（未插入 / 极老 SQLite），此时宁可不写标签，
             # 也绝不能把标签挂到一个错的 record_id 上；记录本身照常插入、后面照常 load()。
             if new_id is not None:
@@ -696,7 +819,7 @@ class AccountStore:
         if new_id is None:
             return None  # 拿不到主键就不猜缓存位置：交给调用方回退全量刷新。
         # 写库已提交，按同一口径构造缓存对象；自增主键必为当前最大值，尾部追加仍保持升序。
-        record = self._cache_record(new_id, record_date, amount, tags, note)
+        record = self._cache_record(new_id, record_date, amount, tags, note, budget_excluded)
         self.records.append(record)
         return record
 
@@ -718,6 +841,7 @@ class AccountStore:
                 )
         if not deleted:
             return None
+        self._unparsed_record_ids.discard(record_id)  # 删除已提交，这笔账不再计入加载异常。
         # 删除只改主键集合、不动其余顺序：二分摘除后列表仍严格升序。
         index = self._cache_index(record_id)
         if index < len(self.records) and self.records[index].record_id == record_id:
@@ -733,11 +857,20 @@ class AccountStore:
         amount: Decimal,
         tags: tuple[str, ...],
         note: str,
+        *,
+        budget_excluded: bool | None = None,
     ) -> Account | None:
         """整份更新记录及标签，保留主键/批次归属；金额非法、缺记录或写库失败返回 None。"""
         # 与 add 同源：金额非法一律按「更新失败」处理，返回 None 让 UI 弹提示而不是崩溃。
         if not self._is_valid_amount(amount):
             return None
+        if budget_excluded is not None and (type(budget_excluded) is not bool or not self.budgets_available):
+            return None
+        if amount > 0:
+            budget_excluded = False  # 改为收入后清除不再适用的支出标记。
+        flag_sql, flag_values = "", ()
+        if self.budgets_available and budget_excluded is not None:
+            flag_sql, flag_values = ", budget_excluded = ?", (int(budget_excluded),)
         # 与 add 同款：形参是 tags 元组，裸字符串会被护栏拒绝（理由见 _normalize_tags）。
         tags = self._normalize_tags(tags)
         try:
@@ -745,13 +878,14 @@ class AccountStore:
                 # WHERE 只依据主键 id，且 id 不参与 SET，保证记录 ID 永远不变（需求 3.5.1）。
                 cursor = connection.execute(
                     "UPDATE accounts SET record_date = ?, amount = ?, "
-                    "category = ?, note = ? WHERE id = ?",
+                    f"category = ?, note = ?{flag_sql} WHERE id = ?",
                     (
                         record_date,
                         f"{amount:.2f}",
                         # 与 add 一致：category 列改存空串，标签只走 record_tags。
                         "",
                         note.strip(),
+                        *flag_values,
                         record_id,
                     ),
                 )
@@ -760,13 +894,22 @@ class AccountStore:
                 # 就会往关联表塞一份永远没人认领的孤儿标签，长期污染 get_tags() 的候选池。
                 if updated:
                     self._replace_tags(connection, record_id, tags)
+                    if self.budgets_available and budget_excluded is None:
+                        # 旧调用未指定标记时保留库中现值，缓存也不用过期对象猜测。
+                        current = connection.execute(
+                            "SELECT budget_excluded FROM accounts WHERE id = ?", (record_id,),
+                        ).fetchone()
+                        if current is None:
+                            raise sqlite3.DatabaseError("无法读取更新后账目的预算外标记。")
+                        budget_excluded = bool(current[0])
         except sqlite3.Error:
             # 更新失败属于可恢复错误（例如数据库文件被占用），返回 None 让 UI 弹提示而不是崩溃。
             return None
         if not updated:
             return None
+        self._unparsed_record_ids.discard(record_id)  # 修正金额已提交，之后按缓存中的新记录校验。
         # 写事务已提交；主键不变，原地替换即可保持升序，不需要整表重读。
-        record = self._cache_record(record_id, record_date, amount, tags, note)
+        record = self._cache_record(record_id, record_date, amount, tags, note, bool(budget_excluded))
         index = self._cache_index(record_id)
         if index < len(self.records) and self.records[index].record_id == record_id:
             self.records[index] = record

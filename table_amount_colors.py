@@ -218,6 +218,8 @@ class AmountColorRenderer:
 
     @staticmethod
     def _color(amount: Decimal) -> str:
+        if not amount.is_finite():
+            return "#334155"  # 异常金额沿用账本正文色，避免将异常方向标成收支。
         # 符号是唯一判据：数据层负数=支出、正数=收入，不依赖展示文本里的 + / -。
         return EXPENSE_COLOR if amount < 0 else INCOME_COLOR
 

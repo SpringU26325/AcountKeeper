@@ -22,6 +22,8 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from backup import create_backup
+from budget_logic import BudgetSnapshot, BudgetState, build_budget_snapshot
+from budget_window import BudgetWindow
 import tag_prefs
 import calendar_picker
 import dialogs
@@ -45,6 +47,8 @@ def _amount_text(amount: Decimal) -> str:
     数据库里的金额约定不变（正数=收入、负数=支出），这里只影响表格显示文本；
     正号同时给色觉障碍用户提供第二重收支线索（#78）。
     """
+    if not amount.is_finite():
+        return "金额无效"  # 旧账保留修正入口，NaN 不能参与收支方向比较。
     text = f"{amount:.2f}"
     return f"+{text}" if amount > 0 else text
 
@@ -87,6 +91,8 @@ class AccountKeeperApp(ctk.CTk):
         self.import_workflow = None  # 延迟加载导入依赖，主页面启动不读取外部账单。
         # store 由外部注入，方便测试时替换成临时数据库，避免测试污染真实账本。
         self.store = store
+        self._budget_window: BudgetWindow | None = None
+        self._budget_opening = False
         # 当前已插入表格的记录（筛选 + 日期倒序），增量增删改靠它定位插入点。
         self._displayed: list[Account] = []
         # last_export_dir 由启动流程注入，带默认值保证单独构造窗口时仍可用：
@@ -206,6 +212,8 @@ class AccountKeeperApp(ctk.CTk):
                 self.attributes("-disabled", True)  # 排空期间阻止新业务输入，更新子窗仍能反馈。
             if workflow is not None:
                 workflow.close()
+            if self._budget_window is not None:
+                self._budget_window.destroy()  # 更新排空时同时封住独立预算窗的额度写入入口。
             calendar_picker.shutdown(self)
         return workflow is None or workflow.shutdown_ready()
 
@@ -250,6 +258,7 @@ class AccountKeeperApp(ctk.CTk):
             self,
             self.add_record,
             clear_tags_callback=self.clear_tag_memory,
+            budgets_available=getattr(self.store, "budgets_available", False),
         )
         # 只给新增区安装方向回填；编辑窗继续完全按原记录初始化。
         self.input_frame.amount_type_var.trace_add("write", lambda *_: self._restore_tag_memory())
@@ -271,6 +280,7 @@ class AccountKeeperApp(ctk.CTk):
             delete_callback=self.delete_record,
             edit_callback=self.edit_selected_record,
             stats_callback=self.show_stats,
+            budget_callback=self.show_budget,
             export_callback=self.export_csv,
             backup_callback=self.backup_data,
             open_folder_callback=self.open_data_folder,
@@ -308,9 +318,52 @@ class AccountKeeperApp(ctk.CTk):
 
     def refresh_records(self) -> None:
         """按当前搜索词重绘缓存，不重新读库，也不清空筛选条件。"""
-        # 正常新增/删除/编辑成功后 store 已 load；刷新按钮本身不会读取外部改库结果。
-        # 刷新按钮与新增/删除/编辑后的刷新都收敛到这一处，避免多份重复的渲染逻辑。
+        # 导入和撤销已先重读缓存，从这里同步预算；搜索筛选不会影响全账本预算。
         self.filter_records()
+        self._refresh_budget()
+
+    def _refresh_budget(self) -> None:
+        window = self._budget_window
+        if window is not None and not window.closing:
+            window.refresh()
+
+    def _budget_before_save(self, record_date: str, amount: Decimal, excluded: bool) -> BudgetSnapshot | None:
+        month = datetime.now().strftime("%Y-%m")
+        if (excluded or record_date[:7] != month or not amount.is_finite() or amount >= 0
+                or not getattr(self.store, "budgets_available", False)):
+            return None  # 只对要计入本月预算的支出取保存前快照。
+        try:
+            limits = self.store.list_budgets(month)
+        except sqlite3.Error as error:
+            # 预算数据读取异常不应拦住已有的记账和更正流程。
+            print(f"警告：无法读取预算提醒所需的额度：{error}")
+            return None
+        return build_budget_snapshot(self.store.records, limits, month) if limits else None
+
+    def _show_budget_notice(self, before: BudgetSnapshot | None) -> None:
+        if self._calendar_closing:
+            return
+        messages = []
+        if before is not None:
+            # 保存前后共用同一组额度，只因这笔账发生的档位上升才提醒。
+            limits = tuple(progress.limit for progress in before.progress)
+            old_states = {progress.limit.tag: progress.state for progress in before.progress}
+            after = build_budget_snapshot(self.store.records, limits, before.month)
+            for progress in after.progress:
+                tag = progress.limit.tag
+                if progress.state <= old_states[tag]:
+                    continue
+                name = "总预算" if tag is None else f"{tag}预算"
+                if progress.state == BudgetState.OVER_LIMIT:
+                    text = f"超支，超出 ¥{progress.overspent:,.2f}"
+                else:
+                    status = "已用完" if progress.state == BudgetState.EXHAUSTED else "接近上限"
+                    text = f"{status}，剩余 ¥{progress.remaining:,.2f}"
+                messages.append(f"{name}{text}")
+        message = "  ·  ".join(messages)
+        if message:
+            self.input_frame.set_budget_notice(message)
+            self.snail_manager.announce_budget(message, header=self.header)
 
     def open_data_folder(self) -> None:
         try:
@@ -509,6 +562,7 @@ class AccountKeeperApp(ctk.CTk):
 
     @business_action
     def add_record(self) -> None:
+        self.input_frame.set_budget_notice("")  # 新提交先清理旧反馈，校验失败时不会留下上一笔的成功文字。
         try:
             # 按年/月/日解析并在写入时用 isoformat 规范化；解析失败走统一输入提示。
             record_date = datetime.strptime(
@@ -551,15 +605,21 @@ class AccountKeeperApp(ctk.CTk):
         # 用户打完字直接点「添加」不会漏掉那个词；0 个标签时返回空元组。
         # 保持 tuple 传给 store；裸字符串会被数据层拒绝，不能把整个摘要当成一个标签。
         tags = self.input_frame.collect_tags()
+        saved_date = record_date.isoformat()
+        excluded = amount < 0 and self.input_frame.budget_excluded_var.get()
+        before_budget = self._budget_before_save(saved_date, amount, excluded)
         # store.add 内部还会再校验一次金额（数据层最后防线）。正常流程下这里不会触发，
         # 但万一上层校验被改动绕过，也只会弹出提示而不会让程序崩溃。
         try:
             record = self.store.add(
-                record_date.isoformat(), amount, tags, self.note_var.get()
+                saved_date, amount, tags, self.note_var.get(), budget_excluded=excluded,
             )
         except ValueError:
             messagebox.showerror("输入错误", "日期格式应为 YYYY-MM-DD，金额必须是数字。")
             return
+        except sqlite3.Error as error:
+            messagebox.showerror("添加失败", f"账目保存失败：{error}", parent=self)
+            return  # 写入失败应保留表单，也不能触发成功后的预算刷新。
         # 只在账本写入成功之后记忆本次方向，校验或入账失败不能污染默认值。
         # 写盘交给后台线程：tags.json 的临时文件替换在 Windows 上可能被占用并重试
         # 上百毫秒，压在主线程就是每次添加都能感觉到的顿挫（#87）。
@@ -572,14 +632,18 @@ class AccountKeeperApp(ctk.CTk):
         # 拿回上一笔的旧值；标签集合一致时 chips 走"不重建"快路径，顺带清掉手输残留。
         self.input_frame.set_remembered_tags(tags)
         self.note_var.set("")
+        self.input_frame.budget_excluded_var.set(False)  # 预算外只针对刚保存的这笔，不随默认标签记忆。
         # 需求 3.13：这里不再需要「重新查历史标签 + 刷新候选」。
         # 候选改由 tag_prefs 在每次点 ▼ 时现算，弹窗里点「+ 保存」把标签写进
         # tags.json 之后，弹窗自己会重画列表，这一层什么都不用做；同时少了一个
         # 必守的「新增成功后记得刷新」约定，也就少一类「忘了刷新」的 bug。
         if record is None:
-            self.refresh_records()  # 极端情况拿不到主键：回退全量刷新，保证界面与库一致。
+            self.store.load()  # 写入已提交但拿不到主键，重读后再更新表格和预算。
+            self.refresh_records()
         else:
             self._insert_displayed(record)  # 单行插入，不再整表重建。
+            self._refresh_budget()
+        self._show_budget_notice(before_budget)
 
     @business_action
     def delete_record(self) -> None:
@@ -597,6 +661,7 @@ class AccountKeeperApp(ctk.CTk):
             messagebox.showinfo("删除记录", "找不到该记录")
             return
         self._remove_displayed(removed)  # 单行摘除，不再整表重建。
+        self._refresh_budget()
 
     def edit_selected_record(self) -> None:
         """常驻按钮按当前选中主键打开同一编辑流程。"""
@@ -631,17 +696,29 @@ class AccountKeeperApp(ctk.CTk):
             return
 
         # 用户取消编辑时返回 None，此时保持原样不做任何改动。
-        edited_values = dialogs.ask_edit_record(self, record)
+        edited_values = dialogs.ask_edit_record(
+            self, record, include_budget=getattr(self.store, "budgets_available", False),
+        )
         if edited_values is None:
             return
+        self.input_frame.set_budget_notice("")
         # 编辑提交入口已转换收支符号并收集完整标签元组；原样透传，不二次取负或包装标签。
-        record_date, amount, tags, note = edited_values
+        record_date, amount, tags, note, *budget_flag = edited_values
+        exclusion = budget_flag[0] if budget_flag else None
+        before_budget = self._budget_before_save(
+            record_date, amount, record.budget_excluded if exclusion is None else exclusion,
+        )
         # 主键不参与修改，编辑只更新内容字段（需求 3.5.1）。
-        updated = self.store.update(record_id, record_date, amount, tags, note)
+        updated = self.store.update(
+            record_id, record_date, amount, tags, note,
+            budget_excluded=exclusion,
+        )
         if updated is None:
             messagebox.showerror("编辑失败", "找不到该记录或记录更新失败。")
             return
         self._update_displayed(updated)  # 单行更新，不再整表重建。
+        self._refresh_budget()
+        self._show_budget_notice(before_budget)
 
     def _confirm_backup_overwrite(self, save_path: Path) -> bool:
         # 与删除确认共用受管理的 CTkToplevel 生命周期；原生 messagebox 不适合危险操作。
@@ -779,12 +856,34 @@ class AccountKeeperApp(ctk.CTk):
         # 每次刷新读取完整缓存，不从搜索后的表格取数，保证同月统计口径一致。
         window = getattr(self, "_stats_window", None)
         if window is None or not window.winfo_exists():
-            self._stats_window = StatsWindow(self, lambda: self.store.records)
+            self._stats_window = StatsWindow(
+                self, lambda: self.store.records,
+                load_skipped_count_provider=lambda: self.store.load_skipped_count,
+            )
         else:
             window.refresh()
             window.deiconify()
             window.lift()
             window.focus_set()
+
+    @business_action
+    def show_budget(self) -> None:
+        if self._budget_opening:
+            return  # CTk 构建会处理事件，不能在首次建窗完成前再打开一个预算窗。
+        if not getattr(self.store, "budgets_available", False):
+            messagebox.showwarning("预算管理", "预算数据尚未就绪，请重启后重试。", parent=self)
+            return
+        window = self._budget_window
+        if window is None or window.closing:
+            self._budget_opening = True
+            try:
+                self._budget_window = BudgetWindow(self, self.store)
+            finally:
+                self._budget_opening = False
+        else:
+            window.refresh()
+            window.deiconify()
+            window.lift()
 
     def ask_edit_record(
         self,

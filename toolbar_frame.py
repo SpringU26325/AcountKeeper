@@ -23,6 +23,7 @@ class ToolbarFrame(ctk.CTkFrame):
         batches_callback: Callable[[], None] | None = None,
         update_callback: Callable[[], None] | None = None,
         uninstall_callback: Callable[[], None] | None = None,
+        budget_callback: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master, fg_color="transparent")
         self.columnconfigure(0, weight=1)
@@ -39,6 +40,12 @@ class ToolbarFrame(ctk.CTkFrame):
                      text_color="#243447").grid(row=0, column=0, sticky="w")
         ctk.CTkButton(heading, text="财务分析", command=stats_callback,
                       **neutral_button).grid(row=0, column=1, padx=(0, 8))  # pyright: ignore[reportArgumentType]  # 参数已核验，混合字典展开丢失键值类型对应。
+        if budget_callback is not None:
+            # 预算与财务分析并排，低频文件操作继续留在菜单内。
+            self.budget_button = ctk.CTkButton(
+                heading, text="预算管理", command=budget_callback,
+                **neutral_button)  # pyright: ignore[reportArgumentType]  # 复用同组按钮的已核验样式。
+            self.budget_button.grid(row=0, column=2, padx=(0, 8))
         self._file_callbacks = {
             "导出 CSV": export_callback, "备份数据": backup_callback,
             "打开数据目录": open_folder_callback,
@@ -53,7 +60,7 @@ class ToolbarFrame(ctk.CTkFrame):
         self.file_menu.configure(fg_color="#E8EEF5")
         for button in (self.file_menu.label_button, self.file_menu.toggle_button):
             button.configure(fg_color="#E8EEF5", hover_color="#DDE7F2", text_color="#475569")
-        self.file_menu.grid(row=0, column=2)
+        self.file_menu.grid(row=0, column=3)
         self._app_callbacks = {}
         if update_callback is not None:
             self._app_callbacks["检查更新"] = update_callback
@@ -61,9 +68,9 @@ class ToolbarFrame(ctk.CTkFrame):
             self._app_callbacks["卸载 AccountKeeper"] = uninstall_callback
         self.app_menu = None
         if self._app_callbacks:
-            ctk.CTkFrame(heading, width=1, height=20, fg_color="#CCD7E3").grid(row=0, column=3, padx=16, pady=6, sticky="ns")  # 显式行内高度，避免默认200px撑大工具栏。
+            ctk.CTkFrame(heading, width=1, height=20, fg_color="#CCD7E3").grid(row=0, column=4, padx=16, pady=6, sticky="ns")  # 显式行内高度，避免默认200px撑大工具栏。
             self.app_menu = FileMenu(heading, tuple(self._app_callbacks), lambda action: self._app_callbacks[action](), application=True)
-            self.app_menu.grid(row=0, column=4)
+            self.app_menu.grid(row=0, column=5)
             self.app_menu.configure(fg_color="#E8EEF5")
             self.app_menu.label_button.configure(fg_color="#E8EEF5", hover_color="#DDE7F2", text_color="#475569")
         for menu in (self.file_menu, self.app_menu):

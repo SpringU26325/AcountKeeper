@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import tkinter as tk
-from typing import Callable
+from typing import Callable, Literal, overload
 
 import customtkinter as ctk
 import calendar_picker
@@ -29,6 +29,10 @@ from dialog_common import (
 from dialog_lifecycle import ManagedToplevel
 from store import Account
 from tag_prefs import split_tag_input
+
+
+EditFields = tuple[str, Decimal, tuple[str, ...], str]
+BudgetEditFields = tuple[str, Decimal, tuple[str, ...], str, bool]
 
 
 def _edit_dialog_max_height(dialog: ctk.CTkToplevel) -> int:
@@ -57,7 +61,8 @@ class _EditSession:
     record: Account
     dialog: _EditWindow | None = None
     signal: tk.BooleanVar | None = None  # 挂在本次 parent 上；隐藏缓存窗不会使等待结束，须显式设置信号。
-    result: tuple[str, Decimal, tuple[str, ...], str] | None = None  # 仅确认写结果；取消保持 None，不从控件临时值返回。
+    include_budget: bool = False
+    result: EditFields | BudgetEditFields | None = None  # 仅确认写结果；取消保持 None。
     previous_grab: tk.Misc | None = None
     open: bool = True
     ready: bool = False
@@ -89,6 +94,8 @@ class _EditWindow(ManagedToplevel):
     amount_type_var: tk.StringVar
     amount_var: tk.StringVar
     note_var: tk.StringVar
+    budget_excluded_var: tk.BooleanVar
+    budget_checkbox: ctk.CTkCheckBox
     error_var: tk.StringVar
     content: ctk.CTkScrollableFrame
     tag_chips: _EditChips
@@ -227,11 +234,17 @@ def _end_edit_session(session: _EditSession) -> None:
             pass  # 整个Tk解释器关闭时不再有可唤醒的等待。
 
 
-def _prefill_edit(dialog: _EditWindow, record: Account) -> None:
+def _prefill_edit(dialog: _EditWindow, record: Account, include_budget: bool) -> None:
     # 复用必须连空字段、错误、光标和滚动一起复位，不能只覆盖上次与本次不同的文本。
     dialog.date_var.set(record.record_date)  # 日期从本条记录覆盖，取消后的旧输入也不能留存。
     valid = record.amount.is_finite() and record.amount != 0
     dialog.amount_type_var.set("支出" if not valid or record.amount < 0 else "收入")  # 方向独立复位，不借主窗或上次编辑值。
+    dialog.budget_excluded_var.set(include_budget and valid and record.amount < 0 and record.budget_excluded)
+    # 缓存表单可能在不同入口复用，每次按本会话能力重新决定是否显示。
+    if include_budget:
+        dialog.budget_checkbox.grid()
+    else:
+        dialog.budget_checkbox.grid_remove()
     dialog.amount_var.set(f"{abs(record.amount):.2f}" if valid else str(record.amount))  # 非有限历史值保留修正入口，不比较NaN。
     dialog.tag_chips.set_tags(record.tags)  # 清手输残留并把 chips 调成本条记录的标签与顺序，未变化的控件复用。
     dialog.note_var.set(record.note)  # 空备注也必须覆盖，不能用“非空才填”造成串记录。
@@ -337,12 +350,22 @@ def _chips_edit_height() -> None:
         _edit_schedule(session, "layout", lambda: _layout_edit(session))  # 同会话增删合并重算，等待整表请求高度传播，不清子窗上下文。
 
 
-def ask_edit_record(parent: ctk.CTk, record: Account) -> tuple[str, Decimal, tuple[str, ...], str] | None:
-    """返回规范化日期、带符号金额、完整标签、备注；取消、父窗失效或拒绝重入返回 None。"""
+@overload
+def ask_edit_record(parent: ctk.CTk, record: Account, *, include_budget: Literal[False] = False) -> EditFields | None: ...
+
+
+@overload
+def ask_edit_record(parent: ctk.CTk, record: Account, *, include_budget: bool) -> EditFields | BudgetEditFields | None: ...
+
+
+def ask_edit_record(
+    parent: ctk.CTk, record: Account, *, include_budget: bool = False,
+) -> EditFields | BudgetEditFields | None:
+    """确认后返回编辑字段，启用预算时附带预算外标记。"""
     global _edit_session, _edit_window
     if _edit_session is not None or not _edit_alive(parent):
         return None  # 模态编辑拒绝重入；不接管、不弹第二层提示、不丢未保存输入。
-    session = _EditSession(parent, replace(record))  # 浅复制完整字段；tags 为不可变 tuple，无须从表格摘要重建。
+    session = _EditSession(parent, replace(record), include_budget=include_budget)
     _edit_session = session  # 必须早于变量创建、建窗及所有Tk update登记守卫。
     try:
         session.signal = tk.BooleanVar(master=parent)
@@ -366,7 +389,7 @@ def ask_edit_record(parent: ctk.CTk, record: Account) -> tuple[str, Decimal, tup
             dialog.transient(parent)
         _close_edit_children(dialog)
         session.child_context.clear()  # 只在编辑会话开始清一次；同会话反复点▼不清上下文，也不销毁共享选择器缓存。
-        _prefill_edit(dialog, session.record)
+        _prefill_edit(dialog, session.record, session.include_budget)
         dialog.deiconify()
         _edit_schedule(session, "layout", lambda: _layout_edit(session))
         signal = session.signal
@@ -403,6 +426,7 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
     amount_type_var = dialog.amount_type_var = tk.StringVar(master=dialog, value="支出")
     amount_var = dialog.amount_var = tk.StringVar(master=dialog)
     note_var = dialog.note_var = tk.StringVar(master=dialog)
+    budget_excluded_var = dialog.budget_excluded_var = tk.BooleanVar(master=dialog)
 
     content = ctk.CTkScrollableFrame(dialog, fg_color="transparent", corner_radius=0, height=1)
     content._scrollbar.configure(height=0)
@@ -524,6 +548,22 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
                 unselected_color="#F0F3F7", unselected_hover_color="#E2E8F0",
                 text_color="#243447",
             ).grid(row=0, column=1)
+            # 预算选项放在方向按钮下方，保持金额输入和方向按键同一基线。
+            dialog.budget_checkbox = ctk.CTkCheckBox(
+                amount_row, text="不计入预算", variable=budget_excluded_var,
+                width=0, height=22, checkbox_width=16, checkbox_height=16,
+                border_width=2, border_color="#94A3B8", text_color="#475569", font=dialog_font)
+            dialog.budget_checkbox.grid(row=1, column=1, sticky="w", pady=(5, 0))
+            dialog.budget_checkbox.grid_remove()
+
+            def sync_budget_checkbox(*_args: str) -> None:
+                # 收入不携带标记，回到支出后由用户重新选择。
+                spending = amount_type_var.get() == "支出"
+                if not spending:
+                    budget_excluded_var.set(False)
+                dialog.budget_checkbox.configure(state="normal" if spending else "disabled")
+
+            amount_type_var.trace_add("write", sync_budget_checkbox)
             continue
 
         # 这里的输入框不需要 placeholder_text，因此可以放心使用 textvariable 双向绑定。
@@ -595,13 +635,14 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
             error_var.set("金额不能为0，收支由按钮决定")
             return
         parsed_tags = tag_chips.collect_tags()
-        # 返回结构不变，原调用方直接 update；按钮切换本身不写库。
-        session.result = (
+        values: EditFields = (
             parsed_date.isoformat(),
             parsed_amount,
             parsed_tags,
             note_var.get().strip(),
         )
+        # 没有预算界面的调用保留四个字段；启用时以提交后的方向作为最终护栏。
+        session.result = (*values, parsed_amount < 0 and budget_excluded_var.get()) if session.include_budget else values
         close_dialog()
 
     ctk.CTkButton(

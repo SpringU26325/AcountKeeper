@@ -15,8 +15,12 @@ def _enforce_exe_name() -> None:
     """打包后强制文件名为 AccountKeeper.exe：自动更新按固定名替换，改名须在建窗前拦下。"""
     if not getattr(sys, "frozen", False) or sys.platform != "win32":
         return  # 源码运行、探针宿主与非 Windows 一律放行，开发环境不受文件名约束。
-    if os.path.basename(sys.executable).lower() == "accountkeeper.exe":
+    filename = os.path.basename(sys.executable).lower()
+    if filename == "accountkeeper.exe":
         return  # 忽略大小写：资源管理器与快捷方式可能改出不同大小写形式。
+    if (filename == "staged.exe" and len(sys.argv) == 4
+            and sys.argv[1] == "--update-rescue" and all(sys.argv[2:])):
+        return  # 仅派发内部救援；bootstrap 还须校验事务和执行映像，救援结束即退出。
     # 这里早于 bootstrap：改名后 update_helper 的路径校验会抛异常且没有可操作指引，
     # 先弹硬性阻断提示再退出。MB_ICONERROR 表明不可继续，MB_TOPMOST 保证无主窗时不被遮挡。
     ctypes.windll.user32.MessageBoxW(
@@ -32,6 +36,9 @@ def _run_app(context) -> None:
     import ctypes
     import platform
     from tkinter import messagebox
+    if sys.stderr is None:
+        # 无控制台打包时，CustomTkinter 的字体回退仍需要可写的错误输出流。
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
     import customtkinter as ctk
     from config import APP_VERSION, DATA_DIR, RESOURCE_DIR
     register_data(DATA_DIR, context)  # 配置/迁移/控件可能写数据，必须先登记；登记靠进程退出失效。
@@ -118,7 +125,7 @@ def _run_app(context) -> None:
 
 
 def main() -> None:
-    _enforce_exe_name()  # 最早执行：改名后不得进入任何 UI、数据或更新初始化。
+    _enforce_exe_name()  # 普通改名包在任何 UI、数据或更新初始化之前退出。
     context = None  # bootstrap自身失败时也有明确的异常处理上下文。
     try:
         context = bootstrap()

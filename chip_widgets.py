@@ -29,6 +29,7 @@ class TagChipsFrame(ctk.CTkFrame):
         on_layout_change: Callable[[], None] | None = None,
         *,
         placeholder_text: str | None = None,
+        inline: bool = False,
     ) -> None:
         super().__init__(master, fg_color="transparent", corner_radius=0)
         self._tags: list[str] = []  # 保留输入/选择顺序，提交时导出 tuple，不向外暴露可变列表。
@@ -37,6 +38,8 @@ class TagChipsFrame(ctk.CTkFrame):
         self._revision = 0  # 清空/换方向后，嵌套选择器返回的旧结果必须失效。
         # 高度重算只关心实际行数变化；宽度变化但仍排成相同行数时无需通知外层。
         self._layout_rows = 0
+        self._inline = inline
+        self._placeholder_text = placeholder_text
         self._on_layout_change = on_layout_change
         self.columnconfigure(0, weight=1)
 
@@ -48,19 +51,28 @@ class TagChipsFrame(ctk.CTkFrame):
 
         self.tag_button = make_toggle_button(self.input_surface, self._pick_tags)
         self.tag_button.grid(row=0, column=1, padx=(0, 1), pady=1, sticky="e")
+        if inline:
+            # 主窗共享一个外框，给文字输入预留宽度。空标签时文字区占满可用空间。
+            self.input_surface.columnconfigure(0, weight=0)
+            self.input_surface.columnconfigure(1, weight=1)
+            self.tag_entry.configure(width=76)
+            self.tag_entry.grid(row=0, column=1, sticky="new", padx=(8, 6), pady=1)
+            self.tag_button.grid(row=0, column=2, padx=(0, 1), pady=1, sticky="ne")
 
         # 半行宽字段更容易换行；视口最多三行，余下滚动，防止挤掉备注和表格。
-        self.chips_view = ctk.CTkScrollableFrame(self, width=0, height=28, corner_radius=0,
+        self.chips_view = ctk.CTkScrollableFrame(self.input_surface if inline else self, width=0, height=28, corner_radius=0,
                                                fg_color="transparent")
         # CTk 内部滚动条默认申请 200px 高；取消该最小请求，才能让一行标签只占一行。
         self.chips_view._scrollbar.configure(height=0)
         self.chips_view._scrollbar.grid_remove()
-        self.chips_view.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        if not inline:
+            self.chips_view.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+            self.chips_view.grid_remove()
         self.chips_frame = ctk.CTkFrame(self.chips_view, fg_color="transparent", corner_radius=0)
         self.chips_view.columnconfigure(0, weight=1)
         self.chips_frame.grid(row=0, column=0, sticky="ew")
-        self.chips_frame.grid_remove()
-        self.chips_view.grid_remove()
+        if not inline:
+            self.chips_frame.grid_remove()
         self.chips_frame.bind("<Configure>", self._on_chips_configure)
 
     def _commit_tag_input(self) -> None:
@@ -118,8 +130,19 @@ class TagChipsFrame(ctk.CTkFrame):
         """等新 chip 完成几何测量后再重排，避免按未测量的 1px 宽度换行。"""
         # 必须每次排一轮：刚上屏那一轮宽度还测不出来，行数会算成 1，
         # 需要后面这一轮按真实宽度收敛（实测合并成单轮会把三行视口算成一行）。
-        self.chips_view.grid()
-        self.chips_frame.grid()
+        if self._inline:
+            # 隐藏时彻底忘掉网格，CTk 改缩放不会把空标签区重新挂回外框。
+            has_tags = bool(self._tags)
+            self.input_surface.columnconfigure(0, weight=int(has_tags))
+            self.input_surface.columnconfigure(1, weight=int(not has_tags))
+            self.tag_entry.configure(placeholder_text="" if has_tags else self._placeholder_text)
+            if has_tags:
+                self.chips_view.grid(row=0, column=0, sticky="new", padx=(7, 0), pady=(4, 2))
+            else:
+                self.chips_view.grid_forget()
+        else:
+            self.chips_view.grid()
+            self.chips_frame.grid()
         coordinator = getattr(self, "layout_coordinator", None)
         if coordinator is None:
             self.after_idle(self._relayout_tags)
@@ -143,8 +166,9 @@ class TagChipsFrame(ctk.CTkFrame):
         if not self.winfo_exists():
             return  # 父窗已销毁时不再动控件，避免退出期 TclError。
         if not self._tag_buttons:
-            self.chips_view.grid_remove()
-            self.chips_frame.grid_remove()
+            if not self._inline:
+                self.chips_view.grid_remove()
+                self.chips_frame.grid_remove()
             rows = 0
         else:
             width = self._chips_available_width()
