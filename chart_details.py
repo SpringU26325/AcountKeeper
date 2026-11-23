@@ -5,22 +5,24 @@ from tkinter import ttk
 
 import customtkinter as ctk
 
-from dialog_common import _apply_app_icon
+from dialog_common import _apply_app_icon, fit_dialog_to_work_area
 from dialog_lifecycle import ManagedToplevel
 from tag_aggregation import StatsRecord
 
 
 class ChartDetails(ManagedToplevel):
     PAGE_SIZE = 100
+    _MINIMUM_SIZE = (620, 360)
+    _PREFERRED_SIZE = (780, 490)
 
     def __init__(self, master):
         super().__init__(master, fg_color="#F0F5FC")
         self.withdraw()  # 等首批内容就绪再显示，避免先闪出空窗。
+        self.attributes("-alpha", 0.0)
         self.transient(master)
         self.title("账目明细")
         _apply_app_icon(self)
-        self.geometry("780x490")
-        self.minsize(620, 360)
+        self._fit_done = False
         self._rows: tuple[StatsRecord, ...] = ()
         self._page = 0
         font = ("Microsoft YaHei UI", 14)
@@ -32,7 +34,6 @@ class ChartDetails(ManagedToplevel):
 
         # 用与财务分析一致的卡片容纳原生表格，内边距让表头和滚动条避开圆角。
         body = ctk.CTkFrame(self, fg_color="#FFFFFF", corner_radius=13, border_width=1, border_color="#DCE6F3")
-        body.pack(fill="both", expand=True, padx=18)
         columns = ("日期", "金额（元）", "标签", "备注")
         self.table = ttk.Treeview(body, columns=columns, show="headings", selectmode="browse",
                                   style="Details.Treeview")
@@ -49,9 +50,11 @@ class ChartDetails(ManagedToplevel):
 
         self.memo = ctk.CTkTextbox(self, height=67, state="disabled", wrap="word", font=font,
                                   fg_color="#E8EFF9", text_color="#334155", corner_radius=9)
-        self.memo.pack(fill="x", padx=18, pady=(8, 0))
         footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.pack(pady=(8, 12))
+        # 先为分页和备注留高度，高缩放时表格用剩余空间并继续滚动。
+        footer.pack(side="bottom", pady=(8, 12))
+        self.memo.pack(side="bottom", fill="x", padx=18, pady=(8, 0))
+        body.pack(fill="both", expand=True, padx=18)
         self.previous_page = ctk.CTkButton(footer, width=76, text="上一页", command=lambda: self._render_page(-1))
         self.previous_page.pack(side="left")
         self.page_label = ctk.CTkLabel(footer, text="", width=74)
@@ -86,16 +89,59 @@ class ChartDetails(ManagedToplevel):
         super()._set_scaling(new_widget_scaling, new_window_scaling)
         if hasattr(self, "table"):  # 构建期间可能先收到缩放回调，等表格存在再更新。
             self._style_table(new_widget_scaling)
+            if self._fit_done and not self.closing:
+                self.after_idle(self._fit_after_scaling)
+
+    def _fit_after_scaling(self) -> None:
+        if not self.closing and self.winfo_viewable():
+            fit_dialog_to_work_area(self.master, self, self._MINIMUM_SIZE)
 
     def show_rows(self, title: str, rows: tuple[StatsRecord, ...], amount: Decimal) -> None:
-        # 同日按主键倒序，复用窗口时从第一页开始，避免继承上一个图形的选中状态。
-        self._rows = tuple(sorted(rows, key=lambda row: (row.record_date, row.record_id), reverse=True))
+        # 主动切换分析指标时，从第一页开始查看另一组账目。
         self._page = 0
-        self.heading.configure(text=title)
-        self.summary.configure(text=f"共 {len(rows)} 笔  ·  合计 ¥ {amount:,.2f}" if rows else "暂无账目")
+        self._set_rows(title, rows, amount)
         self._render_page(0)
         self.deiconify()
+        if not self._fit_done:
+            # 透明映射后按工作区限制窗口，复用时保留用户已调整的尺寸和位置。
+            self._fit_done = True
+            self.update_idletasks()
+            if not fit_dialog_to_work_area(self.master, self, self._MINIMUM_SIZE, self._PREFERRED_SIZE):
+                return
         self.lift()
+
+    def refresh_rows(self, title: str, rows: tuple[StatsRecord, ...], amount: Decimal) -> None:
+        # 刷新前按账目主键记录选择和视口首行，新增或改期时行号可能已经改变。
+        selected = next(iter(self.table.selection()), None)
+        selected_visible = bool(selected and self.table.bbox(selected))
+        items = self.table.get_children()
+        position = self.table.yview()[0]
+        top = items[min(round(position * len(items)), len(items) - 1)] if items else None
+        old_page = self._page
+        self._set_rows(title, rows, amount)
+        if selected is not None:
+            for index, row in enumerate(self._rows):
+                if str(row.record_id) == selected:
+                    self._page = index // self.PAGE_SIZE
+                    break
+        self._render_page(0)
+        if top is not None and self.table.exists(top):
+            position = self.table.index(top) / len(self.table.get_children())
+        elif old_page != self._page:
+            position = 0
+        self.table.yview_moveto(position)
+        if selected is not None and self.table.exists(selected):
+            self.table.selection_set(selected)
+            self.table.focus(selected)
+            if selected_visible or old_page != self._page:
+                self.table.see(selected)
+            self._show_selection()
+
+    def _set_rows(self, title: str, rows: tuple[StatsRecord, ...], amount: Decimal) -> None:
+        # 同日按主键倒序，页内顺序和刷新前的锚点使用同一口径。
+        self._rows = tuple(sorted(rows, key=lambda row: (row.record_date, row.record_id), reverse=True))
+        self.heading.configure(text=title)
+        self.summary.configure(text=f"共 {len(rows)} 笔  ·  合计 ¥ {amount:,.2f}" if rows else "暂无账目")
 
     def _render_page(self, step: int) -> None:
         pages = max(1, (len(self._rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
@@ -103,7 +149,7 @@ class ChartDetails(ManagedToplevel):
         start = self._page * self.PAGE_SIZE
         self.table.delete(*self.table.get_children())
         for row in self._rows[start:start + self.PAGE_SIZE]:
-            self.table.insert("", "end", values=(row.record_date, f"{row.amount:,.2f}",
+            self.table.insert("", "end", iid=str(row.record_id), values=(row.record_date, f"{row.amount:,.2f}",
                                                   "、".join(row.tags) or "—", " ".join(row.note.splitlines())))
         self.table.yview_moveto(0)
         self.page_label.configure(text=f"{self._page + 1} / {pages}")

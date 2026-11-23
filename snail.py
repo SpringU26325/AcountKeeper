@@ -495,6 +495,10 @@ class SnailManager:
         self._cancel_after("snail_animation_id")
         self._show_speech_bubble(f"小声提醒：{message}", timeout_ms=5000, header=header)
 
+    def clear_budget_notice(self) -> None:
+        if self._bubble_header is not None:
+            self._destroy_active_bubble()  # 标题区是预算提示，普通点击台词没有标题锚点。
+
     def _show_speech_bubble(self, message: str, *, timeout_ms: int = 3000, header: tk.Misc | None = None) -> None:
         """在主窗口内创建一个跟随蜗牛的圆角气泡 Canvas。"""
         # 先清掉旧气泡，保证同时只存在一个气泡（restore_pause=False 避免中途恢复动画）。

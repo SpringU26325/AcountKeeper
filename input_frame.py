@@ -12,6 +12,7 @@ import tag_picker
 
 from calendar_picker import ask_date
 from chip_widgets import TagChipsFrame
+from dialog_lifecycle import ManagedToplevel
 from popup_common import entry_surface as _entry_surface, make_toggle_button
 
 
@@ -57,6 +58,9 @@ class InputFrame(ctk.CTkFrame):
         self.amount_type_var = tk.StringVar(value="支出")
         self.note_var = tk.StringVar()
         self.budget_excluded_var = tk.BooleanVar(master=self)
+        self._budget_messages: tuple[str, ...] = ()
+        self._budget_details: ManagedToplevel | None = None
+        self._opening_budget_details = False
         self.columnconfigure(0, weight=1)
         ctk.CTkLabel(self, text="记一笔", height=24, font=("Microsoft YaHei UI", 16, "bold"),
                      text_color="#172F54", anchor="w").grid(row=0, column=0, sticky="w", padx=16, pady=(5, 2))
@@ -140,7 +144,7 @@ class InputFrame(ctk.CTkFrame):
         self.note_surface, self.note_entry = _entry_surface(note_field, self.note_var)
         self.note_surface.grid(row=0, column=0, sticky="ew")
 
-        # 底栏始终给操作保留同一高度，升档只填入左侧反馈，长文可以用滚轮读取。
+        # 底栏只显示保存摘要和明细入口，长内容另有视口，避免挤占账目表高度。
         ctk.CTkFrame(self, height=1, corner_radius=0, fg_color="#DCE6F3").grid(
             row=3, column=0, sticky="ew", padx=16)
         footer = ctk.CTkFrame(self, height=38, fg_color="transparent", corner_radius=0)
@@ -151,12 +155,14 @@ class InputFrame(ctk.CTkFrame):
         self.budget_notice_mark = ctk.CTkLabel(
             footer, text="✓", width=18, height=18, corner_radius=9, fg_color="#187045",
             text_color="#FFFFFF", font=("Microsoft YaHei UI", 11, "bold"))
-        # 用原生文本的一整行请求高度，折行后滚轮逐行展示，避免露出半行字。
-        self.budget_notice = ctk.CTkTextbox(
-            footer, width=1, height=1, corner_radius=0, border_spacing=0,
-            fg_color="#FFFFFF", text_color="#854D0E", font=("Microsoft YaHei UI", 12),
-            activate_scrollbars=False, wrap="word", state="disabled", takefocus=0, padx=2, pady=2)
-        self.budget_notice._textbox.tag_configure("saved", foreground="#172F54")
+        self._budget_feedback = ctk.CTkFrame(footer, fg_color="transparent")
+        self.budget_notice = ctk.CTkLabel(self._budget_feedback, text="", text_color="#854D0E",
+                                          font=("Microsoft YaHei UI", 12))
+        self.budget_notice.pack(side="left", padx=(0, 8))
+        self.budget_details_button = ctk.CTkButton(
+            self._budget_feedback, text="查看全部", width=72, height=27, command=self._show_budget_details,
+            fg_color="#E8EFF9", hover_color="#DCE7F3", text_color="#172F54", font=("Microsoft YaHei UI", 12))
+        self.budget_details_button.pack(side="left")
         if budgets_available:
             self.budget_checkbox = ctk.CTkCheckBox(
                 footer, text="不计入预算", variable=self.budget_excluded_var,
@@ -174,23 +180,52 @@ class InputFrame(ctk.CTkFrame):
         for button in (self.date_button, self.tag_chips.tag_button):
             button.configure(background_corner_colors=("#F8FAFC", "#FFFFFF", "#FFFFFF", "#F8FAFC"))
 
-    def set_budget_notice(self, message: str) -> None:
-        notice = self.budget_notice
-        if not message and not notice.winfo_manager():
-            return  # 常规保存不反复重绘隐藏的提示控件。
-        notice.configure(state="normal")
-        notice.delete("1.0", "end")
-        if message:
-            notice.insert("1.0", "已保存 · ", "saved")
-            notice.insert("end", message)
-        notice.configure(state="disabled")
-        if message:
+    def set_budget_notice(self, messages: tuple[str, ...]) -> None:
+        if self._budget_details is not None:
+            self._budget_details.destroy()
+            self._budget_details = None
+        self._budget_messages = messages
+        if messages:
+            self.budget_notice.configure(text=f"已保存 · {len(messages)} 项预算提醒")
             self.budget_notice_mark.grid(row=0, column=0, padx=(0, 5))
-            notice.grid(row=0, column=1, sticky="ew")
-            notice.yview_moveto(0)
-        else:
-            notice.grid_forget()  # 清除 CTk 保存的网格参数，缩放时不会重新显示空提示。
+            self._budget_feedback.grid(row=0, column=1, sticky="w")
+        elif self._budget_feedback.winfo_manager():
+            self._budget_feedback.grid_forget()  # 清除网格参数，缩放后也不会显现已清除的摘要。
             self.budget_notice_mark.grid_forget()
+
+    def _show_budget_details(self) -> None:
+        messages = self._budget_messages
+        if not messages or self._opening_budget_details:
+            return
+        if self._budget_details is not None and not self._budget_details.closing:
+            self._budget_details.lift()
+            return
+        # 由用户主动打开完整内容，不使用 grab，记账窗口仍可操作。
+        parent = self.winfo_toplevel()
+        self._opening_budget_details = True
+        try:
+            window = ManagedToplevel(parent, fg_color="#F0F5FC")
+        finally:
+            self._opening_budget_details = False  # CTk 建窗时可能再次收到按钮事件。
+        window.withdraw()
+        self._budget_details = window
+        window.title("预算提醒")
+        window.transient(parent)
+        window.geometry("510x300")
+        ctk.CTkLabel(window, text=f"{len(messages)} 项预算提醒", font=("Microsoft YaHei UI", 17, "bold"),
+                     text_color="#172F54").pack(anchor="w", padx=16, pady=(14, 6))
+        details = ctk.CTkTextbox(window, wrap="word", fg_color="#FFFFFF", text_color="#854D0E",
+                                 font=("Microsoft YaHei UI", 14), padx=10, pady=8, spacing3=5)
+        details.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+        details.insert("1.0", "\n".join(messages))
+        details.configure(state="disabled")
+        window.bind("<Escape>", lambda _event: window.destroy())
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        if messages is not self._budget_messages:
+            window.destroy()  # CTk 建窗可处理事件，期间若有新提交，旧明细不得显现。
+        window.finish_setup()
+        if not window.closing:
+            window.deiconify()
 
     def _sync_budget_checkbox(self, *_args: str) -> None:
         # 切到收入时清空本次标记，避免切回支出后误用上一种输入的勾选。

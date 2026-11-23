@@ -360,10 +360,14 @@ class AccountKeeperApp(ctk.CTk):
                     status = "已用完" if progress.state == BudgetState.EXHAUSTED else "接近上限"
                     text = f"{status}，剩余 ¥{progress.remaining:,.2f}"
                 messages.append(f"{name}{text}")
-        message = "  ·  ".join(messages)
-        if message:
-            self.input_frame.set_budget_notice(message)
-            self.snail_manager.announce_budget(message, header=self.header)
+        if messages:
+            self.input_frame.set_budget_notice(tuple(messages))
+            self.snail_manager.announce_budget("预算详情见底栏。", header=self.header)
+
+    def _clear_budget_notice(self) -> None:
+        # 录入底栏、已展开的明细和气泡以同一次提交为边界一起收尾。
+        self.input_frame.set_budget_notice(())
+        self.snail_manager.clear_budget_notice()
 
     def open_data_folder(self) -> None:
         try:
@@ -562,7 +566,7 @@ class AccountKeeperApp(ctk.CTk):
 
     @business_action
     def add_record(self) -> None:
-        self.input_frame.set_budget_notice("")  # 新提交先清理旧反馈，校验失败时不会留下上一笔的成功文字。
+        self._clear_budget_notice()
         try:
             # 按年/月/日解析并在写入时用 isoformat 规范化；解析失败走统一输入提示。
             record_date = datetime.strptime(
@@ -701,7 +705,7 @@ class AccountKeeperApp(ctk.CTk):
         )
         if edited_values is None:
             return
-        self.input_frame.set_budget_notice("")
+        self._clear_budget_notice()
         # 编辑提交入口已转换收支符号并收集完整标签元组；原样透传，不二次取负或包装标签。
         record_date, amount, tags, note, *budget_flag = edited_values
         exclusion = budget_flag[0] if budget_flag else None

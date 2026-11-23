@@ -110,6 +110,36 @@ def center_dialog_on_parent(parent: tk.Misc, dialog: ManagedToplevel) -> bool:
         return False  # 父窗退出可连带销毁子窗，调用方保持原有取消返回值。
 
 
+def fit_dialog_to_work_area(parent: tk.Misc, dialog: ManagedToplevel, minimum: tuple[int, int],
+                            preferred: tuple[int, int] | None = None) -> bool:
+    """窗口映射后按父窗屏幕限制客户区；初次显示或超出工作区时重新定位。"""
+    if dialog.closing or not parent.winfo_exists():
+        return False
+    width, height = dialog.winfo_width(), dialog.winfo_height()
+    try:
+        _, work, _ = _parent_work_area(parent)
+        _, rect = _native_window_rect(dialog)
+        frame_w = max(0, rect.right - rect.left - width)
+        frame_h = max(0, rect.bottom - rect.top - height)
+        available = (work.right - work.left - frame_w, work.bottom - work.top - frame_h)
+        outside = (rect.left < work.left or rect.top < work.top or rect.right > work.right or rect.bottom > work.bottom)
+    except (AttributeError, OSError):
+        # 无法读到装饰尺寸时为边框和标题保留空间，仍允许在较小屏幕上调整尺寸。
+        available = (dialog.winfo_screenwidth() - 24, dialog.winfo_screenheight() - 60)
+        outside = False
+    scale = dialog._get_window_scaling()
+    # Windows 工作区是物理像素，CTk 窗口尺寸是逻辑像素，向下取整避免多出一像素。
+    caps = tuple(max(1, int(size // scale)) for size in available)
+    minimum = tuple(min(size, cap) for size, cap in zip(minimum, caps))
+    current = (round(width / scale), round(height / scale))
+    wanted = tuple(max(lower, min(size, cap)) for lower, size, cap in zip(minimum, preferred or current, caps))
+    dialog.minsize(*minimum)
+    dialog.maxsize(*caps)
+    if preferred is not None or current != wanted:
+        dialog.geometry(f"{wanted[0]}x{wanted[1]}")
+    return center_dialog_on_parent(parent, dialog) if preferred is not None or outside else True
+
+
 def _apply_app_icon(window: tk.Tk | tk.Toplevel) -> None:
     """为窗口设置应用图标。"""
     try:
