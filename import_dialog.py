@@ -2,7 +2,7 @@
 
 import tkinter as tk
 
-from dialog_common import _apply_app_icon
+from dialog_common import _apply_app_icon, fit_dialog_to_work_area
 from dialog_lifecycle import ManagedToplevel
 from import_dialog_view import ImportDialogView
 from import_pagination import ImportPagination
@@ -11,15 +11,19 @@ from import_session import Selection
 
 
 class ImportDialog(ManagedToplevel):
+    _MINIMUM_SIZE = (980, 660)
+    _PREFERRED_SIZE = (1220, 740)
+
     def __init__(self, parent, session, *, on_confirm=None, mapping_path=None):
         super().__init__(parent, fg_color="#F0F4F8")
+        self.withdraw()
+        self.attributes("-alpha", 0.0)  # 实测标题栏后再显现，避免先露出超出工作区的窗口。
         self.session, self.on_confirm, self.mapping_path = session, on_confirm, mapping_path
         self.accepted_result = None
         self.title("导入外部账单")
         # 预览窗显式使用应用图标，避免采用 CustomTkinter 的默认图标。
         _apply_app_icon(self)
-        self.geometry("1220x740")
-        self.minsize(980, 660)
+        self.geometry(f"{self._PREFERRED_SIZE[0]}x{self._PREFERRED_SIZE[1]}")
         self.font = ("Microsoft YaHei UI", 12)
         self._poll_job = self._render_job = None
         self._render_id = self._mapping_key = 0
@@ -30,20 +34,54 @@ class ImportDialog(ManagedToplevel):
         self.pagination = ImportPagination()
         self._preview_meta = None
         self._selection_number = None
+        self._merchant_target = None
         self._scroll_reset = False
         self._advance_after_render = False
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Destroy>", self._destroyed_event, add="+")
         try:
+            owner = parent.winfo_toplevel()
+            if owner.state() != "withdrawn":
+                self.transient(owner)  # 正常主窗拥有预览，隐藏主窗的独立预览仍可展示。
             self._build()
             self.finish_setup()
+            if self.closing:
+                return
+            self.deiconify()
+            self.update_idletasks()
+            if not fit_dialog_to_work_area(parent, self, self._MINIMUM_SIZE, self._PREFERRED_SIZE):
+                return
             self.refresh()
             self._ensure_poll()
+            self.after_idle(self._present_preview)
         except Exception:
             # 构建失败也必须释放线程及 Tk 任务，不能留下半个预览窗。
             self.finish_setup()
             self.destroy()
             raise
+
+    def _present_preview(self):
+        # 标题栏重绘的建窗事件处理完，再把预览提到应用内已有窗口前。
+        if self.closing:
+            return
+        if self.master.winfo_toplevel().state() == "iconic":
+            # Tk 可能在主窗最小化时仍报告预览可见，等恢复后再执行首次提层。
+            self.after(100, self._present_preview)
+            return
+        if self.winfo_viewable():
+            self.lift()
+            self.focus_set()
+
+    def _set_scaling(self, new_widget_scaling, new_window_scaling):
+        super()._set_scaling(new_widget_scaling, new_window_scaling)
+        if self._setup_complete and not self.closing:
+            self.after_idle(self._fit_after_scaling)  # 同一窗口切换 DPI 后重新限制原生边界。
+
+    def _fit_after_scaling(self):
+        if not self.closing and self.winfo_viewable():
+            fit_dialog_to_work_area(self.master, self, self._MINIMUM_SIZE)
+            if not self.closing and self.table is not None:
+                self.table.rescale()
 
     def _build(self):
         # 视图只持有 Tk 父级与事件回调，业务对象及令牌留在当前门面。
@@ -51,6 +89,7 @@ class ImportDialog(ManagedToplevel):
             search=self._search_changed, filter=self._filter_changed,
             locate=self.locate_next, all=self._show_all, row=self._row_action,
             duplicate=self._duplicate_changed, close=self.destroy, submit=self.submit, page=self._change_page,
+            merchant=self._apply_merchant_tag, merchant_memory=self._merchant_memory_changed,
             page_delta=lambda delta: self._change_page(self.pagination.page + delta),
             wheel=lambda event: self.table._wheel(event),
             rebuild_fields=self._build_fields,
@@ -62,7 +101,7 @@ class ImportDialog(ManagedToplevel):
             search_text=self.session.search_text, only_unhandled=self.session.only_unhandled)
         self.view.build()
         self.footer = self.view.footer  # 门面保留提交入口使用的错误展示句柄，控件仍归视图持有。
-        self.table = ImportPreviewTable(self, self.view.details, self.font,
+        self.table = ImportPreviewTable(self, self.view.details, self.view.preview_rows, self.font,
             on_select=self._selected, on_choose=self._choose, on_confirm=self._confirm_selection,
             on_clear=lambda group: self._run(lambda: self.session.clear_group(group)),
             header_state=self._header_state)
@@ -83,7 +122,7 @@ class ImportDialog(ManagedToplevel):
         decided = bool(members.intersection(source.row_actions)) or any(
             members.intersection(key) for key in source.pair_actions)
         return HeaderState(selection.value, selection.state, selection.explicit, actions,
-            not historical and not self.session.busy, ready, len(members), decided)
+            not historical and not self.session.busy, ready, len(members), decided, not self.view.mapping_incomplete)
 
     def _run(self, operation):
         try:
@@ -188,6 +227,8 @@ class ImportDialog(ManagedToplevel):
         self._scroll_reset = False
         self.table.reset()
         self._selection_number = None
+        self._merchant_target = None
+        self.view.hide_merchant_actions()
         self._restore_selection = self.pagination.selections.get(self.pagination.page)
         self.view.inspect_title.configure(text="单笔核对 · 点击上方记录查看")
         self.view.set_raw("选择一笔记录查看日期、金额、备注和原始内容。\n需要批量处理时，请使用对应组标题处的操作。")
@@ -203,7 +244,7 @@ class ImportDialog(ManagedToplevel):
         self.view.all_button.pack(side="left") if summary and len(full) > 5 else self.view.all_button.pack_forget()
         self.view.update_pager(self.pagination)
         if not rows:
-            self.view.controls.label(self.view.details, "未找到匹配记录" if self.session.search_text else "当前视图无记录").grid(row=0, column=0)
+            self.view.controls.label(self.view.preview_rows, "未找到匹配记录" if self.session.search_text else "当前视图无记录").grid(row=0, column=0)
         self._render_job = self.after(0, lambda: self._render_batch(rows, 0, token, version, historical))  # type: ignore[reportArgumentType] # Tk 接受无参回调，存根对回调类型标注过窄。
 
     def _render_batch(self, rows, start, token, version, historical):
@@ -213,7 +254,9 @@ class ImportDialog(ManagedToplevel):
         source = self.session.obsolete if historical else self.session
         self.table.append_rows(rows[start:start + 20], historical=historical,
             pending=self.session.current_view == "待确认", source=source,
-            display_values=self.session.display_values, continuation=self.pagination.continuation)
+            display_values=self.session.display_values, continuation=self.pagination.continuation,
+            merchant_preview=self.session.merchant_preview if not historical and
+            self.session.current_view == "将导入" else None)
         if start + 20 < len(rows):
             self._render_job = self.after(1, lambda: self._render_batch(rows, start + 20, token, version, historical))  # type: ignore[reportArgumentType] # Tk 接受无参回调，存根对回调类型标注过窄。
         else:
@@ -348,10 +391,12 @@ class ImportDialog(ManagedToplevel):
         self.session.located_row = number
         historical = self.session.result is None
         notice = "已作废（映射已变，决定不能应用）\n" if historical else ""
-        self.view.show_inspection(True, row_actions=True)
+        self.view.show_inspection(True, row_actions=not self.view.mapping_incomplete)
         self.view.inspect_title.configure(text=f"{'历史回看' if historical else '正在处理'}：原始第 {number} 行")
         self.view.set_raw(notice + self._inspection_text((row,)))
         self._set_row_state(row, historical)
+        if not historical and not self.session.busy and self.session.current_view == "将导入":
+            self._show_merchant_row(row)
         if not historical and not self.session.busy and self.session.current_view == "待确认" and row.row_number in {n for ids in self.session.groups.values() for n in ids}:
             if row.pair_key or row.can_import and row.group != "疑似退款对":
                 target = ("pair", row.pair_key, self.session.version) if row.pair_key else ("row", number, self.session.version)
@@ -364,6 +409,61 @@ class ImportDialog(ManagedToplevel):
                     action = self.session.pair_choices.get(row.pair_key, Selection("两笔都跳过")).value
                     self._request_preview(lambda: self.session.request_preview(key=row.pair_key, action=action) if row.pair_key else
                               self.session.request_preview(number=number))
+
+    def _show_merchant_row(self, row, *, refresh_controls=True):
+        number = row.row_number
+        preview = self.session.merchant_preview(number)
+        if preview is None:
+            return
+        suggestion, _direction, tag, manual = preview
+        self._merchant_target = (number, self.session.version, self.session.request_id)
+        # 完整商户值和依据放进核对区，表格仍可保留日期、金额及备注的可见宽度。
+        source = row.merchant_sources[0].strip() if suggestion.key else " / ".join(row.merchant_sources) or "—"
+        tag_text = self.table.merchant_text(preview)
+        remembered = self.session.merchant_remembered(number)
+        source_label = "将保存的商户" if suggestion.key else "商户来源"
+        learning = "\n已选择记住此商户标签，随本批入账生效。" if remembered else ""
+        self.view.set_raw(f"{source_label}：{source}\n预览标签：{tag_text} · {suggestion.reason}{learning}\n\n"
+                          + self._inspection_text((row,)))
+        if not refresh_controls:
+            return  # 即时撤销只更新核对内容，保留用户尚未应用的下拉选择。
+        total, preserved = self.session.merchant_scope(number)
+        selected_tag = tag if manual else tag or suggestion.tag
+        self.view.show_inspection(True)
+        self.view.row_hint.configure(text="选择后点击「应用标签」。")
+        self.view.show_merchant_actions(self.session.merchant_tags, selected_tag, total, preserved,
+                                        can_remember=bool(suggestion.key), remembered=remembered)
+
+    def _merchant_memory_changed(self, enabled):
+        if enabled or self._merchant_target is None or self._ending:
+            return  # 勾选仍须应用标签后生效，取消勾选则立即撤销既有授权。
+        number, version, request = self._merchant_target
+        if not self.session.merchant_remembered(number):
+            return
+        if self.session.revoke_merchant_memory(number, version=version, request=request):
+            location = self.table.row_locations.get(number)
+            if location is not None:
+                self._show_merchant_row(location[2], refresh_controls=False)
+
+    def _apply_merchant_tag(self, tag, batch, remember):
+        target = self._merchant_target
+        if target is None or self._ending or self.session.current_view != "将导入":
+            return
+        number, version, request = target
+        try:
+            self.session.choose_merchant_tag(number, tag, version=version, request=request,
+                                             batch=batch, remember=remember)
+        except ValueError as error:
+            self.footer.configure(text=str(error))
+            return
+        # 修改草稿时只更新当前页的标签单元格，避免丢失滚动及选中行。
+        self.table.update_merchant_tags(self.session.merchant_preview)
+        location = self.table.row_locations.get(number)
+        if location is not None:
+            self._show_merchant_row(location[2])
+
+    def refresh_merchant_context(self, mappings, tags):
+        self._run(lambda: self.session.refresh_merchant_context(mappings, tags))
 
     def _set_row_state(self, row, historical):
         enabled = row is not None and not historical and not self.session.busy

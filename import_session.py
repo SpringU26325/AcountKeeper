@@ -10,6 +10,9 @@ from types import MappingProxyType
 
 from import_reader import BillFile, RawCell, RawRow
 from import_rules import AnalysisResult, FieldMapping, NoteOptions, analyze_bill, apply_decisions
+from merchant_classifier import MerchantSuggestion, classify_merchant
+from store import ImportMerchant, ImportRecord, MerchantMapping, MerchantMappingChange
+from tag_prefs import build_tag_candidates
 
 
 def frozen_map(values):
@@ -49,8 +52,16 @@ class ObsoleteSnapshot:
         return self.result.mapping
 
 
+@dataclass(frozen=True)
+class ImportSubmission:
+    records: tuple[ImportRecord, ...]
+    expectations: tuple[MerchantMapping, ...]
+    changes: tuple[MerchantMappingChange, ...]
+    replacements: tuple[tuple[MerchantMapping, MerchantMappingChange], ...]
+
+
 class ImportSession:
-    def __init__(self, bill: BillFile, vocabulary, mapping=None, *, options=None):
+    def __init__(self, bill: BillFile, vocabulary, mapping=None, *, options=None, merchant_mappings=()):
         # 仅支持读取器的不可变标量；外层 frozen 不足以保护任意 object。
         scalar = (str, int, float, bool, date, time, timedelta, Decimal, type(None))
         if any(not isinstance(c.value, scalar) for r in bill.rows for c in r.cells):
@@ -64,6 +75,13 @@ class ImportSession:
             empty_markers=tuple(vocabulary.empty_markers))
         self.mapping = mapping
         self.options = options or NoteOptions()
+        self.merchant_tags = tuple(build_tag_candidates())
+        self._tag_candidates = frozenset(self.merchant_tags)
+        self._merchants: dict[int, tuple[MerchantSuggestion, str, tuple[str, ...]]] = {}
+        self._merchant_groups: dict[tuple[str, str], list[int]] = {}
+        self._tag_choices: dict[int, str] = {}
+        self._remember: set[int] = set()
+        self._mapping_snapshot = self._index_merchant_mappings(merchant_mappings)
         self.baseline = self.result = self.obsolete = None
         self.current_view, self.search_text, self.only_unhandled = "将导入", "", True
         self.show_all, self.located_row = set(), None
@@ -126,11 +144,16 @@ class ImportSession:
         self.released_duplicates = frozenset()
         self.preview, self.preview_error, self.located_row = None, "", None
         rows, vocab, mapping, options = self.bill.rows, self.vocabulary, self.mapping, self.options
-        self._submit("analysis", lambda: analyze_bill(rows, vocab, mapping, options=options))
+        self._submit("analysis", lambda: self._with_merchants(
+            analyze_bill(rows, vocab, mapping, options=options)))
         self.revision += 1
 
     def update_mapping(self, mapping):
         self._main()
+        if self.mapping is None or (mapping.header_row, mapping.columns) != (
+                self.mapping.header_row, self.mapping.columns):
+            self._tag_choices.clear()  # 同一行号在另一份字段映射下可能表示不同交易。
+            self._remember.clear()
         self.mapping = FieldMapping(mapping.header_row, mapping.columns, tuple(mapping.review_roles))
         self._recompute()
 
@@ -166,17 +189,20 @@ class ImportSession:
                     self.error = str(error)
                 # 分析失败绝不恢复旧结果；决定失败则保留此前有效结果。
             elif kind == "analysis":
-                self.baseline = self.result = value
-                self.mapping, self.obsolete = value.mapping, None
-                self._index(value)
+                self.baseline = self.result = self._adopt_merchants(value)
+                self.mapping, self.obsolete = self.result.mapping, None
+                self._index(self.result)
                 if self._initial_view:
-                    self.current_view = "待确认" if value.counts["待确认"] else "将导入"
+                    self.current_view = "待确认" if self.result.counts["待确认"] else "将导入"
                     self._initial_view = False
             elif kind == "decision":
-                semantic, self.result = value
+                semantic, classified = value
+                self.result = self._adopt_merchants(classified)
                 (self.row_actions, self.pair_actions, self.released_duplicates,
                  self.group_choices, self.pair_choices) = metadata
                 self._index(semantic)
+            elif kind == "merchants":
+                self.result = self._adopt_merchants(value)
             else:
                 self.preview = value
             self.revision += 1
@@ -218,6 +244,135 @@ class ImportSession:
             raise ValueError("尚有待确认或必需字段问题，不能提交")
         return self.result  # 只交付整份结果；搜索不能缩小最终提交集合。
 
+    @staticmethod
+    def _index_merchant_mappings(mappings):
+        return frozen_map({(item.merchant.key, item.direction): item for item in mappings})
+
+    def refresh_merchant_context(self, mappings, tags):
+        self._guard()
+        latest = self._index_merchant_mappings(mappings)
+        available = frozenset(tags)
+        # 标签仍在池中就保留本笔选择；只有其对应映射变化时才撤销学习同意。
+        self._tag_choices = {n: tag for n, tag in self._tag_choices.items() if not tag or tag in available}
+        for number in tuple(self._remember):
+            suggestion, direction, _ = self._merchants[number]
+            key = suggestion.key, direction
+            if number not in self._tag_choices or latest.get(key) != self._mapping_snapshot.get(key):
+                self._remember.remove(number)
+        self.merchant_tags, self._tag_candidates = tuple(tags), available
+        self._mapping_snapshot = latest
+        result = self.result
+        self._submit("merchants", lambda: self._with_merchants(result))
+
+    def _with_merchants(self, result):
+        merchants, groups, cache = {}, {}, {}
+        available = self._tag_candidates
+        learned = {key: item.tag for key, item in self._mapping_snapshot.items()}
+        # 分类消费最终可入账结果，退款和重复项的试算不会提前产生标签草稿。
+        for row in result.to_import:
+            assert row.amount is not None  # 交易规则已排除缺少最终金额或方向的行。
+            direction = "收入" if row.amount > 0 else "支出"
+            source = (row.merchant_sources, direction)
+            suggestion = cache.get(source)
+            if suggestion is None:
+                suggestion = cache[source] = classify_merchant(*source, available, learned=learned)
+            merchants[row.row_number] = (suggestion, direction, row.merchant_sources)
+            if suggestion.key:
+                groups.setdefault((suggestion.key, direction), []).append(row.row_number)
+        return result, merchants, groups
+
+    def _adopt_merchants(self, classified):
+        result, merchants, groups = classified
+        # 只有行仍可入账且来源和方向未变时，才能保留手选和主动清空。
+        self._tag_choices = {number: tag for number, tag in self._tag_choices.items()
+                             if number in merchants and merchants[number][1:] == self._merchants[number][1:]}
+        self._remember.intersection_update(self._tag_choices)
+        self._merchants, self._merchant_groups = merchants, groups
+        return result
+
+    def merchant_preview(self, number):
+        if self.result is None or number not in self._merchants:
+            return None
+        suggestion, direction, _ = self._merchants[number]
+        return suggestion, direction, self._tag_choices.get(number, suggestion.prefill), number in self._tag_choices
+
+    def merchant_scope(self, number):
+        preview = self.merchant_preview(number)
+        if preview is None or not preview[0].key:
+            return 0, 0
+        members = self._merchant_groups[(preview[0].key, preview[1])]
+        return len(members), sum(member in self._tag_choices for member in members)
+
+    def export_import_submission(self, result) -> ImportSubmission:
+        if result is not self.export_result():
+            raise ValueError("预览已变化，请重新核对。")
+        records, expectations, requests, changes, replacements = [], {}, {}, {}, []
+        for row in result.to_import:
+            assert row.amount is not None and row.record_date is not None
+            suggestion, direction, sources = self._merchants[row.row_number]
+            merchant = ImportMerchant(suggestion.key, sources[0].strip()) if suggestion.key else None
+            key = suggestion.key, direction
+            prior = self._mapping_snapshot.get(key)
+            tag = self._tag_choices.get(row.row_number, suggestion.prefill)
+            records.append(ImportRecord(row.record_date, row.amount, row.note, (tag,) if tag else (), merchant))
+            if prior and suggestion.learned and row.row_number not in self._tag_choices:
+                expectations[key] = prior
+            if row.row_number not in self._remember or not merchant:
+                continue
+            if key in requests:
+                if requests[key] != tag:
+                    raise ValueError(f"「{merchant.name}」的{direction}学习标签有冲突，请统一标签或取消记忆。")
+                continue
+            requests[key] = tag
+            # 同一商户同方向只写一次；原映射等于当前标签时仍核对修订号。
+            change = MerchantMappingChange(merchant, direction, tag, prior.revision if prior else None)
+            if prior and prior.tag == tag:
+                expectations[key] = prior
+            else:
+                changes[key] = change
+                if prior:
+                    replacements.append((prior, change))
+        return ImportSubmission(tuple(records), tuple(expectations.values()), tuple(changes.values()), tuple(replacements))
+
+    def merchant_remembered(self, number) -> bool:
+        return number in self._remember
+
+    def revoke_merchant_memory(self, number, *, version, request) -> bool:
+        self._guard(version)
+        if request != self.request_id or number not in self._remember:
+            return False
+        # 取消授权立即影响提交快照，已应用的本笔标签仍然有效。
+        self._remember.remove(number)
+        self.revision += 1
+        return True
+
+    def choose_merchant_tag(self, number, tag, *, version, request, batch=False, remember=False):
+        self._guard(version)
+        preview = self.merchant_preview(number)
+        if request != self.request_id or preview is None:
+            raise ValueError("交易结果已变化，请重新选择该笔记录")
+        if tag and tag not in self._tag_candidates:
+            raise ValueError("请选择常用标签")
+        if remember and (not tag or not preview[0].key):
+            raise ValueError("记住标签需要可识别商户和非空标签。")
+        if batch:
+            if not preview[0].key:
+                raise ValueError("商户不明确，不能批量应用")
+            members = [member for member in self._merchant_groups[(preview[0].key, preview[1])]
+                       if member not in self._tag_choices]
+            if remember and not members:
+                raise ValueError("本组标签均已有人工决定，请从单笔操作记住标签。")
+            if remember and number not in members and self._tag_choices[number] != tag:
+                raise ValueError("本笔与批量标签不同，请从使用该标签的记录勾选记住。")
+            self._tag_choices.update(dict.fromkeys(members, tag))
+        else:
+            self._tag_choices[number] = tag  # 空串表示用户主动留空，必须覆盖自动预填。
+        # 批量授权也归当前勾选的行，用户回到这行就能撤销。
+        self._remember.discard(number)
+        if remember:
+            self._remember.add(number)
+        self.revision += 1
+
     def _change(self, rows=None, pairs=None, released=None, groups=None, choices=None):
         row_actions = frozen_map(self.row_actions if rows is None else rows)
         pair_actions = frozen_map(self.pair_actions if pairs is None else pairs)
@@ -229,7 +384,8 @@ class ImportSession:
 
         def replay():
             semantic = apply_decisions(base, release_duplicates=releases)
-            return semantic, apply_decisions(semantic, row_actions=row_actions, pair_actions=pair_actions)
+            result = apply_decisions(semantic, row_actions=row_actions, pair_actions=pair_actions)
+            return semantic, self._with_merchants(result)
 
         self.preview, self.preview_error = None, ""
         self._submit("decision", replay, metadata)
@@ -460,3 +616,7 @@ class ImportSession:
             self.task_handle.cancel()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self.result = self.baseline = self.obsolete = None
+        self._merchants.clear()
+        self._merchant_groups.clear()
+        self._tag_choices.clear()
+        self._remember.clear()

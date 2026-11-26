@@ -5,6 +5,7 @@ from tkinter import ttk
 
 import customtkinter as ctk
 
+from dialog_lifecycle import _cancel_owned_tasks
 from import_preview_controls import PreviewControls, PreviewSelect
 
 
@@ -18,18 +19,33 @@ class HeaderState:
     ready: bool
     count: int
     has_decisions: bool
+    show_actions: bool
 
 
 class ImportPreviewTable:
-    def __init__(self, window, details, font, *, on_select, on_choose, on_confirm, on_clear, header_state):
-        self.window, self.details, self.font = window, details, font
+    _COLUMNS = (("row", "原始行", 45, 45), ("date", "本地日期", 90, 70),
+                ("amount", "带符号金额", 85, 70), ("note", "备注", 170, 70),
+                ("result", "处理结果", 170, 70))
+
+    def __init__(self, window, details, rows, font, *, on_select, on_choose, on_confirm, on_clear, header_state):
+        self.window, self.details, self.rows, self.font = window, details, rows, font
         self.controls = PreviewControls(font)
         self.on_select, self.on_choose = on_select, on_choose
         self.on_confirm, self.on_clear, self.header_state = on_confirm, on_clear, header_state
         self.closed, self._wheel_remainder = False, 0.0
         self.row_locations, self.group_controls, self.pair_controls = {}, {}, {}
         self._sections, self._trees = {}, {}
+        self._scale = None
+        self.rescale()
+
+    def rescale(self):
+        scale = self.details._get_widget_scaling()
+        if scale == self._scale:
+            return
+        self._scale = scale
         self._style_table()
+        for tree in self._trees.values():
+            self._size_columns(tree)
 
     def _style_table(self):
         # 只配置预览专属样式；复制 clam 表头元素，与主页面一致且不切换全局主题。
@@ -53,8 +69,9 @@ class ImportPreviewTable:
         style.map("ImportPreview.Treeview", background=[("selected", "#D7E9FC")], foreground=[("selected", "#243447")])
 
     def reset(self):
-        # 每次上下文重建都清空控件索引，不把旧 Treeview 项带入新页。
-        for child in self.details.winfo_children():
+        # 只重建记录控件，保留共用视口内的分类和筛选入口。
+        _cancel_owned_tasks(self.rows)  # 整组确认会销毁旧按钮，先取消其未执行的点击动画。
+        for child in self.rows.winfo_children():
             child.destroy()
         self.row_locations, self.group_controls, self.pair_controls = {}, {}, {}
         self._sections, self._trees = {}, {}
@@ -62,14 +79,21 @@ class ImportPreviewTable:
     def close(self):
         self.closed = True  # 关闭后滚轮不得访问正在销毁的控件树。
 
-    def _tree_for(self, row, historical, *, pending, source, continuation):
+    def _size_columns(self, tree):
+        scale = self.details._get_widget_scaling()
+        # ttk 列宽是物理像素，和表头字体一起换算，缩放时保留现有行与选择。
+        for key, _, width, minimum in self._COLUMNS:
+            tree.column(key, width=round(width * scale), minwidth=round(minimum * scale),
+                        stretch=key in ("note", "result"))
+
+    def _tree_for(self, row, historical, *, pending, source, continuation, show_merchants):
         group = row.group if pending else "用户选择跳过" if row.reason == "用户选择跳过" else "明细"
         pair = row.pair_key if pending else None
         tree_key = (group, pair)
         if tree_key in self._trees:
             return self._trees[tree_key]
         if group not in self._sections:
-            section = ctk.CTkFrame(self.details, fg_color="white")
+            section = ctk.CTkFrame(self.rows, fg_color="white")
             section.grid(row=len(self._sections), column=0, sticky="ew", pady=4)
             section.grid_columnconfigure(0, weight=1)
             self._sections[group] = section
@@ -93,12 +117,10 @@ class ImportPreviewTable:
         tree = ttk.Treeview(section, columns=("row", "date", "amount", "note", "result"),
                             displaycolumns=("row", "note", "date", "amount", "result"),
                             show="headings", height=1, style="ImportPreview.Treeview", selectmode="browse")
-        scale = self.details._get_widget_scaling()
-        for key, title, width in zip(tree["columns"], ("原始行", "本地日期", "带符号金额", "备注", "处理结果"), (45, 90, 85, 170, 170)):
-            tree.heading(key, text=title)
-            # 原生Treeview按物理像素计算列宽，须与表头字体使用同一缩放，避免高DPI文字相连。
-            tree.column(key, width=round(width * scale),
-                        minwidth=round((45 if key == "row" else 70) * scale), stretch=key in ("note", "result"))
+        for key, title, _, _ in self._COLUMNS:
+            # 「将导入」的最后一列展示标签，原交易处理详情仍可在核对区阅读。
+            tree.heading(key, text="预览标签" if show_merchants and key == "result" else title)
+        self._size_columns(tree)
         tree.tag_configure("obsolete", foreground="#84909E", background="#F0F4F8")
         tree.tag_configure("handled", foreground="#64748B", background="#F0F4F8")
         tree.pack(fill="x", pady=3)
@@ -108,6 +130,11 @@ class ImportPreviewTable:
         return tree
 
     def _processing_header(self, parent, title, group, pair, historical):
+        selection = self.header_state(group, pair, historical)
+        if not selection.show_actions:
+            # 缺必填字段时保留行预览，避免引导用户先做批量决定。
+            self.controls.label(parent, "账单预览 · 请先核对必填字段", anchor="w").pack(fill="x", padx=8)
+            return
         frame = ctk.CTkFrame(parent, fg_color="#F0F4F8")
         frame.pack(fill="x", pady=3)
         frame.grid_columnconfigure(0, weight=1)
@@ -117,7 +144,6 @@ class ImportPreviewTable:
         caption.grid(row=0, column=0, sticky="w", padx=8, pady=3)
         action_area = ctk.CTkFrame(frame, fg_color="transparent")
         action_area.grid(row=0, column=1, sticky="e", padx=6, pady=3)
-        selection = self.header_state(group, pair, historical)
         actions = selection.actions
         values = list(actions)
         menu = PreviewSelect(action_area, values=values, width=150, font=self.font,
@@ -165,10 +191,27 @@ class ImportPreviewTable:
         frame.bind("<Configure>", reflow, add="+")
 
 
-    def append_rows(self, rows, *, historical, pending, source, display_values, continuation):
+    @staticmethod
+    def merchant_text(preview):
+        if preview is None:
+            return "—"
+        suggestion, _direction, tag, manual = preview
+        if manual:
+            return f"已选 · {tag}" if tag else "已留空"
+        if tag:
+            return f"预填 · {tag}"
+        return f"建议 · {suggestion.tag}" if suggestion.tag else "留空"
+
+    def update_merchant_tags(self, merchant_preview):
+        for number, (tree, item, _row) in self.row_locations.items():
+            tree.set(item, "result", self.merchant_text(merchant_preview(number)))
+
+    def append_rows(self, rows, *, historical, pending, source, display_values, continuation,
+                    merchant_preview=None):
         # 只插入门面已核验令牌的当前批次，本组件不注册异步任务。
         for row in rows:
-            tree = self._tree_for(row, historical, pending=pending, source=source, continuation=continuation)
+            tree = self._tree_for(row, historical, pending=pending, source=source,
+                                  continuation=continuation, show_merchants=merchant_preview is not None)
             values = display_values(row)
             result = values[-1]
             if historical:
@@ -177,6 +220,8 @@ class ImportPreviewTable:
                 result = "✓ 已处理 · " + result
             elif row.reason == "用户选择跳过":
                 result = "用户选择 · " + result
+            elif merchant_preview is not None:
+                result = self.merchant_text(merchant_preview(row.row_number))
             tag = "obsolete" if historical else "handled" if pending and row.decision else "normal"
             item = tree.insert("", "end", values=(*values[:4], result), tags=(tag,))
             tree.configure(height=len(tree.get_children()))

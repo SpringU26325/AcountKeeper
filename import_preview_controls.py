@@ -7,7 +7,7 @@ import customtkinter as ctk
 
 from dialog_common import _parent_work_area
 from dialog_lifecycle import ManagedToplevel
-from popup_common import anchored_position, make_toggle_button
+from popup_common import RoundedFieldFrame, anchored_position, make_toggle_button
 
 
 class _SelectPopup(ManagedToplevel):
@@ -24,12 +24,11 @@ class _SelectOption(ctk.CTkButton):
         return "break" if picked else None
 
 
-class PreviewSelect(ctk.CTkFrame):
+class PreviewSelect(RoundedFieldFrame):
     """统一实心三角与候选面板，展示名称和回填值可分别设置。"""
 
-    def __init__(self, master, *, values, command, font, width=180, display=str, group=None):
-        super().__init__(master, width=width, height=34, corner_radius=8,
-                         fg_color="#F8FAFC", border_color="#D8E1EA", border_width=1)
+    def __init__(self, master, *, values, command, font, width=180, display=str, group=None, precise_outline=False):
+        super().__init__(master, width=width, height=34, precise_outline=precise_outline)
         self.values, self.command, self.font = tuple(values), command, font
         self._display = display
         self._group = group

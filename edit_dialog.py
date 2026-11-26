@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass, field, replace
@@ -27,12 +28,19 @@ from dialog_common import (
     center_dialog_on_parent,
 )
 from dialog_lifecycle import ManagedToplevel
-from store import Account
+from store import Account, EditMerchantContext, MerchantMapping, MerchantMappingChange, MerchantMappingConflict
 from tag_prefs import split_tag_input
 
 
 EditFields = tuple[str, Decimal, tuple[str, ...], str]
 BudgetEditFields = tuple[str, Decimal, tuple[str, ...], str, bool]
+
+
+@dataclass(frozen=True)
+class MerchantEditActions:
+    load: Callable[[], Future[tuple[EditMerchantContext | None, tuple[str, ...]]]]
+    save: Callable[[EditFields | BudgetEditFields, MerchantMappingChange, Callable[[Exception | None], None]], None]
+    confirm_replace: Callable[[tk.Misc, MerchantMapping, MerchantMappingChange], bool]
 
 
 def _edit_dialog_max_height(dialog: ctk.CTkToplevel) -> int:
@@ -70,6 +78,12 @@ class _EditSession:
     bindings: list[tuple[tk.Misc, str, str, str]] = field(default_factory=list)  # 注册控件/事件/命令 ID/守卫脚本均需收回。
     child_context: dict[str, object] = field(default_factory=dict)  # 本次子调用结果；同会话 chips 重排不清它。
     layout_sample: tuple[int, int, int, int] | None = None
+    merchant_actions: MerchantEditActions | None = None
+    merchant: EditMerchantContext | None = None
+    common_tags: tuple[str, ...] = ()
+    merchant_tag_explicit: bool = False
+    merchant_read: Future[tuple[EditMerchantContext | None, tuple[str, ...]]] | None = None
+    saving: bool = False
 
 
 _edit_window: _EditWindow | None = None  # 控件树及用户拖动位置可复用，真正 Destroy 后清缓存。
@@ -101,6 +115,13 @@ class _EditWindow(ManagedToplevel):
     tag_chips: _EditChips
     entries: list[ctk.CTkEntry]
     buttons: ctk.CTkFrame
+    merchant_box: ctk.CTkFrame
+    merchant_name: ctk.CTkLabel
+    merchant_remember: ctk.CTkCheckBox
+    merchant_tag_label: ctk.CTkLabel
+    merchant_tag: ctk.CTkOptionMenu
+    save_button: ctk.CTkButton
+    cancel_button: ctk.CTkButton
     pick_date: Callable[[], None]
     cancel: Callable[[], None]
     confirm: Callable[[], None]
@@ -200,6 +221,9 @@ def _end_edit_session(session: _EditSession) -> None:
     if not session.open:
         return
     session.open = False  # 先封住迟到回填；重入守卫到公共入口finally才释放。
+    if session.merchant_read is not None:
+        session.merchant_read.cancel()  # 已开始的只读查询允许结束，旧会话丢弃结果。
+        session.merchant_read = None
     dialog = session.dialog
     if dialog is not None:
         _close_edit_children(dialog)
@@ -265,6 +289,8 @@ class _EditChips(TagChipsFrame):
         session = _edit_session
         if session is not None:
             _edit_schedule(session, "chips", self._relayout_tags)  # 合并批量chips任务，关闭即取消，旧便条不跨会话。
+            if session.merchant is not None:
+                _sync_merchant_choice(session)
 
     def _pick_tags(self) -> None:
         session = _edit_session
@@ -350,22 +376,124 @@ def _chips_edit_height() -> None:
         _edit_schedule(session, "layout", lambda: _layout_edit(session))  # 同会话增删合并重算，等待整表请求高度传播，不清子窗上下文。
 
 
-@overload
-def ask_edit_record(parent: ctk.CTk, record: Account, *, include_budget: Literal[False] = False) -> EditFields | None: ...
+def _sync_merchant_choice(session: _EditSession) -> None:
+    dialog = session.dialog
+    assert dialog is not None
+    applied = dialog.tag_chips.get_tags()
+    choices = [tag for tag in session.common_tags if tag in applied]
+    selected = dialog.merchant_tag.get()
+    if selected not in choices or (len(choices) > 1 and not session.merchant_tag_explicit):
+        session.merchant_tag_explicit = False
+        dialog.merchant_remember.deselect()  # 移除原目标后，即使只剩一个候选也须重新授权。
+        dialog.merchant_tag.set(choices[0] if len(choices) == 1 else "")
+    dialog.merchant_tag.configure(values=choices)
+    for widget in (dialog.merchant_remember, dialog.merchant_tag_label, dialog.merchant_tag):
+        widget.grid() if choices else widget.grid_remove()
+    dialog.merchant_remember.configure(state="normal" if dialog.merchant_tag.get() else "disabled")
+
+
+def _load_edit_merchant(session: _EditSession) -> None:
+    dialog, actions = session.dialog, session.merchant_actions
+    assert dialog is not None and actions is not None
+    session.merchant = None
+    session.merchant_tag_explicit = False
+    dialog.merchant_remember.deselect()
+    dialog.merchant_tag.set("")
+    dialog.merchant_remember.grid_remove()
+    dialog.merchant_tag_label.grid_remove()
+    dialog.merchant_tag.grid_remove()
+    dialog.merchant_name.configure(text="正在读取商户信息…")
+    dialog.merchant_box.pack(fill="x", pady=(8, 0), before=dialog.buttons)
+    future = session.merchant_read = actions.load()
+
+    def poll() -> None:
+        if not future.done():
+            _edit_schedule(session, "merchant", poll, 40)
+            return
+        session.merchant_read = None
+        try:
+            session.merchant, session.common_tags = future.result()
+        except Exception as error:
+            dialog.merchant_name.configure(text=f"无法读取商户信息，可只保存本笔。\n{error}")
+        else:
+            if session.merchant is None:
+                dialog.merchant_box.pack_forget()
+            else:
+                dialog.merchant_name.configure(text=f"商户：{session.merchant.merchant.name}")
+                _sync_merchant_choice(session)
+        _edit_schedule(session, "layout", lambda: _layout_edit(session))
+
+    _edit_schedule(session, "merchant", poll, 40)
+
+
+def _submit_merchant_edit(session: _EditSession, values: EditFields | BudgetEditFields) -> None:
+    dialog, actions, merchant = session.dialog, session.merchant_actions, session.merchant
+    assert dialog is not None and actions is not None and merchant is not None
+    tag = dialog.merchant_tag.get()
+    direction = "收入" if values[1] > 0 else "支出"
+    if not tag or tag not in values[2] or tag not in session.common_tags:
+        dialog.error_var.set("请选择本笔要记住的常用标签。")
+        return
+    prior = merchant.for_direction(direction)
+    change = MerchantMappingChange(merchant.merchant, direction, tag, prior.revision if prior else None)
+    session.saving = True  # 替换确认也会让出 Tk 事件循环，期间不能再次提交。
+    if prior and prior.tag != tag:
+        try:
+            accepted = actions.confirm_replace(dialog, prior, change)
+        finally:
+            session.saving = False
+            if _edit_current(session) and dialog.grab_current() is None:
+                dialog.grab_set()
+        if not _edit_current(session):
+            return
+        if not accepted:
+            dialog.merchant_remember.deselect()
+            return
+        session.saving = True
+
+    def saving_state(enabled: bool) -> None:
+        state = "disabled" if enabled else "normal"
+        dialog.save_button.configure(state=state)
+        dialog.cancel_button.configure(state=state)
+        if dialog.tk.call("tk", "windowingsystem") == "win32":
+            dialog.attributes("-disabled", enabled)  # 后台持锁时只冻结草稿输入，事件循环继续运行。
+
+    def finished(error: Exception | None) -> None:
+        if not _edit_current(session):
+            return
+        session.saving = False
+        saving_state(False)
+        if error is None:
+            _end_edit_session(session)
+        else:
+            dialog.error_var.set(f"保存失败：{error}")
+            if isinstance(error, MerchantMappingConflict):
+                _load_edit_merchant(session)  # 保留日期、金额和标签草稿，明确授权后再试。
+
+    dialog.error_var.set("正在保存…")
+    saving_state(True)
+    actions.save(values, change, finished)
 
 
 @overload
-def ask_edit_record(parent: ctk.CTk, record: Account, *, include_budget: bool) -> EditFields | BudgetEditFields | None: ...
+def ask_edit_record(parent: ctk.CTk, record: Account, *, include_budget: Literal[False] = False,
+                    merchant_actions: MerchantEditActions | None = None) -> EditFields | None: ...
+
+
+@overload
+def ask_edit_record(parent: ctk.CTk, record: Account, *, include_budget: bool,
+                    merchant_actions: MerchantEditActions | None = None) -> EditFields | BudgetEditFields | None: ...
 
 
 def ask_edit_record(
     parent: ctk.CTk, record: Account, *, include_budget: bool = False,
+    merchant_actions: MerchantEditActions | None = None,
 ) -> EditFields | BudgetEditFields | None:
     """确认后返回编辑字段，启用预算时附带预算外标记。"""
     global _edit_session, _edit_window
     if _edit_session is not None or not _edit_alive(parent):
         return None  # 模态编辑拒绝重入；不接管、不弹第二层提示、不丢未保存输入。
-    session = _EditSession(parent, replace(record), include_budget=include_budget)
+    session = _EditSession(parent, replace(record), include_budget=include_budget, merchant_actions=merchant_actions)
     _edit_session = session  # 必须早于变量创建、建窗及所有Tk update登记守卫。
     try:
         session.signal = tk.BooleanVar(master=parent)
@@ -390,6 +518,9 @@ def ask_edit_record(
         _close_edit_children(dialog)
         session.child_context.clear()  # 只在编辑会话开始清一次；同会话反复点▼不清上下文，也不销毁共享选择器缓存。
         _prefill_edit(dialog, session.record, session.include_budget)
+        dialog.merchant_box.pack_forget()  # 缓存窗每次回到当前记录，手工账不能继承商户或授权。
+        if merchant_actions is not None:
+            _load_edit_merchant(session)
         dialog.deiconify()
         _edit_schedule(session, "layout", lambda: _layout_edit(session))
         signal = session.signal
@@ -580,6 +711,27 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
         entry.pack(fill="x")
         entries.append(entry)
 
+    dialog.merchant_box = ctk.CTkFrame(content, fg_color="transparent")
+    dialog.merchant_box.grid_columnconfigure(1, weight=1)
+    dialog.merchant_name = ctk.CTkLabel(dialog.merchant_box, text="", wraplength=365, justify="left", anchor="w")
+    dialog.merchant_name.grid(row=0, column=0, columnspan=2, sticky="ew")
+    dialog.merchant_remember = ctk.CTkCheckBox(dialog.merchant_box, text="记住此商户的标签", font=dialog_font)
+    dialog.merchant_remember.grid(row=1, column=0, columnspan=2, sticky="w")
+    # 收支方向改变后，仍由用户明确授权学习新方向的映射。
+    amount_type_var.trace_add("write", lambda *_: dialog.merchant_remember.deselect())
+    dialog.merchant_tag = ctk.CTkOptionMenu(
+        dialog.merchant_box, values=[], command=lambda _value: reset_merchant_consent(), font=dialog_font,
+    )
+    dialog.merchant_tag_label = ctk.CTkLabel(dialog.merchant_box, text="以后导入的标签", font=dialog_font)
+    dialog.merchant_tag_label.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(5, 0))
+    dialog.merchant_tag.grid(row=2, column=1, sticky="ew", pady=(5, 0))
+
+    def reset_merchant_consent() -> None:
+        if _edit_session is not None and _edit_current(_edit_session):
+            _edit_session.merchant_tag_explicit = True
+        dialog.merchant_remember.deselect()  # 更换目标后，须对新标签重新授权。
+        dialog.merchant_remember.configure(state="normal" if dialog.merchant_tag.get() else "disabled")
+
     error_var = dialog.error_var = tk.StringVar(master=dialog)
     ctk.CTkLabel(
         content,
@@ -600,14 +752,14 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
             _end_edit_session(session)  # 正常结束只隐藏，真正销毁才交给ManagedToplevel。
 
     def cancel() -> None:
-        if dialog.closing:
+        if dialog.closing or (_edit_session is not None and _edit_session.saving):
             return  # 构建期间已收到关闭请求，不再重复确认或取消。
         # 返回 None 表示取消，调用方据此不做任何更新。
         close_dialog()
 
     def confirm() -> None:
         session = _edit_session
-        if session is None or session.dialog is not dialog or not _edit_current(session):
+        if session is None or session.dialog is not dialog or session.saving or not _edit_current(session):
             return  # 取消先到时，后续回车不能再改写返回结果。
         try:
             # 日期格式与金额合法性同时校验，任一失败都走统一的错误提示。
@@ -642,10 +794,14 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
             note_var.get().strip(),
         )
         # 没有预算界面的调用保留四个字段；启用时以提交后的方向作为最终护栏。
-        session.result = (*values, parsed_amount < 0 and budget_excluded_var.get()) if session.include_budget else values
+        result = (*values, parsed_amount < 0 and budget_excluded_var.get()) if session.include_budget else values
+        if session.merchant is not None and dialog.merchant_remember.get():
+            _submit_merchant_edit(session, result)
+            return
+        session.result = result
         close_dialog()
 
-    ctk.CTkButton(
+    dialog.cancel_button = ctk.CTkButton(
         buttons,
         text="取消",
         command=cancel,
@@ -655,8 +811,9 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
         fg_color="#90A4AE",
         hover_color="#78909C",
         font=dialog_font,
-    ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
-    ctk.CTkButton(
+    )
+    dialog.cancel_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    dialog.save_button = ctk.CTkButton(
         buttons,
         text="确定",
         command=confirm,
@@ -666,7 +823,8 @@ def _build_edit_controls(dialog: _EditWindow) -> None:
         fg_color="#2F80ED",
         hover_color="#256AC4",
         font=dialog_font,
-    ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+    )
+    dialog.save_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
     # 关闭按钮等同取消；回车确定、Esc 取消，与月份对话框保持一致的操作习惯。
     dialog.protocol("WM_DELETE_WINDOW", cancel)
     dialog.bind("<Return>", lambda _event: confirm())

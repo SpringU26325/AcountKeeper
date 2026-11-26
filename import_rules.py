@@ -91,6 +91,7 @@ class RowResult:
     duplicate_released: bool = False
     pair_key: tuple[int, int] | None = None
     decision: str | None = None
+    merchant_sources: tuple[str, ...] = ()
     _semantic: tuple[str, str, str] = field(default=("非交易行", "", ""), repr=False)
     _facts: tuple[str, str, str, str] = field(default=("", "", "", ""), repr=False)
     _note_parts: tuple[str, ...] = field(default=(), repr=False)
@@ -366,6 +367,9 @@ def _row_analysis(raw, mapping, vocab, cleaner, mixed_signs, options):
     row = RowResult(raw.row_number, raw.values, "非交易行", "日期或金额无有效值",
                     record_date=day, original_amount=original, _note_parts=note_parts,
                     _time=f"[{time}]" if options.include_time and time else "",
+                    # 先沿用空值及公式筛选，再保留原文本供核对；备注开关与商户来源独立。
+                    merchant_sources=tuple(str(c.value) for c in cells("counterparty")
+                                           if c is not None and cleaner.text(c, "counterparty")),
                     _facts=(value("counterparty"), value("product"), value("status"), value("order_id")))
     row = replace(row, note=_note(row))
     if not mapping.columns.get("date") or not mapping.columns.get("amount"):

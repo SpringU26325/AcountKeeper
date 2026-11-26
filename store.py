@@ -19,7 +19,8 @@ from pathlib import Path
 import shutil
 import sqlite3
 from time import monotonic
-from typing import Iterable, Iterator
+from typing import Callable, Collection, Iterable, Iterator
+from uuid import uuid4
 
 from budget_logic import BudgetLimit, budget_month_start, normalize_budget_tag
 from config import CSV_FIELDS, DB_PATH
@@ -36,7 +37,8 @@ def _csv_safe_cell(value: object) -> object:
 # 历史标签迁移固定到 2；不能把目标改成 3，否则已迁过的库会再次补 legacy 标签。
 _MULTI_TAG_USER_VERSION = 2
 _IMPORT_BATCH_USER_VERSION = 3
-_SCHEMA_USER_VERSION = 4
+_BUDGET_USER_VERSION = 4
+_SCHEMA_USER_VERSION = 5
 
 
 def _business_write(method):
@@ -68,12 +70,49 @@ class Account:
 
 
 @dataclass(frozen=True)
+class ImportMerchant:
+    key: str
+    name: str
+
+
+@dataclass(frozen=True)
+class MerchantMapping:
+    merchant: ImportMerchant
+    direction: str
+    tag: str
+    revision: str
+
+
+@dataclass(frozen=True)
+class MerchantMappingChange:
+    merchant: ImportMerchant
+    direction: str
+    tag: str
+    expected_revision: str | None = None
+
+
+class MerchantMappingConflict(ValueError):
+    """商户映射在预览之后发生变化，需要重新核对。"""
+
+
+@dataclass(frozen=True)
+class EditMerchantContext:
+    merchant: ImportMerchant
+    mappings: tuple[MerchantMapping, ...]
+
+    def for_direction(self, direction: str) -> MerchantMapping | None:
+        return next((item for item in self.mappings if item.direction == direction), None)
+
+
+@dataclass(frozen=True)
 class ImportRecord:
-    """已经通过预览确认的账本字段；外部单号与标签均不携入数据库。"""
+    """预览确认后的账本字段和标签，可携带独立的商户信息。"""
 
     record_date: str
     amount: Decimal
     note: str
+    tags: tuple[str, ...] = ()
+    merchant: ImportMerchant | None = None
 
 
 @dataclass(frozen=True)
@@ -112,7 +151,8 @@ class AccountStore:
         # 前一步失败时不跨级；基础账本仍可启动，批次接口通过就绪标记拒绝使用。
         self.import_batches_available = self._migrate_to_import_batches()
         self.budgets_available = self.import_batches_available and self._migrate_to_budgets()
-        if strict_migrations and not self.budgets_available:
+        self.merchants_available = self.budgets_available and self._migrate_to_merchants()
+        if strict_migrations and not self.merchants_available:
             raise sqlite3.DatabaseError("更新初始化要求全部迁移成功")
         self.load()
 
@@ -400,7 +440,7 @@ class AccountStore:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")  # 表、字段和版本一起提交，失败保住原库。
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (_IMPORT_BATCH_USER_VERSION, _SCHEMA_USER_VERSION):
+                if not _IMPORT_BATCH_USER_VERSION <= version <= _SCHEMA_USER_VERSION:
                     return False
                 columns = {row[1]: row for row in connection.execute("PRAGMA table_info(accounts)")}
                 if version == _IMPORT_BATCH_USER_VERSION:
@@ -424,10 +464,10 @@ class AccountStore:
                 }):
                     raise sqlite3.DatabaseError("预算 schema 不完整，不能启用预算。")
                 if version == _IMPORT_BATCH_USER_VERSION:
-                    connection.execute(f"PRAGMA user_version = {_SCHEMA_USER_VERSION}")
+                    connection.execute(f"PRAGMA user_version = {_BUDGET_USER_VERSION}")
             return True
         except sqlite3.Error as error:
-            # 普通启动保留记账和导入，严格更新必须回退，不能把部分迁移标记为健康。
+            # 普通启动仍可查看基础账本，严格更新必须回退，不能把部分迁移标记为健康。
             if self.strict_migrations:
                 raise
             print(f"警告：预算迁移未就绪，下次启动重试：{error}")
@@ -436,6 +476,116 @@ class AccountStore:
     def _require_budgets(self) -> None:
         if not self.budgets_available:
             raise sqlite3.DatabaseError("预算数据库尚未就绪。")
+
+    def _migrate_to_merchants(self) -> bool:
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if version not in (_BUDGET_USER_VERSION, _SCHEMA_USER_VERSION):
+                    return False
+                if version == _BUDGET_USER_VERSION:
+                    # 已有账目及其标签无需回填；级联删除同时覆盖单笔删除和撤销批次。
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS import_merchants ("
+                        "record_id INTEGER PRIMARY KEY NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, "
+                        "merchant_key TEXT NOT NULL, merchant_name TEXT NOT NULL)"
+                    )
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS merchant_mappings ("
+                        "merchant_key TEXT NOT NULL, direction TEXT NOT NULL CHECK(direction IN ('支出', '收入')), "
+                        "merchant_name TEXT NOT NULL, tag TEXT NOT NULL, revision TEXT NOT NULL, "
+                        "PRIMARY KEY(merchant_key, direction)) WITHOUT ROWID"
+                    )
+                # 即使版本号已经存在，也必须确认两张表的主键和级联关系可用。
+                sources = {row[1]: (row[2], row[3], row[5])
+                           for row in connection.execute("PRAGMA table_info(import_merchants)")}
+                mappings = {row[1]: (row[2], row[3], row[5])
+                            for row in connection.execute("PRAGMA table_info(merchant_mappings)")}
+                foreign = [(row[2], row[3], row[4], row[6])
+                           for row in connection.execute("PRAGMA foreign_key_list(import_merchants)")]
+                if (sources != {"record_id": ("INTEGER", 1, 1), "merchant_key": ("TEXT", 1, 0),
+                                "merchant_name": ("TEXT", 1, 0)}
+                        or mappings != {"merchant_key": ("TEXT", 1, 1), "direction": ("TEXT", 1, 2),
+                                        "merchant_name": ("TEXT", 1, 0), "tag": ("TEXT", 1, 0),
+                                        "revision": ("TEXT", 1, 0)}
+                        or foreign != [("accounts", "record_id", "id", "CASCADE")]):
+                    raise sqlite3.DatabaseError("商户 schema 不完整，不能启用归类。")
+                if version == _BUDGET_USER_VERSION:
+                    connection.execute(f"PRAGMA user_version = {_SCHEMA_USER_VERSION}")
+            return True
+        except sqlite3.Error as error:
+            if self.strict_migrations:
+                raise
+            print(f"警告：商户迁移未就绪，下次启动重试：{error}")
+            return False
+
+    def _require_merchants(self) -> None:
+        if not self.merchants_available:
+            raise sqlite3.DatabaseError("商户数据库尚未就绪。")
+
+    def list_merchant_mappings(self) -> tuple[MerchantMapping, ...]:
+        self._require_merchants()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT merchant_key, merchant_name, direction, tag, revision "
+                "FROM merchant_mappings ORDER BY merchant_name, direction, merchant_key"
+            ).fetchall()
+        return tuple(MerchantMapping(ImportMerchant(key, name), direction, tag, revision)
+                     for key, name, direction, tag, revision in rows)
+
+    def edit_merchant_context(self, record_id: int) -> EditMerchantContext | None:
+        if not self.merchants_available:
+            return None
+        with self._connect() as connection:
+            # 一个查询读取商户和两个方向的修订号，避免上下文来自不同快照。
+            rows = connection.execute(
+                "SELECT i.merchant_key, i.merchant_name, m.direction, m.tag, m.revision, m.merchant_name "
+                "FROM import_merchants AS i LEFT JOIN merchant_mappings AS m ON m.merchant_key = i.merchant_key "
+                "WHERE i.record_id = ?", (record_id,),
+            ).fetchall()
+        if not rows:
+            return None
+        merchant = ImportMerchant(*rows[0][:2])
+        return EditMerchantContext(merchant, tuple(
+            MerchantMapping(ImportMerchant(key, mapped_name), direction, tag, revision)
+            for key, _name, direction, tag, revision, mapped_name in rows if direction is not None
+        ))
+
+    @_business_write
+    def delete_merchant_mapping(self, mapping: MerchantMapping) -> None:
+        self._require_merchants()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM merchant_mappings WHERE merchant_key = ? AND direction = ? AND revision = ?",
+                (mapping.merchant.key, mapping.direction, mapping.revision),
+            )
+            if cursor.rowcount != 1:
+                raise MerchantMappingConflict(f"「{mapping.merchant.name}」的映射已变化，请刷新后重试。")
+
+    @staticmethod
+    def _check_mapping_revisions(connection: sqlite3.Connection, expectations, changes) -> None:
+        # 必须在同一写事务持锁后比对，避免另一个实例在检查后覆盖或重建映射。
+        checks = [(item.merchant, item.direction, item.revision) for item in expectations]
+        checks.extend((item.merchant, item.direction, item.expected_revision) for item in changes)
+        for merchant, direction, expected in checks:
+            row = connection.execute(
+                "SELECT revision FROM merchant_mappings WHERE merchant_key = ? AND direction = ?",
+                (merchant.key, direction),
+            ).fetchone()
+            if (row[0] if row else None) != expected:
+                raise MerchantMappingConflict(f"「{merchant.name}」的{direction}映射已变化，请重新核对。")
+
+    @staticmethod
+    def _write_merchant_mappings(connection: sqlite3.Connection, changes) -> None:
+        # 新修订号能区分删除后又重建为同名同标签的映射。
+        connection.executemany(
+            "INSERT INTO merchant_mappings (merchant_key, direction, merchant_name, tag, revision) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(merchant_key, direction) DO UPDATE SET "
+            "merchant_name = excluded.merchant_name, tag = excluded.tag, revision = excluded.revision",
+            [(item.merchant.key, item.direction, item.merchant.name, item.tag, uuid4().hex)
+             for item in changes],
+        )
 
     def list_budgets(self, month: str) -> tuple[BudgetLimit, ...]:
         self._require_budgets()
@@ -503,6 +653,8 @@ class AccountStore:
     def import_batch(
         self, records: Iterable[ImportRecord], file_name: str,
         skipped_count: int = 0, non_transaction_count: int = 0,
+        *, expected_mappings: Iterable[MerchantMapping] = (),
+        merchant_changes: Iterable[MerchantMappingChange] = (),
     ) -> ImportBatch | None:
         """一次事务导入；调用者在提交成功后单独 load/刷新，避免把显示失败当回滚。"""
         self._require_import_batches()
@@ -511,7 +663,8 @@ class AccountStore:
             skipped_count, non_transaction_count,
         )):
             raise ValueError("跳过笔数及非交易行数必须为非负整数。")
-        values = []  # 全批先校验再开写事务，末笔非法也不能留下已写入的前几笔。
+        expectations, changes = tuple(expected_mappings), tuple(merchant_changes)
+        values, linked_choices = [], set()  # 先验证完整批次，拒绝和实际入账无关的学习请求。
         for record in records:
             date = datetime.strptime(record.record_date, "%Y-%m-%d").date().isoformat()
             if not self._is_valid_amount(record.amount):
@@ -519,7 +672,21 @@ class AccountStore:
             # 按输入小数位严格拦截，包括尾随零；不得靠格式化掩盖超过两位小数的异常。
             if int(record.amount.as_tuple().exponent) < -2:
                 raise ValueError("超过两位小数的导入金额禁止入账。")
-            values.append((date, f"{record.amount:.2f}", "", record.note.strip()))
+            tags, merchant = self._normalize_tags(record.tags), record.merchant
+            if merchant is not None:
+                if not merchant.key.strip() or not merchant.name.strip():
+                    raise ValueError("商户键及显示名称不能为空。")
+                direction = "收入" if record.amount > 0 else "支出"
+                linked_choices.update((merchant.key, direction, tag) for tag in tags)
+            values.append((date, f"{record.amount:.2f}", record.note.strip(), tags, merchant))
+        keys = {(change.merchant.key, change.direction) for change in changes}
+        if len(keys) != len(changes) or any(
+            (change.merchant.key, change.direction, change.tag) not in linked_choices for change in changes
+        ):
+            raise ValueError("学习请求必须唯一且对应本批已选标签。")
+        has_links = any(tags or merchant for _, _, _, tags, merchant in values)
+        if has_links or changes or expectations:
+            self._require_merchants()
         if not values:
             return None  # 零笔不创建批次，也不产生空事务。
         name = Path(file_name).name  # 批次仅留文件名，不持久化用户机器上的完整来源路径。
@@ -528,6 +695,7 @@ class AccountStore:
         imported_at = datetime.now().isoformat(timespec="seconds")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._check_mapping_revisions(connection, expectations, changes)
             cursor = connection.execute(
                 "INSERT INTO import_batches (imported_at, file_name, imported_count, "
                 "skipped_count, non_transaction_count) VALUES (?, ?, ?, ?, ?)",
@@ -536,13 +704,31 @@ class AccountStore:
             batch_id = cursor.lastrowid
             if batch_id is None:
                 raise sqlite3.DatabaseError("未能取得导入批次 id。")
-            # 一批一次连接、一次提交；默认零标签，不调用逐笔 add 或写 tags.json。
-            connection.executemany(
+            insert_record = (
                 "INSERT INTO accounts "
                 "(record_date, amount, category, note, import_batch_id) "
-                "VALUES (?, ?, ?, ?, ?)",
-                [(*row, batch_id) for row in values],
+                "VALUES (?, ?, '', ?, ?)"
             )
+            if not has_links:
+                # 保留无关联批次的批量写入路径。
+                connection.executemany(insert_record, [(day, amount, note, batch_id)
+                                       for day, amount, note, _, _ in values])
+            else:
+                tag_rows, merchant_rows = [], []
+                for day, amount, note, tags, merchant in values:
+                    record_id = connection.execute(insert_record, (day, amount, note, batch_id)).lastrowid
+                    if record_id is None:
+                        raise sqlite3.DatabaseError("未能取得导入记录 id。")
+                    tag_rows.extend((record_id, tag) for tag in tags)
+                    if merchant is not None:
+                        merchant_rows.append((record_id, merchant.key, merchant.name))
+                connection.executemany("INSERT INTO record_tags (record_id, tag) VALUES (?, ?)", tag_rows)
+                connection.executemany(
+                    "INSERT INTO import_merchants (record_id, merchant_key, merchant_name) VALUES (?, ?, ?)",
+                    merchant_rows,
+                )
+            if changes:
+                self._write_merchant_mappings(connection, changes)
             result = ImportBatch(
                 batch_id, imported_at, name, len(values),
                 skipped_count, non_transaction_count,
@@ -861,7 +1047,31 @@ class AccountStore:
         budget_excluded: bool | None = None,
     ) -> Account | None:
         """整份更新记录及标签，保留主键/批次归属；金额非法、缺记录或写库失败返回 None。"""
-        # 与 add 同源：金额非法一律按「更新失败」处理，返回 None 让 UI 弹提示而不是崩溃。
+        try:
+            record = self._commit_edit(record_id, record_date, amount, tags, note, budget_excluded)
+        except sqlite3.Error:
+            return None  # 保留普通编辑调用者的失败返回约定。
+        return self.apply_committed_edit(record) if record is not None else None
+
+    @_business_write
+    def commit_merchant_edit(
+        self, record_id: int, record_date: str, amount: Decimal, tags: tuple[str, ...], note: str,
+        *, budget_excluded: bool | None = None, change: MerchantMappingChange,
+        read_common_tags: Callable[[], Collection[str]],
+    ) -> Account:
+        """后台提交账目及商户映射，返回已提交记录，由主线程更新缓存。"""
+        self._require_merchants()
+        record = self._commit_edit(record_id, record_date, amount, tags, note, budget_excluded,
+                                   change=change, read_common_tags=read_common_tags)
+        if record is None:
+            raise ValueError("找不到该记录或编辑字段无效。")
+        return record
+
+    def _commit_edit(
+        self, record_id: int, record_date: str, amount: Decimal, tags: tuple[str, ...], note: str,
+        budget_excluded: bool | None, *, change: MerchantMappingChange | None = None,
+        read_common_tags: Callable[[], Collection[str]] | None = None,
+    ) -> Account | None:
         if not self._is_valid_amount(amount):
             return None
         if budget_excluded is not None and (type(budget_excluded) is not bool or not self.budgets_available):
@@ -871,52 +1081,59 @@ class AccountStore:
         flag_sql, flag_values = "", ()
         if self.budgets_available and budget_excluded is not None:
             flag_sql, flag_values = ", budget_excluded = ?", (int(budget_excluded),)
-        # 与 add 同款：形参是 tags 元组，裸字符串会被护栏拒绝（理由见 _normalize_tags）。
         tags = self._normalize_tags(tags)
-        try:
-            with self._connect() as connection:
-                # WHERE 只依据主键 id，且 id 不参与 SET，保证记录 ID 永远不变（需求 3.5.1）。
-                cursor = connection.execute(
-                    "UPDATE accounts SET record_date = ?, amount = ?, "
-                    f"category = ?, note = ?{flag_sql} WHERE id = ?",
-                    (
-                        record_date,
-                        f"{amount:.2f}",
-                        # 与 add 一致：category 列改存空串，标签只走 record_tags。
-                        "",
-                        note.strip(),
-                        *flag_values,
-                        record_id,
-                    ),
-                )
-                updated = cursor.rowcount > 0
-                # 只有主记录真的被改到才动标签：id 不存在时若照样替换，
-                # 就会往关联表塞一份永远没人认领的孤儿标签，长期污染 get_tags() 的候选池。
-                if updated:
-                    self._replace_tags(connection, record_id, tags)
-                    if self.budgets_available and budget_excluded is None:
-                        # 旧调用未指定标记时保留库中现值，缓存也不用过期对象猜测。
-                        current = connection.execute(
-                            "SELECT budget_excluded FROM accounts WHERE id = ?", (record_id,),
-                        ).fetchone()
-                        if current is None:
-                            raise sqlite3.DatabaseError("无法读取更新后账目的预算外标记。")
-                        budget_excluded = bool(current[0])
-        except sqlite3.Error:
-            # 更新失败属于可恢复错误（例如数据库文件被占用），返回 None 让 UI 弹提示而不是崩溃。
-            return None
-        if not updated:
-            return None
-        self._unparsed_record_ids.discard(record_id)  # 修正金额已提交，之后按缓存中的新记录校验。
-        # 写事务已提交；主键不变，原地替换即可保持升序，不需要整表重读。
-        record = self._cache_record(record_id, record_date, amount, tags, note, bool(budget_excluded))
+        with self._connect() as connection:
+            if change is not None:
+                if change.tag not in tags or change.direction != ("收入" if amount > 0 else "支出"):
+                    raise ValueError("记忆标签须属于本笔最终标签和收支方向。")
+                connection.execute("BEGIN IMMEDIATE")
+                source = connection.execute(
+                    "SELECT merchant_key, merchant_name FROM import_merchants WHERE record_id = ?", (record_id,),
+                ).fetchone()
+                if source != (change.merchant.key, change.merchant.name):
+                    raise MerchantMappingConflict("这条账目的商户关联已变化，请重新核对。")
+                self._check_mapping_revisions(connection, (), (change,))
+            # 由主键定位，保留原记录 ID 与批次归属。
+            cursor = connection.execute(
+                "UPDATE accounts SET record_date = ?, amount = ?, "
+                f"category = '', note = ?{flag_sql} WHERE id = ?",
+                (record_date, f"{amount:.2f}", note.strip(), *flag_values, record_id),
+            )
+            if cursor.rowcount == 0:
+                return None  # 缺少主记录时不得创建孤立标签或商户映射。
+            self._replace_tags(connection, record_id, tags)
+            if self.budgets_available and budget_excluded is None:
+                # 未指定预算标记时，保留本次事务中的现值。
+                current = connection.execute(
+                    "SELECT budget_excluded FROM accounts WHERE id = ?", (record_id,)
+                ).fetchone()
+                if current is None:
+                    raise sqlite3.DatabaseError("无法读取更新后账目的预算外标记。")
+                budget_excluded = bool(current[0])
+            if change is not None:
+                prior = connection.execute(
+                    "SELECT tag FROM merchant_mappings WHERE merchant_key = ? AND direction = ?",
+                    (change.merchant.key, change.direction),
+                ).fetchone()
+                # 等锁期间另一实例可以删签，写映射前现读，失效时连同本笔编辑一起回滚。
+                if read_common_tags is None or change.tag not in read_common_tags():
+                    raise MerchantMappingConflict("常用标签已变化，请重新选择要记住的标签。")
+                if prior != (change.tag,):
+                    self._write_merchant_mappings(connection, (change,))
+        return self._cache_record(record_id, record_date, amount, tags, note, bool(budget_excluded))
+
+    def apply_committed_edit(self, record: Account) -> Account:
+        """在主线程发布已经成功提交的单条编辑。"""
+        record_id = record.record_id
+        self._unparsed_record_ids.discard(record_id)  # 修正金额已提交，这笔账不再计入加载异常。
         index = self._cache_index(record_id)
         if index < len(self.records) and self.records[index].record_id == record_id:
             self.records[index] = record
         else:
-            # 缓存里缺这条（外部改库或缓存曾被整表替换）：按二分位置补进去，不丢新数据。
+            # 缓存缺这条时按主键补入，保持有序。
             self.records.insert(index, record)
         return record
+
 
     def export_month_csv(self, month: str, save_path: Path) -> Path:
         """现读指定月份导出 CSV，不依赖筛选后的表格或缓存，路径及失败提示由调用方管理。"""

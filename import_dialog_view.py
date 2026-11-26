@@ -7,7 +7,7 @@ from tkinter import font as tkfont
 import customtkinter as ctk
 
 from dialog_common import _apply_app_icon
-from dialog_lifecycle import ManagedToplevel
+from dialog_lifecycle import ManagedToplevel, _cancel_owned_tasks
 from import_preview_controls import PreviewControls, PreviewSelect
 
 
@@ -19,6 +19,8 @@ class ImportDialogView:
         self.controls = PreviewControls(font)
         self._more, self.closed = False, False
         self.help_popup = None
+        self.mapping_incomplete = True
+        self._filename_expanded = False
 
     def build(self):
         # 卡片与底栏固定；只有中部两个面板滚动，避免操作入口被长列表挤走。
@@ -27,12 +29,20 @@ class ImportDialogView:
         heading = ctk.CTkFrame(self.window, fg_color="transparent")
         heading.grid(row=0, column=0, sticky="ew", padx=20, pady=(10, 0))
         heading.grid_columnconfigure(0, weight=1)
-        self.controls.label(heading, self.file_name, anchor="w").grid(row=0, column=0, sticky="ew")
+        self.filename = self.controls.label(heading, anchor="w", justify="left")
+        self.filename.grid(row=0, column=0, sticky="ew")
+        # 未映射的原生 Label 使用与标题相同的字体，保留系统字体回退后的真实请求宽度。
+        self._filename_measure = tk.Label(heading, borderwidth=0, highlightthickness=0, padx=0, pady=0)
+        self.full_name_button = self.controls.button(heading, "展开文件名", self._toggle_filename, width=100)
+        self.full_name_button.grid(row=0, column=1, padx=6)
+        self.full_name_button.grid_forget()
         # 说明只由显式按钮打开，避免初次弹窗打断字段核对。
         self.help_button = self.controls.button(heading, "使用说明", self.show_help, width=110,
             height=36, border_width=1, border_color="#8CB6ED", fg_color="#DCEAFE",
             hover_color="#CFE0F8", text_color="#245D9F")
-        self.help_button.grid(row=0, column=1, sticky="e")
+        self.help_button.grid(row=0, column=2, sticky="e")
+        tk.Misc.bind(heading, "<Configure>", self._layout_filename, add="+")
+        tk.Misc.bind(self.filename, "<Configure>", self._layout_filename, add="+")
         middle = ctk.CTkFrame(self.window, fg_color="transparent")
         middle.grid(row=1, column=0, sticky="nsew", padx=18, pady=12)
         middle.grid_columnconfigure(1, weight=1)
@@ -63,16 +73,25 @@ class ImportDialogView:
         right = ctk.CTkFrame(middle, fg_color="white", corner_radius=14)
         right.grid(row=0, column=1, sticky="nsew")
         right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(5, weight=1)
+        right.grid_rowconfigure(0, weight=1)
+        # 统计、筛选和记录共用可收缩视口，翻页与单笔操作保留固定空间。
+        self.details = ctk.CTkScrollableFrame(right, fg_color="white")
+        self.details.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
+        self.details.grid_columnconfigure(0, weight=1)
+        self.details._parent_canvas.configure(yscrollincrement=1)
+        self.window.bind("<MouseWheel>", self.actions["wheel"], add="+")
+        self.preview_rows = ctk.CTkFrame(self.details, fg_color="white")
+        self.preview_rows.grid(row=5, column=0, sticky="ew")
+        self.preview_rows.grid_columnconfigure(0, weight=1)
         self.cards = {}
-        self.card_area = ctk.CTkFrame(right, fg_color="transparent")
+        self.card_area = ctk.CTkFrame(self.details, fg_color="transparent")
         self.card_area.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
         for index, view in enumerate(("将导入", "规则跳过", "待确认", "非交易行")):
             button = self.controls.button(self.card_area, view, lambda v=view: self.actions["view"](v),
                 width=120, height=34)
             button.grid(row=0, column=index, padx=(0, 6), pady=2)
             self.cards[view] = button
-        self.toolbar = ctk.CTkFrame(right, fg_color="white")
+        self.toolbar = ctk.CTkFrame(self.details, fg_color="white")
         self.toolbar.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
         self.toolbar.grid_columnconfigure(0, weight=1)
         search = ctk.CTkFrame(self.toolbar, fg_color="white")
@@ -94,33 +113,30 @@ class ImportDialogView:
         self.only_check.pack(side="left")
         self.next_button = self.controls.button(self.filters, "定位下一笔", self.actions["locate"], width=100)
         self.next_button.pack(side="left", padx=6)
-        self.banner = self.controls.label(right, "", anchor="w", wraplength=500, justify="left")
+        self.banner = self.controls.label(self.details, "", anchor="w", wraplength=500, justify="left")
         self.banner.grid(row=2, column=0, sticky="ew", padx=12)
-        self.view_title = self.controls.label(right, "", anchor="w", wraplength=500)
+        self.view_title = self.controls.label(self.details, "", anchor="w", wraplength=500)
         self.view_title.grid(row=3, column=0, sticky="ew", padx=12)
         self.all_button = self.controls.button(self.filters, "查看全部", self.actions["all"], width=75)
         self._layout = None
         self.card_area.bind("<Configure>", self._reflow, add="+")
-        self.progress_label = self.controls.label(right, "", anchor="w")
+        self.progress_label = self.controls.label(self.details, "", anchor="w")
         self._build_pager(right)
         self.progress_label.grid(row=4, column=0, sticky="ew", padx=12)
-        self.details = ctk.CTkScrollableFrame(right, fg_color="white")
-        self.details.grid(row=5, column=0, sticky="nsew", padx=8, pady=4)
-        self.details.grid_columnconfigure(0, weight=1)
-        # 明细内统一路由；其他区域保留原滚动行为，不注册全局滚轮绑定。
-        self.details._parent_canvas.configure(yscrollincrement=1)
-        self.window.bind("<MouseWheel>", self.actions["wheel"], add="+")
         inspect = ctk.CTkFrame(right, fg_color="#F8FAFC", corner_radius=8)
-        inspect.grid(row=7, column=0, sticky="ew", padx=10)
+        inspect.grid_columnconfigure(0, weight=1)
+        inspect.grid_rowconfigure(1, weight=1)
+        inspect.grid_propagate(False)
         self.inspect_title = self.controls.label(inspect, "单笔核对 · 点击上方记录查看", anchor="w")
-        self.inspect_title.pack(fill="x", padx=8)
+        self.inspect_title.grid(row=0, column=0, sticky="ew", padx=8)
         self.raw_text = ctk.CTkTextbox(inspect, height=64, font=self.font, fg_color="#F8FAFC", text_color="#243447")
-        self.raw_text.pack(fill="x", padx=4)
+        self.raw_text.grid(row=1, column=0, sticky="nsew", padx=4)
         self.row_hint = self.controls.label(inspect, "选择记录后，可查看原值和可用操作。", anchor="w", wraplength=590)
-        self.row_hint.pack(fill="x", padx=8)
+        self.row_hint.grid(row=2, column=0, sticky="ew", padx=8)
         self.inspection = inspect
+        tk.Misc.bind(right, "<Configure>", self._fit_inspection, add="+")
+        tk.Misc.bind(self.row_hint, "<Configure>", self._fit_inspection, add="+")
         row_bar = self.row_bar = ctk.CTkFrame(right, fg_color="white")
-        row_bar.grid(row=8, column=0, sticky="ew", padx=10, pady=6)
         self.income_button = self.controls.button(row_bar, "此笔入账", lambda: self.actions["row"]("入账"), width=80, primary=True)
         self.skip_button = self.controls.button(row_bar, "跳过此笔", lambda: self.actions["row"]("跳过"), width=80)
         self.income_button.pack(side="left")
@@ -129,14 +145,125 @@ class ImportDialogView:
         self.duplicate_check = self.controls.check(row_bar, text="仍要导入（只解除重复跳过）",
             variable=self.duplicate_var, command=self.actions["duplicate"])
         self.duplicate_check.pack(side="left")
+        self._build_merchant_actions(right)
         bottom = ctk.CTkFrame(self.window, fg_color="transparent")
         bottom.grid(row=2, column=0, sticky="ew", padx=20, pady=12)
         bottom.grid_columnconfigure(0, weight=1)
         self.footer = self.controls.label(bottom, "预览尚未写入账本", anchor="w", wraplength=620)
         self.footer.grid(row=0, column=0, sticky="ew")
+        for label in (self.banner, self.view_title, self.row_hint, self.footer):
+            tk.Misc.bind(label, "<Configure>", self._wrap_message, add="+")
         self.controls.button(bottom, "取消", self.actions["close"], width=80).grid(row=0, column=1, padx=8)
         self.submit_button = self.controls.button(bottom, "确认导入", self.actions["submit"], width=155, primary=True)
         self.submit_button.grid(row=0, column=2)
+
+    def _build_merchant_actions(self, right):
+        bar = self.merchant_bar = ctk.CTkFrame(right, fg_color="white")
+        bar.grid_columnconfigure(3, weight=1)
+        self.merchant_select = PreviewSelect(bar, values=("",), command=self._merchant_label_changed,
+            font=self.font, width=128, display=lambda tag: tag or "留空")
+        self.merchant_select.grid(row=0, column=0, sticky="w")
+        self.merchant_batch = tk.BooleanVar(master=self.window)
+        self.merchant_batch_check = self.controls.check(bar, text="同商户批量",
+            variable=self.merchant_batch)
+        self.merchant_batch_check.grid(row=0, column=1, padx=6)
+        self.merchant_apply = self.controls.button(bar, "应用标签", lambda: self.actions["merchant"](
+            self.merchant_select.get(), self.merchant_batch.get(), self.merchant_remember.get()), width=82)
+        self.merchant_apply.grid(row=0, column=2)
+        self.merchant_remember = tk.BooleanVar(master=self.window)
+        self.merchant_remember_check = self.controls.check(bar, text="记住此商户的标签",
+            variable=self.merchant_remember,
+            command=lambda: self.actions["merchant_memory"](self.merchant_remember.get()))
+        self.merchant_remember_check.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self._merchant_can_remember = False
+        self.merchant_scope = self.controls.label(bar, "", anchor="w", justify="left", wraplength=280)
+        self.merchant_scope.grid(row=2, column=0, columnspan=4, sticky="ew")
+        tk.Misc.bind(self.merchant_scope, "<Configure>", self._wrap_message, add="+")
+
+    def _merchant_label_changed(self, tag):
+        if tag != self._merchant_applied_label and self.merchant_remember.get():
+            # 选择不同的标签会清除勾选，也须撤销旧标签的学习授权。
+            self.merchant_remember.set(False)
+            self.actions["merchant_memory"](False)
+        self._set_merchant_remember_state(tag)
+
+    def _set_merchant_remember_state(self, tag):
+        enabled = bool(tag and self._merchant_can_remember)
+        self.merchant_remember_check.configure(state="normal" if enabled else "disabled")
+
+    def show_merchant_actions(self, tags, selected, total, preserved, *, can_remember, remembered):
+        # 和待确认工具栏共用同一布局行，窄窗保留列表和核对区的纵向空间。
+        self.merchant_select.set_values(("", *tags))
+        self.merchant_select.set(selected)
+        self._merchant_applied_label = selected
+        self.merchant_batch.set(False)
+        self._merchant_can_remember = can_remember
+        self.merchant_remember.set(remembered)
+        self._set_merchant_remember_state(selected)
+        self.merchant_batch_check.configure(state="normal" if total > preserved else "disabled")
+        self.merchant_scope.configure(text=(
+            f"同商户同方向 {total} 笔（含筛选隐藏及其他页），保留人工决定 {preserved} 笔。"
+            if total else "可设置本笔标签。"))
+        self.merchant_bar.grid(row=3, column=0, sticky="ew", padx=10, pady=6)
+
+    def hide_merchant_actions(self):
+        self.merchant_select.close()  # 翻页、重算和换视图时，旧下拉不能继续操作。
+        self.merchant_bar.grid_forget()
+
+    def _wrap_message(self, event):
+        # 按文案自己的实际宽度换行，并扣除 CTk 内部为圆角预留的两侧空间。
+        label = event.widget
+        width = max(1, int(event.width / label._get_widget_scaling()) - 2 * label.cget("corner_radius") - 4)
+        if label.cget("wraplength") != width:
+            label.configure(wraplength=width)
+
+    def _toggle_filename(self):
+        self._filename_expanded = not self._filename_expanded
+        self._layout_filename()
+
+    def _layout_filename(self, _event=None):
+        if self.closed:
+            return
+        label = self.filename
+        self._filename_measure.configure(font=label._label.cget("font"))
+        scale = label._get_widget_scaling()
+        inset = round((2 * label.cget("corner_radius") + 4) * scale)
+        width = label.master.winfo_width() - self.help_button.winfo_reqwidth() - inset
+        if width <= 1:
+            return
+        text, wrap = self.file_name, 0
+        if self._measure_filename(text) > width:
+            caption = "收起文件名" if self._filename_expanded else "展开文件名"
+            if self.full_name_button.cget("text") != caption:
+                self.full_name_button.configure(text=caption)
+            if not self.full_name_button.winfo_manager():
+                self.full_name_button.grid(row=0, column=1, padx=6)
+            width -= self.full_name_button.winfo_reqwidth() + round(12 * scale)
+            if self.full_name_button.winfo_ismapped() and label.winfo_width() > 1:
+                width = min(width, label.winfo_width() - inset)  # 按按钮布局后的实际列宽限制文件名。
+            if self._filename_expanded:
+                wrap = max(1, int(width / scale))
+            else:
+                # 中间省略并保留末尾，方便区分前缀相同的文件。
+                first, last = 0, len(self.file_name)
+                text = "…"
+                while first < last:
+                    count = (first + last) // 2
+                    head, tail = count // 2, (count + 1) // 2
+                    candidate = self.file_name[:head] + "…" + self.file_name[len(self.file_name) - tail:]
+                    if self._measure_filename(candidate) <= width:
+                        text, first = candidate, count + 1
+                    else:
+                        last = count
+        else:
+            self.full_name_button.grid_forget()
+            self._filename_expanded = False
+        if label.cget("text") != text or label.cget("wraplength") != wrap:
+            label.configure(text=text, wraplength=wrap)
+
+    def _measure_filename(self, text):
+        self._filename_measure.configure(text=text)
+        return self._filename_measure.winfo_reqwidth()
 
     def build_fields(self, headers, bill_rows, mapping, options):
         for widget in self.fields_area.winfo_children():
@@ -164,7 +291,7 @@ class ImportDialogView:
             if value not in values:
                 values.append(value)
             control = PreviewSelect(self.fields_area, values=values, width=160, font=self.font,
-                command=lambda text, r=role: self._field_changed(r, text))
+                command=lambda text, r=role: self._field_changed(r, text), precise_outline=role in ("date", "amount"))
             control.set(value)
             needs_review = role in (mapping.review_roles if mapping else ()) or role in ("date", "amount") and (not bound or any(i >= len(names) for i in bound))
             control.configure(border_color="#B7791F" if needs_review else "#D8E1EA")
@@ -224,9 +351,9 @@ class ImportDialogView:
         popup.finish_setup()
 
     def _build_pager(self, parent):
-        # 分页入口固定在筛选栏下方，不放入随明细滚动的容器。
+        # 分页入口在视口外，长列表滚动到任意位置都可以翻页。
         self.pager = ctk.CTkFrame(parent, fg_color="white")
-        self.pager.grid(row=6, column=0, sticky="ew", padx=10, pady=3)
+        self.pager.grid(row=1, column=0, sticky="ew", padx=10, pady=3)
         self.pager.grid_columnconfigure(0, weight=1)
         self.page_label = self.controls.label(self.pager, "", anchor="w")
         self.page_label.grid(row=0, column=0, sticky="w")
@@ -252,6 +379,9 @@ class ImportDialogView:
         self.page_entry.configure(state="normal" if pages.rows else "disabled")
 
     def refresh_status(self, session, historical):
+        missing = [title for role, title in (("date", "日期"), ("amount", "金额"))
+                   if not session.mapping or not session.mapping.columns.get(role)]
+        self.mapping_incomplete = bool(missing)
         if session.busy and session.result is None:
             message = "正在重算，旧决定已作废" if historical else "正在分析账单"
         elif session.error:
@@ -280,20 +410,17 @@ class ImportDialogView:
         elif session.error:
             next_step = "处理失败，请检查错误提示；可修正字段重试或取消"
         else:
-            missing = [title for role, title in (("date", "日期"), ("amount", "金额"))
-                       if not session.mapping or not session.mapping.columns.get(role)]
             next_step = ("请先选择" + "、".join(missing) + "列" if missing else
                          f"还有 {remaining} 笔需要你处理，请在右侧核对后决定" if remaining else
                          "核对日期、金额与备注后，可确认导入" if session.can_submit else "请核对高亮字段及待确认记录")
-        missing_required = not session.mapping or any(not session.mapping.columns.get(role) for role in ("date", "amount"))
-        step = "① 核对字段" if missing_required or session.result is None else "② 处理待确认" if remaining else "③ 确认导入"
+        step = "① 核对字段" if self.mapping_incomplete or session.result is None else "② 处理待确认" if remaining else "③ 确认导入"
         self.guide_step.configure(text=step)
         self.guide.configure(text=next_step)
         self._reflow()
-        self.footer.configure(text="预览尚未写入账本")
+        self.footer.configure(text="确认后保存已选标签、可识别商户和明确记住的映射")
         waiting = session.current_view == "待确认"
         self.only_check.configure(state="normal" if waiting else "disabled")
-        self.next_button.configure(state="normal" if waiting and session.result and not session.busy else "disabled")
+        self.next_button.configure(state="normal" if waiting and not missing and session.result and not session.busy else "disabled")
         self.save_button.configure(state="normal" if session.result and not session.busy else "disabled")
 
     def set_raw(self, text):
@@ -304,8 +431,26 @@ class ImportDialogView:
 
     def show_inspection(self, expanded, *, row_actions=False):
         # 整组试算只展开核对内容；只有单笔选择才显示单笔操作入口。
-        self.inspection.grid() if expanded else self.inspection.grid_remove()
-        self.row_bar.grid() if expanded and row_actions else self.row_bar.grid_remove()
+        # grid_forget 同时取消 CTk 的缩放重放，隐藏中的操作栏不会自行出现。
+        if expanded:
+            self._fit_inspection()
+            self.inspection.grid(row=2, column=0, sticky="ew", padx=10)
+        else:
+            self.inspection.grid_forget()
+        if expanded and row_actions:
+            self.row_bar.grid(row=3, column=0, sticky="ew", padx=10, pady=6)
+        else:
+            self.row_bar.grid_forget()
+
+    def _fit_inspection(self, _event=None):
+        if self.closed:
+            return
+        # 小工作区限制核对区占高，原值用文本框自身滚动查看，给列表和操作栏留出空间。
+        scale = self.inspection._get_widget_scaling()
+        requested = self.inspect_title.winfo_reqheight() + self.raw_text.winfo_reqheight() + self.row_hint.winfo_reqheight()
+        height = max(1, int(min(requested, self.inspection.master.winfo_height() * .45) / scale))
+        if self.inspection.cget("height") != height:
+            self.inspection.configure(height=height)
 
     def _reflow(self, event=None):
         if self.closed:
@@ -327,9 +472,6 @@ class ImportDialogView:
             button.grid(row=index // columns, column=index % columns)
         self.filters.grid(row=1 if compact else 0, column=0 if compact else 1,
                           sticky="w", padx=0 if compact else 6, pady=(4, 0) if compact else 0)
-        # 提示文字随右栏宽度换行，避免历史错误和长组名撑大最小窗口。
-        for label in (self.banner, self.view_title, self.row_hint):
-            label.configure(wraplength=max(250, round(width - 24)))
 
     def show_help(self):
         if self.closed:
@@ -385,26 +527,31 @@ class ImportDialogView:
 
     def show_saved_candidates(self, candidates=(), error=None):
         for child in self.saved_area.winfo_children():
+            _cancel_owned_tasks(child)  # 清理旧按钮尚未执行的点击动画，再销毁列表项。
             child.destroy()
+        if not candidates and error is None:
+            self.saved_area.grid_forget()
+            self.saved_empty.grid(row=3, column=0, sticky="w", padx=10, pady=6)
+            return
+        self.saved_empty.grid_forget()
+        self.saved_area.grid(row=3, column=0, sticky="ew", padx=8)  # 专属行与完整边距都参与缩放回放。
         if error is not None:
-            self.saved_empty.grid_remove()
-            self.saved_area.grid(row=3, column=0, sticky="ew", padx=6)
             self.controls.label(self.saved_area, "映射读取失败：" + str(error), wraplength=270).pack()
             return
-        if not candidates:
-            self.saved_area.grid_remove()
-            self.saved_empty.grid(row=3, column=0, sticky="w", padx=10, pady=6)
-        else:
-            self.saved_empty.grid_remove()
-            self.saved_area.grid(row=1, column=0, sticky="ew", padx=6)
         for candidate in candidates:
             line = ctk.CTkFrame(self.saved_area, fg_color="white")
             line.pack(fill="x", pady=2)
+            line.grid_columnconfigure(0, weight=1)
             name = candidate.mapping.name
             if candidate.missing_headers:
                 name += " · 缺失：" + "、".join(candidate.missing_headers)
-            self.controls.button(line, name, lambda m=candidate.mapping: self.actions["apply_mapping"](m), width=215).pack(side="left")
-            self.controls.button(line, "×", lambda f=candidate.mapping.fingerprint: self.actions["delete_mapping"](f), width=30).pack(side="right")
+            # 名称可在滚动区内换行，右边两格始终留给操作按钮。
+            self.controls.label(line, name, anchor="w", justify="left", wraplength=160).grid(
+                row=0, column=0, sticky="new", padx=(0, 4))
+            self.controls.button(line, "应用", lambda m=candidate.mapping: self.actions["apply_mapping"](m), width=50).grid(
+                row=0, column=1, sticky="n", padx=(0, 4))
+            self.controls.button(line, "×", lambda f=candidate.mapping.fingerprint: self.actions["delete_mapping"](f), width=30).grid(
+                row=0, column=2, sticky="n")
 
     def show_save_mapping(self, headers):
         popup = self._popup("保存此映射")
@@ -430,6 +577,8 @@ class ImportDialogView:
 
     def close(self):
         self.closed = True  # 先阻止重开说明，再撤销本视图的 Tcl 变量订阅。
+        if hasattr(self, "merchant_select"):
+            self.merchant_select.close()  # 关闭预览时同步清理可能仍展开的候选窗口。
         if self.help_popup is not None:
             self.help_popup.destroy()
         if hasattr(self, "_search_trace"):

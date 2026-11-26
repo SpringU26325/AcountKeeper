@@ -4,20 +4,21 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from typing import TypeGuard, TypeVar
 
 import customtkinter as ctk
 
 from config import RESOURCE_DIR
-from dialog_common import _apply_app_icon
+from dialog_common import _apply_app_icon, fit_dialog_to_work_area
 from dialog_lifecycle import ManagedToplevel
 import dialogs
 from import_dialog import ImportDialog
 from import_reader import read_bill_file
 from import_rules import load_vocabulary
 from import_session import ImportSession
-from store import ImportRecord
+from store import MerchantMappingConflict
+from tag_prefs import build_tag_candidates
 
 
 def _read_import(path):
@@ -126,7 +127,10 @@ class BatchList(FlowWindow):
         self.body.pack(fill="both", expand=True, padx=18, pady=(5, 10))
         self.body.columnconfigure(1, weight=1)
         self.undo_buttons = {}
-        self.button(self, "刷新批次", self.refresh).pack(pady=(0, 12))
+        actions = ctk.CTkFrame(self, fg_color="transparent")
+        actions.pack(pady=(0, 12))
+        self.button(actions, "刷新批次", self.refresh).pack(side="left", padx=5)
+        self.button(actions, "商户映射", workflow.show_merchant_mappings).pack(side="left", padx=5)
         self.refresh()
         self.show()
 
@@ -152,13 +156,111 @@ class BatchList(FlowWindow):
             self.undo_buttons[batch.batch_id] = button
 
 
+class MerchantMappingList(FlowWindow):
+    def __init__(self, workflow):
+        self._refresh_future = None
+        self._can_delete = False
+        super().__init__(workflow.app, "商户映射", "700x430")
+        self.workflow = workflow
+        self.mappings = ()
+        self.status = self.label(self, "", wraplength=540)
+        self.status.pack(fill="x", padx=12, pady=8)
+        body = ctk.CTkFrame(self, fg_color="white")
+        body.grid_rowconfigure(0, weight=1)
+        body.grid_columnconfigure(0, weight=1)
+        # 原生表格保持单选，滚动时不会为每条映射单独创建按钮。
+        self.tree = ttk.Treeview(body, columns=("merchant", "direction", "tag"), show="headings",
+                                 selectmode="browse")
+        for key, title, width in (("merchant", "商户", 260), ("direction", "收支", 72), ("tag", "标签", 120)):
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width, minwidth=64)
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        # 窄窗保留表格列宽，选中项的完整名称在可滚动核对区换行展示。
+        self.detail = ctk.CTkTextbox(self, height=64, font=self.font, wrap="word")
+        actions = ctk.CTkFrame(self, fg_color="transparent")
+        actions.pack(side="bottom", pady=10)
+        self.detail.pack(side="bottom", fill="x", padx=12, pady=(0, 4))
+        # 先为核对区和操作按钮分配空间，表格可缩短并通过滚动查看。
+        body.pack(fill="both", expand=True, padx=12, pady=6)
+        self.refresh_button = self.button(actions, "刷新", self.refresh)
+        self.refresh_button.pack(side="left", padx=5)
+        self.remove = self.button(actions, "删除选中映射", self._delete_selected, danger=True)
+        self.remove.pack(side="left", padx=5)
+        self.tree.bind("<<TreeviewSelect>>", self._show_selected)
+        self.refresh()
+        self.show()
+        if not self.closing:
+            fit_dialog_to_work_area(workflow.app, self, (480, 270))
+
+    def refresh(self, *, message=""):
+        if self.closing or self._refresh_future is not None:
+            return  # 等待同一份快照，重复打开或点击刷新不会排队查询。
+        self._can_delete = False
+        self.remove.configure(state="disabled")
+        self.refresh_button.configure(state="disabled")
+        self.status.configure(text=message or "正在读取商户映射…")
+        # 使用现有读取线程等待 SQLite 锁，窗口可继续操作和关闭。
+        self._refresh_future = self.workflow.executor.submit(self.workflow.store.list_merchant_mappings)
+        self.after(50, self._poll_refresh, message)
+
+    def _poll_refresh(self, message):
+        future = self._refresh_future
+        if self.closing or future is None:
+            return
+        if not future.done():
+            self.after(50, self._poll_refresh, message)
+            return
+        self._refresh_future = None
+        self.refresh_button.configure(state="normal")
+        try:
+            self.mappings = future.result()
+        except Exception as error:
+            self.status.configure(text=f"读取商户映射失败：{error}")
+            return  # 权限或数据库错误不得显示成空列表。
+        self.tree.delete(*self.tree.get_children())
+        for index, item in enumerate(self.mappings):
+            self.tree.insert("", "end", iid=str(index), values=(item.merchant.name, item.direction, item.tag))
+        self._can_delete = True
+        self._show_selected()
+        self.status.configure(text=message or (
+            "删除映射只影响今后的导入。" if self.mappings else "暂无已记住的商户映射"))
+
+    def _show_selected(self, _event=None):
+        selected = self.tree.selection()
+        if selected:
+            mapping = self.mappings[int(selected[0])]
+            text = f"商户：{mapping.merchant.name}\n收支：{mapping.direction}\n标签：{mapping.tag}"
+        else:
+            text = "选择一项可查看完整的商户名称和标签。"
+        self.detail.configure(state="normal")
+        self.detail.delete("1.0", "end")
+        self.detail.insert("1.0", text)
+        self.detail.configure(state="disabled")
+        self.remove.configure(state="normal" if selected and self._can_delete else "disabled")
+
+    def _delete_selected(self):
+        selected = self.tree.selection()
+        if selected and self._can_delete:
+            self.workflow.delete_merchant_mapping(self.mappings[int(selected[0])], self)
+
+    def _on_destroy(self, event):
+        if event.widget is self and self._refresh_future is not None:
+            # 取消尚未执行的读取，已运行的查询由线程池收尾；父类移除本窗轮询。
+            self._refresh_future.cancel()
+            self._refresh_future = None
+        super()._on_destroy(event)
+
+
 class ImportWorkflow:
     """批次事务只调用 store 的公开接口，读入与显示错误不能冒充事务回滚。"""
 
     def __init__(self, app):
         self.app, self.store = app, app.store
         self.closed, self.writing = False, False
-        self.preview = self.loading = self.batch_list = self.failure = None
+        self.preview = self.loading = self.batch_list = self.failure = self.merchant_list = None
         self.reports = []
         self.future = self.poll_job = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bill-reader")
@@ -193,16 +295,24 @@ class ImportWorkflow:
         if not self.store.import_batches_available:
             self.notice("无法导入", "导入批次数据库尚未就绪，请先解决数据库升级问题。")
             return
+        if not self.store.merchants_available:
+            self.notice("无法导入", "商户数据库尚未就绪，请重启完成数据库升级。")
+            return
         self.loading = FlowWindow(self.app, "读取账单", "520x180")
-        self.loading.label(self.loading, "正在读取账单，尚未写入账本。", wraplength=470).pack(pady=30)
+        self.loading.label(self.loading, "正在读取账单及商户映射，尚未写入账本。", wraplength=470).pack(pady=30)
         self.loading.button(self.loading, "取消", self.cancel_read).pack()
         self.loading.protocol("WM_DELETE_WINDOW", self.cancel_read)
         self.loading.bind("<Escape>", lambda _event: self.cancel_read())
         self.loading.show()
         if self.closed or not _alive(self.loading):
             return
-        self.future = self.executor.submit(_read_import, Path(path))
+        self.future = self.executor.submit(self._load_preview, Path(path))
         self.poll_job = self.app.after(50, self.poll_read)
+
+    def _load_preview(self, path):
+        bill, vocabulary = _read_import(path)
+        # 独立连接可能等待 SQLite 锁，随账单一起在读取线程完成，加载窗仍可响应取消。
+        return bill, vocabulary, self.store.list_merchant_mappings()
 
     def cancel_read(self):
         if self.poll_job is not None:
@@ -226,15 +336,15 @@ class ImportWorkflow:
             self.loading.destroy()
         session = None
         try:
-            bill, vocabulary = future.result()
-            session = ImportSession(bill, vocabulary)
+            bill, vocabulary, merchant_mappings = future.result()
+            session = ImportSession(bill, vocabulary, merchant_mappings=merchant_mappings)
             self.preview = ImportDialog(self.app, session, on_confirm=self.submit)
         except Exception as error:
             if session is not None:
                 session.close()
             self.last_error = str(error)
             if not self.closed:
-                self.notice("无法打开账单", f"{error}\n账本未写入，请检查文件后重新选择。")
+                self.notice("无法打开账单", f"{error}\n账本未写入，请检查账单或数据库后重试。")
 
     def reload_main(self):
         try:
@@ -246,17 +356,42 @@ class ImportWorkflow:
         return ""
 
     def submit(self, result):
-        if self.closed or self.writing:
+        preview = self.preview
+        if self.closed or self.writing or not _alive(preview):
             return False
         self.writing = True
         try:
-            # 从完整分析结果取入账集合，绝不从搜索后的可见行取数，也不保存外部单号。
-            records = tuple(ImportRecord(row.record_date, row.amount, row.note) for row in result.to_import)
+            session = preview.session
             try:
-                if not result.can_confirm:
-                    raise ValueError("仍有待确认记录或必需字段缺失，不能导入。")
-                batch = self.store.import_batch(records, self.preview.session.bill.file_name,  # type: ignore[reportOptionalMemberAccess] # submit 只由预览窗回调，preview 必存在。
-                    result.counts["规则跳过"], result.counts["非交易行"])
+                payload = session.export_import_submission(result)
+            except ValueError as error:
+                preview.footer.configure(text=str(error))
+                return False  # 同批学习冲突可在当前预览修正，账本事务尚未开启。
+            if payload.replacements:
+                changes = "\n".join(f"{old.merchant.name}（{old.direction}）：{old.tag} → {new.tag}"
+                                    for old, new in payload.replacements)
+                revision = session.revision
+                if not self._confirm_merchant_action(preview, "确认更新商户映射", changes, "更新映射并导入"):
+                    return False
+                if self.closed or preview.closing or session.revision != revision:
+                    return False  # 确认弹窗让出事件循环，旧载荷不能用于已变化的预览。
+            try:
+                # 常用标签可能已被另一实例移除，提交前拒绝写入已经失效的预览选择。
+                available = set(build_tag_candidates())
+                if any(tag not in available for record in payload.records for tag in record.tags):
+                    raise MerchantMappingConflict("常用标签已变化，请重新核对预览标签。")
+                batch = self.store.import_batch(payload.records, session.bill.file_name,
+                    result.counts["规则跳过"], result.counts["非交易行"],
+                    expected_mappings=payload.expectations, merchant_changes=payload.changes)
+            except MerchantMappingConflict as error:
+                self.last_error = str(error)
+                self.show_failure(error)
+                if not self.closed and not preview.closing:
+                    try:
+                        preview.refresh_merchant_context(self.store.list_merchant_mappings(), build_tag_candidates())
+                    except Exception as refresh_error:
+                        preview.footer.configure(text=f"商户映射刷新失败：{refresh_error}")
+                return False
             except Exception as error:
                 self.last_error = str(error)
                 self.show_failure(error)
@@ -266,7 +401,7 @@ class ImportWorkflow:
             # 此边界以后绝不重试写入；报告建窗异常也不能让原预览再次提交。
             try:
                 if not self.closed:
-                    report = ImportReport(self, self.preview.session.bill.file_name, result.counts, batch, error)  # type: ignore[reportOptionalMemberAccess] # submit 只由预览窗回调，preview 必存在。
+                    report = ImportReport(self, session.bill.file_name, result.counts, batch, error)
                     self.reports = [item for item in self.reports if _alive(item)]
                     self.reports.append(report)
             except Exception as display_error:
@@ -303,6 +438,60 @@ class ImportWorkflow:
         else:
             self.batch_list = BatchList(self)
 
+    def show_merchant_mappings(self):
+        if self.closed:
+            return
+        if not self.store.merchants_available:
+            self.notice("无法查看商户映射", "商户数据库尚未就绪，请重启完成数据库升级。")
+        elif _alive(self.merchant_list):
+            self.merchant_list.refresh()
+            self.merchant_list.lift()
+        else:
+            self.merchant_list = MerchantMappingList(self)
+
+    def _confirm_merchant_action(self, parent, title, details, caption, *, danger=False):
+        window = FlowWindow(parent, title, "570x300")
+        # 文本框保留长商户名称及所有将替换的映射，不因条数增加把按钮推出窗口。
+        content = ctk.CTkTextbox(window, height=165, font=window.font, wrap="word")
+        content.pack(fill="both", expand=True, padx=14, pady=12)
+        content.insert("1.0", details)
+        content.configure(state="disabled")
+        actions = ctk.CTkFrame(window, fg_color="transparent")
+        actions.pack(pady=(0, 12))
+        confirmed = False
+
+        def accept():
+            nonlocal confirmed
+            confirmed = True
+            window.destroy()
+
+        window.button(actions, "取消", window.destroy).pack(side="left", padx=5)
+        window.button(actions, caption, accept, danger=danger, primary=not danger).pack(side="left", padx=5)
+        window.show()
+        if not window.closing and fit_dialog_to_work_area(parent, window, (350, 190)):
+            window.grab_set()
+            parent.wait_window(window)
+        return confirmed
+
+    def delete_merchant_mapping(self, mapping, origin):
+        if self.closed or self.writing:
+            return
+        self.writing = True
+        try:
+            detail = f"{mapping.merchant.name}（{mapping.direction}） → {mapping.tag}\n\n删除只影响今后的导入。"
+            if not self._confirm_merchant_action(origin, "确认删除商户映射", detail, "删除映射", danger=True):
+                return
+            if self.closed or origin.closing:
+                return
+            try:
+                self.store.delete_merchant_mapping(mapping)
+            except Exception as error:
+                origin.refresh(message=f"删除映射失败：{error}")
+            else:
+                origin.refresh()
+        finally:
+            self.writing = False
+
     def undo_batch(self, batch, origin):
         if self.closed or self.writing:
             return False
@@ -335,7 +524,7 @@ class ImportWorkflow:
             return
         self.closed = True
         self.cancel_read()
-        for window in (self.preview, self.batch_list, self.failure, *self.reports):
+        for window in (self.preview, self.batch_list, self.merchant_list, self.failure, *self.reports):
             if _alive(window):
                 window.destroy()
         # cancel_read会丢弃future引用；必须等线程池真正排空，不能据此误判文件已释放。

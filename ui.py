@@ -32,6 +32,7 @@ from chart_window import StatsWindow
 from config import DATA_DIR, DEFAULT_EXPORT_DIR
 from dialog_lifecycle import ManagedToplevel, _cancel_owned_tasks
 from dialogs import center_dialog_on_parent
+from edit_dialog import MerchantEditActions
 from snail import SnailManager
 from store import Account, AccountStore
 from widgets import InputFrame
@@ -89,6 +90,8 @@ class AccountKeeperApp(ctk.CTk):
         self._uninstall_choice = None
         self._uninstall_job = None
         self.import_workflow = None  # 延迟加载导入依赖，主页面启动不读取外部账单。
+        self._merchant_edit_saving = False
+        self._merchant_edit_exit = False
         # store 由外部注入，方便测试时替换成临时数据库，避免测试污染真实账本。
         self.store = store
         self._budget_window: BudgetWindow | None = None
@@ -151,6 +154,9 @@ class AccountKeeperApp(ctk.CTk):
     def destroy(self) -> None:
         if self._calendar_destroyed:
             return
+        if self._merchant_edit_saving:
+            self._merchant_edit_exit = True  # 写事务一旦交给后台，等待结果后再关闭解释器。
+            return
         if self.update_flow is not None and not self.update_flow.exit_ready:
             self.update_flow.close()  # 主窗关闭也先取消、结算并异步等线程退出。
             return
@@ -203,7 +209,7 @@ class AccountKeeperApp(ctk.CTk):
 
     def prepare_update_exit(self):
         workflow = self.import_workflow
-        if (self._business_depth or self._calendar_building or self._backup_running
+        if (self._business_depth or self._calendar_building or self._backup_running or self._merchant_edit_saving
                 or (workflow is not None and workflow.writing) or self.grab_current()):
             return False  # 模态回调仍在Python栈上时不得快照或交出替换权。
         if not self._update_exiting:
@@ -327,7 +333,8 @@ class AccountKeeperApp(ctk.CTk):
         if window is not None and not window.closing:
             window.refresh()
 
-    def _budget_before_save(self, record_date: str, amount: Decimal, excluded: bool) -> BudgetSnapshot | None:
+    def _budget_before_save(self, record_date: str, amount: Decimal, excluded: bool, *,
+                            records: tuple[Account, ...] | None = None) -> BudgetSnapshot | None:
         month = datetime.now().strftime("%Y-%m")
         if (excluded or record_date[:7] != month or not amount.is_finite() or amount >= 0
                 or not getattr(self.store, "budgets_available", False)):
@@ -338,7 +345,7 @@ class AccountKeeperApp(ctk.CTk):
             # 预算数据读取异常不应拦住已有的记账和更正流程。
             print(f"警告：无法读取预算提醒所需的额度：{error}")
             return None
-        return build_budget_snapshot(self.store.records, limits, month) if limits else None
+        return build_budget_snapshot(self.store.records if records is None else records, limits, month) if limits else None
 
     def _show_budget_notice(self, before: BudgetSnapshot | None) -> None:
         if self._calendar_closing:
@@ -690,6 +697,8 @@ class AccountKeeperApp(ctk.CTk):
     @business_action
     def _edit_record_by_id(self, record_id: int) -> None:
         """按钮和双击共用预填、取消与保存流程，防止业务口径分叉。"""
+        if self._merchant_edit_saving:
+            return  # 后台提交即使遇到原窗销毁，也不能与新会话交叉写入。
         # 从完整缓存按主键取记录预填，不能读取 Treeview 的摘要或 Canvas 可复用槽位。
         record = next(
             (item for item in self.store.records if item.record_id == record_id),
@@ -700,9 +709,13 @@ class AccountKeeperApp(ctk.CTk):
             return
 
         # 用户取消编辑时返回 None，此时保持原样不做任何改动。
-        edited_values = dialogs.ask_edit_record(
-            self, record, include_budget=getattr(self.store, "budgets_available", False),
-        )
+        include_budget = getattr(self.store, "budgets_available", False)
+        if getattr(self.store, "merchants_available", False):
+            edited_values = dialogs.ask_edit_record(
+                self, record, include_budget=include_budget, merchant_actions=self._merchant_edit_actions(record),
+            )
+        else:
+            edited_values = dialogs.ask_edit_record(self, record, include_budget=include_budget)
         if edited_values is None:
             return
         self._clear_budget_notice()
@@ -720,9 +733,77 @@ class AccountKeeperApp(ctk.CTk):
         if updated is None:
             messagebox.showerror("编辑失败", "找不到该记录或记录更新失败。")
             return
-        self._update_displayed(updated)  # 单行更新，不再整表重建。
+        self._publish_edited_record(updated, before_budget)
+
+    def _merchant_edit_actions(self, record: Account) -> MerchantEditActions:
+        workflow = self._get_import_workflow()
+
+        def read_context():
+            # 每次编辑独立读取商户及常用标签，阻塞性 I/O 在既有工作线程完成。
+            return self.store.edit_merchant_context(record.record_id), tuple(tag_prefs.build_tag_candidates())
+
+        def confirm_replace(parent, old, new):
+            detail = f"{old.merchant.name}（{old.direction}）\n{old.tag} → {new.tag}\n\n此映射用于今后的导入。"
+            return workflow._confirm_merchant_action(parent, "确认更新商户映射", detail, "保存并更新映射")
+
+        return MerchantEditActions(
+            lambda: workflow.executor.submit(read_context),
+            lambda fields, change, done: self._save_merchant_edit(record, fields, change, done),
+            confirm_replace,
+        )
+
+    def _save_merchant_edit(self, record, fields, change, done) -> None:
+        record_date, amount, tags, note, *budget_flag = fields
+        exclusion = budget_flag[0] if budget_flag else None
+        records = tuple(self.store.records)  # 后台读取快照，单行缓存仍只由 Tk 线程发布。
+        self._clear_budget_notice()
+
+        def commit():
+            before = self._budget_before_save(record_date, amount,
+                                             record.budget_excluded if exclusion is None else exclusion,
+                                             records=records)
+            updated = self.store.commit_merchant_edit(record.record_id, record_date, amount, tags, note,
+                                                      budget_excluded=exclusion, change=change,
+                                                      read_common_tags=tag_prefs.build_tag_candidates)
+            return updated, before
+
+        try:
+            future = self._get_import_workflow().executor.submit(commit)
+        except RuntimeError as error:
+            done(error)
+            return
+        self._merchant_edit_saving = True
+
+        def poll() -> None:
+            if not future.done():
+                self.after(40, poll)
+                return
+            failure = None
+            try:
+                updated, before = future.result()
+            except Exception as error:
+                failure = error  # 事务失败保留原窗的输入，供重新核对或普通保存。
+            else:
+                self.store.apply_committed_edit(updated)
+                try:
+                    self._publish_edited_record(updated, before)
+                except Exception as error:
+                    # 已提交的写入不得伪装成可重试的保存失败。
+                    print(f"警告：编辑已保存，刷新失败：{error}")
+            finally:
+                self._merchant_edit_saving = False
+                try:
+                    done(failure)
+                finally:
+                    if self._merchant_edit_exit:
+                        self.after_idle(self.destroy)
+
+        self.after(40, poll)
+
+    def _publish_edited_record(self, record: Account, before: BudgetSnapshot | None) -> None:
+        self._update_displayed(record)  # 单行更新，不再整表重建。
         self._refresh_budget()
-        self._show_budget_notice(before_budget)
+        self._show_budget_notice(before)
 
     def _confirm_backup_overwrite(self, save_path: Path) -> bool:
         # 与删除确认共用受管理的 CTkToplevel 生命周期；原生 messagebox 不适合危险操作。
